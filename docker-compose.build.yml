@@ -1,0 +1,8 @@
+# Overlay that builds the image locally instead of pulling it from GHCR:
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+services:
+  runner:
+    build:
+      context: .
+      args:
+        INSTALL_DOCKER_CLI: ${INSTALL_DOCKER_CLI:-true}

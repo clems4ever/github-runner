@@ -9,13 +9,32 @@ container mints a fresh one from a personal access token every time it starts.
 That token is only valid for an hour, so a container using it could never
 restart on its own.
 
+The image is built for `linux/amd64` and `linux/arm64` and published to
+`ghcr.io/clems4ever/github-runner`.
+
 ## Quick start
 
 ```bash
 cp .env.example .env
 $EDITOR .env          # set GITHUB_URL and ACCESS_TOKEN
-docker compose up -d --build
+docker compose up -d
 docker compose logs -f
+```
+
+The package inherits this repository's visibility, so while the repo is private
+you need to authenticate before pulling:
+
+```bash
+echo "$GHCR_PAT" | docker login ghcr.io -u <your-username> --password-stdin
+```
+
+(a classic PAT with `read:packages`). Making the package public under
+*Package settings → Change visibility* removes that step.
+
+To build the image locally instead of pulling it:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 The runner then shows up under *Settings → Actions → Runners*, and jobs can
@@ -57,9 +76,8 @@ All settings are read from `.env` (see `.env.example`).
 | `EPHEMERAL` | `true` | Accept a single job, then exit and let Compose start a fresh registration |
 | `DISABLE_UPDATE` | `false` | Prevent the runner from auto-updating itself |
 | `GITHUB_API_URL` | `https://api.github.com` | Override for GitHub Enterprise Server |
-| `RUNNER_VERSION` | `2.336.0` | Build arg: runner release to install |
-| `RUNNER_ARCH` | `x64` | Build arg: `x64` or `arm64` |
-| `INSTALL_DOCKER_CLI` | `false` | Build arg: also install the Docker CLI and compose plugin |
+| `IMAGE_TAG` | `latest` | Tag of `ghcr.io/clems4ever/github-runner` to run |
+| `INSTALL_DOCKER_CLI` | `true` | Build arg (local builds): install the Docker CLI and compose plugin |
 
 ### Ephemeral runners
 
@@ -70,17 +88,33 @@ state from every job it has run, and workflows can see each other's leftovers.
 
 ### Docker inside jobs
 
-The image has no Docker daemon. To let jobs use the host's daemon, build with
-`INSTALL_DOCKER_CLI=true` and uncomment the `docker.sock` mount and `group_add`
-entries in `docker-compose.yml`. Note that access to the host's Docker socket
-is equivalent to root on the host.
+The published image ships the Docker CLI but no daemon. To let jobs use the
+host's daemon, uncomment the `docker.sock` mount and `group_add` entries in
+`docker-compose.yml` and set `DOCKER_GID` to the host's docker group id. Note
+that access to the host's Docker socket is equivalent to root on the host.
 
 ### Upgrading the runner
 
-Bump `RUNNER_VERSION` and the checksums in the `Dockerfile` (`RUNNER_SHA256_X64`
-/ `RUNNER_SHA256_ARM64`, published in the
-[release notes](https://github.com/actions/runner/releases)), then
-`docker compose up -d --build`.
+Bump `ARG RUNNER_VERSION` and the checksums in the `Dockerfile`
+(`RUNNER_SHA256_AMD64` / `RUNNER_SHA256_ARM64`, published in the
+[release notes](https://github.com/actions/runner/releases)) and push to
+`main`. The workflow republishes `latest` and tags the image with the new
+runner version; `docker compose pull && docker compose up -d` picks it up.
+
+## Publishing
+
+`.github/workflows/build.yml` builds the image with buildx (QEMU for arm64) and
+pushes to GHCR on every push to `main`, using the workflow's built-in
+`GITHUB_TOKEN` — no secret to configure. Pull requests build without pushing.
+
+Tags produced:
+
+| Tag | When |
+| --- | --- |
+| `latest` | push to `main` |
+| runner version, e.g. `2.336.0` | push to `main`, read from the `Dockerfile` |
+| `sha-<commit>` | every push |
+| `vX.Y.Z` | pushing a `v*` git tag |
 
 ## Security note
 

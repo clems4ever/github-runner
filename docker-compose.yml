@@ -1,12 +1,8 @@
 services:
   runner:
-    build:
-      context: .
-      args:
-        RUNNER_VERSION: ${RUNNER_VERSION:-2.336.0}
-        RUNNER_ARCH: ${RUNNER_ARCH:-x64}
-        INSTALL_DOCKER_CLI: ${INSTALL_DOCKER_CLI:-false}
-    image: github-runner:${RUNNER_VERSION:-2.336.0}
+    # Published by .github/workflows/build.yml. To build locally instead:
+    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    image: ghcr.io/clems4ever/github-runner:${IMAGE_TAG:-latest}
     restart: unless-stopped
     # Give the runner time to finish its job and de-register on `compose down`.
     stop_grace_period: 5m
@@ -23,9 +19,8 @@ services:
       RUNNER_GROUP: ${RUNNER_GROUP:-Default}
       EPHEMERAL: ${EPHEMERAL:-true}
       DISABLE_UPDATE: ${DISABLE_UPDATE:-false}
-    # Uncomment (and build with INSTALL_DOCKER_CLI=true) to let jobs use the
-    # host Docker daemon. This grants the runner root-equivalent access to the
-    # host, so only do it for workflows you trust.
+    # Uncomment to let jobs use the host Docker daemon. This grants the runner
+    # root-equivalent access to the host, so only do it for trusted workflows.
     # volumes:
     #   - /var/run/docker.sock:/var/run/docker.sock
     # group_add:
