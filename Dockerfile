@@ -41,7 +41,9 @@ RUN if [ "$INSTALL_DOCKER_CLI" = "true" ]; then \
 RUN useradd --create-home --shell /bin/bash --uid 1001 runner \
     && echo "runner ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/runner \
     && chmod 0440 /etc/sudoers.d/runner \
-    && mkdir -p /home/runner/actions-runner /home/runner/_work \
+    # .runner-state exists so that a volume mounted there is created with the
+    # runner's ownership rather than root's.
+    && mkdir -p /home/runner/actions-runner /home/runner/_work /home/runner/.runner-state \
     && chown -R runner:runner /home/runner
 
 WORKDIR /home/runner/actions-runner
