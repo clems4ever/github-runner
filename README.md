@@ -103,6 +103,12 @@ over the existing entry rather than pile up duplicates.
 To move a runner to another repository or change its labels, register again:
 `docker compose down -v`, put a fresh token in `.env`, `docker compose up -d`.
 
+The runner is unprivileged (uid 1001), and the image ships an empty
+`/home/runner/.runner-state` so that a named volume inherits its ownership.
+Replacing that volume with a bind mount means `chown 1001:1001` on the host
+directory; the entrypoint checks it can write there before it registers, so a
+bad mount fails immediately instead of after burning a token.
+
 ### Ephemeral runners
 
 With `EPHEMERAL=true` the runner takes exactly one job and exits;

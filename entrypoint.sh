@@ -31,9 +31,10 @@ RUNNER_NAME=${RUNNER_NAME:-$(hostname)}
 RUNNER_GROUP=${RUNNER_GROUP:-Default}
 RUNNER_WORKDIR=${RUNNER_WORKDIR:-/home/runner/_work}
 EPHEMERAL=${EPHEMERAL:-false}
+STATE_ROOT=${RUNNER_STATE_DIR:-/home/runner/.runner-state}
 # One directory per runner name, so replicas sharing the state volume cannot
 # pick up each other's registration.
-STATE_DIR=${RUNNER_STATE_DIR:-/home/runner/.runner-state}/${RUNNER_NAME}
+STATE_DIR=${STATE_ROOT}/${RUNNER_NAME}
 # Everything config.sh writes, and all the runner needs to reconnect later.
 CONFIG_FILES=(.runner .credentials .credentials_rsakey)
 
@@ -43,6 +44,23 @@ die() { echo "[entrypoint] error: $*" >&2; exit 1; }
 [[ -n "${GITHUB_URL:-}" ]] || die "GITHUB_URL is required"
 
 cd "$RUNNER_DIR"
+
+# The image ships an empty, runner-owned state directory, so a named volume
+# inherits that ownership. A bind mount, or a volume created before the
+# directory existed in the image, arrives owned by root instead — take it over
+# rather than fail halfway through, once the runner is already registered.
+claim_state_dir() {
+  if [[ ! -d "$STATE_ROOT" ]]; then
+    mkdir -p "$STATE_ROOT" 2>/dev/null \
+      || die "cannot create ${STATE_ROOT}, mount it as a volume writable by uid $(id -u)"
+  fi
+  if [[ -w "$STATE_ROOT" ]]; then return 0; fi
+  if command -v sudo >/dev/null && sudo -n chown -R "$(id -u):$(id -g)" "$STATE_ROOT" 2>/dev/null; then
+    log "took ownership of ${STATE_ROOT}"
+    return 0
+  fi
+  die "${STATE_ROOT} is not writable by $(id -un) (uid $(id -u)): recreate the volume with 'docker compose down -v', or chown the bind mount on the host"
+}
 
 # An ephemeral runner is dropped by GitHub after its job, so every container
 # start has to register again — which only works while the token is valid.
@@ -105,6 +123,10 @@ register() {
     || die "registration failed (a registration token expires one hour after it is issued)"
   save_registration
 }
+
+# Checked up front: a registration that cannot be saved is worse than useless,
+# as the next start would have to burn another token.
+if [[ "$EPHEMERAL" != "true" ]]; then claim_state_dir; fi
 
 if saved_registration_matches; then
   restore_registration
