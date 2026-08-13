@@ -3,11 +3,14 @@
 A containerised [self-hosted GitHub Actions runner](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners).
 
 It follows the download / configure / run procedure GitHub shows on the
-*Settings → Actions → Runners → New self-hosted runner* page, with one change:
-instead of pasting the short-lived registration token from that page, the
-container mints a fresh one from a personal access token every time it starts.
-That token is only valid for an hour, so a container using it could never
-restart on its own.
+*Settings → Actions → Runners → New self-hosted runner* page: you paste the
+registration token from that page into `.env` and nothing else. No personal
+access token is involved.
+
+The registration token expires an hour after GitHub issued it, but it is only
+needed to register — from then on the runner authenticates with credentials of
+its own. Those are kept in a small `runner-state` volume, so the container can
+restart, be re-created, or come back after a reboot without a new token.
 
 The image is built for `linux/amd64` and `linux/arm64` and published to
 `ghcr.io/clems4ever/github-runner`.
@@ -16,7 +19,7 @@ The image is built for `linux/amd64` and `linux/arm64` and published to
 
 ```bash
 cp .env.example .env
-$EDITOR .env          # set GITHUB_URL and ACCESS_TOKEN
+$EDITOR .env          # set GITHUB_URL and RUNNER_TOKEN
 docker compose up -d
 docker compose logs -f
 ```
@@ -53,13 +56,18 @@ docker compose up -d --scale runner=3
 ```
 
 `RUNNER_NAME` must stay empty for that, so each container registers under its
-own hostname.
+own hostname. Each replica registers separately, so the token must still be
+valid when they start.
 
-Stop and de-register:
+Stop the runners:
 
 ```bash
 docker compose down
 ```
+
+The registrations survive that (see below); to also throw them away, use
+`docker compose down -v` and delete the runners in
+*Settings → Actions → Runners*.
 
 ## Configuration
 
@@ -68,23 +76,44 @@ All settings are read from `.env` (see `.env.example`).
 | Variable | Default | Description |
 | --- | --- | --- |
 | `GITHUB_URL` | — | Repository or organisation URL, e.g. `https://github.com/clems4ever/runyard` |
-| `ACCESS_TOKEN` | — | PAT used to mint registration tokens. Classic PAT: `repo` scope for a repository runner, `admin:org` for an organisation runner. Fine-grained PAT: *Administration* read & write |
-| `RUNNER_TOKEN` | — | Alternative to `ACCESS_TOKEN`: a registration token from the runner page. Expires after one hour |
+| `RUNNER_TOKEN` | — | Registration token from *Settings → Actions → Runners → New self-hosted runner*. Only needed until the runner has registered |
 | `RUNNER_NAME` | container hostname | Name shown in the runners list |
 | `RUNNER_LABELS` | — | Extra comma-separated labels |
 | `RUNNER_GROUP` | `Default` | Runner group |
-| `EPHEMERAL` | `true` | Accept a single job, then exit and let Compose start a fresh registration |
+| `EPHEMERAL` | `false` | Accept a single job, then exit and register again on restart — needs a valid token every time |
 | `DISABLE_UPDATE` | `false` | Prevent the runner from auto-updating itself |
-| `GITHUB_API_URL` | `https://api.github.com` | Override for GitHub Enterprise Server |
+| `RUNNER_STATE_DIR` | `/home/runner/.runner-state` | Where the registration is stored inside the container |
 | `IMAGE_TAG` | `latest` | Tag of `ghcr.io/clems4ever/github-runner` to run |
 | `INSTALL_DOCKER_CLI` | `true` | Build arg (local builds): install the Docker CLI and compose plugin |
 
+### Registration and restarts
+
+`entrypoint.sh` registers the runner the first time it starts and copies the
+files `config.sh` produced (`.runner`, `.credentials`, `.credentials_rsakey`)
+into the `runner-state` volume, under a directory named after the runner. Every
+later start restores them and skips registration, so `RUNNER_TOKEN` can be
+emptied out of `.env` once the first start has succeeded.
+
+Nothing de-registers the runner on shutdown — that would need a *removal* token,
+which is exactly the kind of credential this setup avoids. A stopped runner
+therefore shows up as offline in *Settings → Actions → Runners* until it comes
+back; `config.sh --replace` makes a re-registration under the same name take
+over the existing entry rather than pile up duplicates.
+
+To move a runner to another repository or change its labels, register again:
+`docker compose down -v`, put a fresh token in `.env`, `docker compose up -d`.
+
 ### Ephemeral runners
 
-With `EPHEMERAL=true` (the default) the runner takes exactly one job and exits;
+With `EPHEMERAL=true` the runner takes exactly one job and exits;
 `restart: unless-stopped` then brings the container back with a clean
-workspace. This is the recommended setup — a long-lived runner accumulates
-state from every job it has run, and workflows can see each other's leftovers.
+workspace. That is nicer isolation — a long-lived runner accumulates state from
+every job it has run, and workflows can see each other's leftovers — but GitHub
+drops an ephemeral registration as soon as its job ends, so the container has to
+register again on every restart. Without a PAT to mint tokens, that only works
+while the pasted token is valid, i.e. for an hour. Hence the default of
+`EPHEMERAL=false`; turn it on if you are happy to paste a token per hour of
+jobs, or clean the workspace from the workflow itself.
 
 ### Docker inside jobs
 
@@ -120,14 +149,18 @@ Tags produced:
 
 GitHub recommends self-hosted runners only for **private** repositories: on a
 public repository, a pull request from a fork can run arbitrary code on the
-runner. Combine this with `EPHEMERAL=true` and a host you are willing to treat
-as untrusted.
+runner. Treat the host as untrusted, and prefer `EPHEMERAL=true` where the
+token churn it implies is acceptable.
+
+The only credential in `.env` is a registration token: it can enrol a runner
+for an hour and does nothing else, so a leak is far less damaging than that of
+a PAT with repository or organisation administration rights.
 
 ## How it works
 
 - `Dockerfile` — Ubuntu 24.04, downloads the runner tarball, verifies its
   SHA-256, extracts it, runs `bin/installdependencies.sh`, and drops to an
   unprivileged `runner` user (the runner refuses to run as root).
-- `entrypoint.sh` — requests a registration token from the GitHub API, runs
-  `config.sh --unattended --replace`, starts `run.sh`, and on `SIGTERM` stops
-  the runner and calls `config.sh remove` so no offline runner is left behind.
+- `entrypoint.sh` — restores a saved registration if there is one, otherwise
+  runs `config.sh --unattended --replace` with `RUNNER_TOKEN` and saves what it
+  produced, then starts `run.sh` and stops it on `SIGTERM`.
