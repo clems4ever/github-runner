@@ -25,8 +25,16 @@ services:
       # runner root-equivalent access to the host, so only do it for trusted
       # workflows.
       # - /var/run/docker.sock:/var/run/docker.sock
+    # Uncomment to let jobs run hardware-accelerated VMs (Android emulator,
+    # QEMU/libvirt, ...). No privileged mode needed, but the device is owned by
+    # the host's kvm group, hence the matching group_add entry.
+    # devices:
+    #   - /dev/kvm:/dev/kvm
+    # Groups the runner joins on top of its own; uncomment the line that goes
+    # with each of the two blocks above.
     # group_add:
     #   - ${DOCKER_GID:-988}
+    #   - ${KVM_GID:-104}
 
 volumes:
   # Keeps the registration (and only that) across `compose down` / `up`, so a
