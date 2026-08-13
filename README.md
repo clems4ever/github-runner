@@ -122,6 +122,59 @@ host's daemon, uncomment the `docker.sock` mount and `group_add` entries in
 `docker-compose.yml` and set `DOCKER_GID` to the host's docker group id. Note
 that access to the host's Docker socket is equivalent to root on the host.
 
+### VMs inside jobs
+
+Jobs that boot a VM — the Android emulator, QEMU, libvirt, anything wanting
+`-accel kvm` — need the host's `/dev/kvm`. Passing that one device through is
+enough; the container does not need `privileged: true`.
+
+Check the host can do it at all:
+
+```bash
+ls -l /dev/kvm                    # crw-rw---- 1 root kvm ...
+stat -c %g /dev/kvm               # gid to put in KVM_GID
+```
+
+No such file means the kernel modules are not loaded (`modprobe kvm_intel` /
+`kvm_amd`), virtualisation is off in the firmware, or — if the host is itself a
+VM — nested virtualisation is not enabled for it.
+
+Then uncomment the `devices` entry and the `KVM_GID` line of `group_add` in
+`docker-compose.yml`, set `KVM_GID` in `.env` to the gid printed above, and
+recreate the container:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+The gid matters because `/dev/kvm` is `rw` for its group only, and the runner
+is an unprivileged user that is not in the host's `kvm` group by default.
+`group_add` takes numeric gids, and the gid of `kvm` varies by distribution and
+by install order (often 104 on Debian/Ubuntu, 36 on Fedora), so read it from
+the host rather than copying a number.
+
+Verify from a workflow:
+
+```yaml
+- run: |
+    ls -l /dev/kvm
+    sudo apt-get update && sudo apt-get install -y cpu-checker
+    kvm-ok
+```
+
+The image ships no QEMU, libvirt or emulator packages: jobs install what they
+need (the runner user has passwordless `sudo`), or an action such as
+[`reactivecircus/android-emulator-runner`](https://github.com/ReactiveCircus/android-emulator-runner)
+brings its own.
+
+KVM only accelerates guests of the host's own architecture — an arm64 host
+runs arm64 guests at native speed and x86 guests through slow emulation.
+
+Access to `/dev/kvm` is far narrower than the Docker socket: it does not grant
+root on the host. It is still a kernel interface reachable by whatever a
+workflow runs, and a job can exhaust the host's memory and CPU with it, so keep
+it to repositories you trust.
+
 ### Upgrading the runner
 
 Bump `ARG RUNNER_VERSION` and the checksums in the `Dockerfile`
