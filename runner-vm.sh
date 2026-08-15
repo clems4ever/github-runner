@@ -106,7 +106,12 @@ FORCE=false
 # print_help echoes the comment block at the top of this file, so the usage
 # text and the documentation cannot drift apart.
 print_help() {
-  awk 'NR > 2 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "${BASH_SOURCE[0]}"
+  # Skips the shebang and "set" line, then prints the comment block, stopping
+  # at the first line that is not a comment once the block has started — the
+  # blank line between the two is why this cannot simply stop at line three.
+  awk 'NR <= 2 { next }
+       /^#/    { seen = 1; sub(/^# ?/, ""); print; next }
+       seen    { exit }' "${BASH_SOURCE[0]}"
 }
 
 log()  { echo "[runner-vm] $*"; }
