@@ -34,6 +34,8 @@ set -euo pipefail
 #   --url URL             GITHUB_URL       repository or organisation
 #   --token TOKEN         RUNNER_TOKEN     registration token
 #   --github-token PAT    GITHUB_TOKEN     PAT, to mint a token automatically
+#   --app-id ID           GITHUB_APP_ID    GitHub App id, instead of a PAT
+#   --app-key FILE        GITHUB_APP_PRIVATE_KEY   the app's PEM private key
 #   --name NAME           RUNNER_NAME      runner name
 #   --labels a,b          RUNNER_LABELS    extra labels
 #   --group GROUP         RUNNER_GROUP     runner group
@@ -47,6 +49,8 @@ set -euo pipefail
 # Examples:
 #   ./runner-vm.sh --url https://github.com/runyard-ai --token AAA...
 #   GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/runyard-ai
+#   ./runner-vm.sh --url https://github.com/runyard-ai --app-id 123456 \
+#     --app-key /etc/runner-vm/app.pem
 #   ./runner-vm.sh build --force
 
 VERSION=0.1.0
@@ -85,6 +89,11 @@ VM_NESTED=${VM_NESTED:-true}
 GITHUB_URL=${GITHUB_URL:-}
 RUNNER_TOKEN=${RUNNER_TOKEN:-}
 GITHUB_TOKEN=${GITHUB_TOKEN:-${GH_TOKEN:-}}
+# A GitHub App is the alternative to a PAT: it belongs to the organisation
+# rather than to a person, so it neither expires nor leaves with anyone.
+GITHUB_APP_ID=${GITHUB_APP_ID:-}
+GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY:-}
+GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID:-}
 RUNNER_NAME=${RUNNER_NAME:-}
 RUNNER_LABELS=${RUNNER_LABELS:-}
 RUNNER_GROUP=${RUNNER_GROUP:-Default}
@@ -586,9 +595,6 @@ qemu_machine() {
 # Running a runner
 # --------------------------------------------------------------------------
 
-# mint_token exchanges a PAT for a registration token. A registration token
-# expires an hour after GitHub issues it and a VM never keeps its registration,
-# so this is what makes restarts work without a fresh paste every time.
 # github_api_prefix prints the API root for the runner endpoints of a URL. The
 # endpoints differ only in whether they hang off a repository or an
 # organisation, which is also what decides the PAT scope needed.
@@ -613,6 +619,98 @@ api_call() {
     "$url"
 }
 
+# json_str pulls a top-level string field out of a JSON response. jq when it is
+# available, because the sed fallback cannot cope with nesting — which is fine
+# for the two flat responses read here.
+json_str() {
+  local field=$1
+  if have jq; then
+    jq -r --arg f "$field" '.[$f] // empty'
+  else
+    sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+  fi
+}
+
+# --- GitHub App authentication -------------------------------------------
+#
+# A PAT is a long-lived credential belonging to a person: it expires, and it
+# stops working when they leave. A GitHub App belongs to the organisation
+# instead, and its private key mints an installation token that lasts an hour.
+# For a server expected to reboot unattended for months, that is the difference
+# between "restarts for ever" and "restarts until the PAT expires".
+#
+# Nothing here is stored: the JWT is signed per call and the installation token
+# is used immediately to mint a registration token.
+
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+# app_jwt signs the short-lived assertion that authenticates as the app itself.
+app_jwt() {
+  local now iat exp header payload unsigned sig
+  now=$(date +%s)
+  # Backdated by a minute against clock skew, and well inside the ten minutes
+  # GitHub allows.
+  iat=$((now - 60))
+  exp=$((now + 480))
+  header='{"alg":"RS256","typ":"JWT"}'
+  payload="{\"iat\":${iat},\"exp\":${exp},\"iss\":\"${GITHUB_APP_ID}\"}"
+  unsigned="$(printf '%s' "$header" | b64url).$(printf '%s' "$payload" | b64url)"
+  sig=$(printf '%s' "$unsigned" \
+    | openssl dgst -sha256 -sign "$GITHUB_APP_PRIVATE_KEY" -binary \
+    | b64url) || die "cannot sign with ${GITHUB_APP_PRIVATE_KEY} (is it the app's PEM private key?)"
+  printf '%s.%s' "$unsigned" "$sig"
+}
+
+app_api_call() {
+  local method=$1 url=$2 jwt=$3
+  curl -fsSL -X "$method" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -H "Authorization: Bearer ${jwt}" \
+    "$url"
+}
+
+# app_installation_token exchanges the app's private key for an installation
+# token, which is then used exactly like a PAT.
+app_installation_token() {
+  local url=$1 jwt id token api
+  [[ -r "$GITHUB_APP_PRIVATE_KEY" ]] || die "cannot read the app private key at ${GITHUB_APP_PRIVATE_KEY}"
+  have openssl || die "openssl is required for GitHub App authentication"
+
+  jwt=$(app_jwt)
+  api=$(github_api_prefix "$url")
+
+  id=$GITHUB_APP_INSTALLATION_ID
+  if [[ -z "$id" ]]; then
+    # The app knows where it is installed, so there is no need to make the
+    # operator hunt for an installation id.
+    id=$(app_api_call GET "${api}/installation" "$jwt" 2>/dev/null | json_str id) \
+      || die "the app is not installed on $(sed -E 's#^https?://[^/]+/##' <<<"$url"), or GITHUB_APP_ID is wrong"
+    [[ -n "$id" ]] || die "cannot find the app's installation on $(sed -E 's#^https?://[^/]+/##' <<<"$url"): install the app there, or set GITHUB_APP_INSTALLATION_ID"
+  fi
+
+  local base
+  base=$(sed -E 's#(https://[^/]+(/api/v3)?)/.*#\1#' <<<"$api")
+  token=$(app_api_call POST "${base}/app/installations/${id}/access_tokens" "$jwt" 2>/dev/null | json_str token) \
+    || die "GitHub refused an installation token for installation ${id}"
+  [[ -n "$token" ]] || die "GitHub returned no installation token"
+  echo "$token"
+}
+
+# resolve_github_token fills in GITHUB_TOKEN from whichever long-lived
+# credential is configured. Both paths end in the same place: a credential that
+# can mint a registration token per boot, so a reboot needs no human.
+resolve_github_token() {
+  [[ -n "$GITHUB_TOKEN" ]] && return 0
+  [[ -n "$GITHUB_APP_ID" && -n "$GITHUB_APP_PRIVATE_KEY" ]] || return 0
+  log "authenticating as GitHub App ${GITHUB_APP_ID}"
+  GITHUB_TOKEN=$(app_installation_token "$GITHUB_URL")
+}
+
+# mint_token exchanges the long-lived credential for a registration token,
+# which is what a runner actually registers with. One is minted per boot,
+# because a registration token expires an hour after GitHub issues it and a VM
+# never keeps its registration.
 mint_token() {
   local url=$1
   local response
@@ -622,11 +720,7 @@ mint_token() {
     die "GitHub refused to mint a registration token: a classic PAT needs ${need}, a fine-grained one needs 'Administration' (read and write)"
   }
 
-  if have jq; then
-    jq -r .token <<<"$response"
-  else
-    sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$response"
-  fi
+  json_str token <<<"$response"
 }
 
 # deregister_runner removes the runner entry a non-ephemeral VM leaves behind.
@@ -824,13 +918,20 @@ cmd_run() {
     cmd_build
   fi
 
+  resolve_github_token
+
   if [[ -z "$RUNNER_TOKEN" ]]; then
     if [[ -n "$GITHUB_TOKEN" ]]; then
       log "minting a registration token"
       RUNNER_TOKEN=$(mint_token "$GITHUB_URL")
       [[ -n "$RUNNER_TOKEN" ]] || die "GitHub returned no registration token"
     else
-      die "no registration token: pass --token from ${GITHUB_URL}/settings/actions/runners/new, or --github-token to mint one"
+      die "no way to register a runner. Either:
+  --token TOKEN         a registration token from ${GITHUB_URL}/settings/actions/runners/new
+                        (good for an hour, so it will not survive a reboot)
+  --github-token PAT    mints one per boot; expires when the PAT does
+  --app-id / --app-key  mints one per boot from a GitHub App, which belongs to
+                        the organisation rather than to a person"
     fi
   fi
 
@@ -970,6 +1071,12 @@ main() {
       --token=*)        RUNNER_TOKEN=${1#*=}; shift ;;
       --github-token)   GITHUB_TOKEN=$2; shift 2 ;;
       --github-token=*) GITHUB_TOKEN=${1#*=}; shift ;;
+      --app-id)         GITHUB_APP_ID=$2; shift 2 ;;
+      --app-id=*)       GITHUB_APP_ID=${1#*=}; shift ;;
+      --app-key)        GITHUB_APP_PRIVATE_KEY=$2; shift 2 ;;
+      --app-key=*)      GITHUB_APP_PRIVATE_KEY=${1#*=}; shift ;;
+      --app-installation-id)   GITHUB_APP_INSTALLATION_ID=$2; shift 2 ;;
+      --app-installation-id=*) GITHUB_APP_INSTALLATION_ID=${1#*=}; shift ;;
       --name)           RUNNER_NAME=$2; shift 2 ;;
       --name=*)         RUNNER_NAME=${1#*=}; shift ;;
       --labels)         RUNNER_LABELS=$2; shift 2 ;;

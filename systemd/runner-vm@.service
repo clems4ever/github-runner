@@ -54,19 +54,28 @@ StateDirectory=runner-vm
 Environment=RUNNER_VM_HOME=/var/lib/runner-vm
 WorkingDirectory=/var/lib/runner-vm
 
-# GITHUB_URL and GITHUB_TOKEN live here. systemd reads this file as root before
-# dropping to User=, so it can stay 0600 root-owned and the PAT is never
-# readable by the service user — or by anything a job runs, which only ever
-# sees the short-lived registration token minted from it.
+# GITHUB_URL and the long-lived credential live here. systemd reads this file
+# as root before dropping to User=, so it can stay 0600 root-owned and the
+# credential is never readable by the service user — or by anything a job runs,
+# which only ever sees the hour-long registration token minted from it.
 EnvironmentFile=/etc/runner-vm/env
+
+# For GitHub App authentication, uncomment both lines and drop the app's
+# private key at /etc/runner-vm/app.pem. LoadCredential hands the service a
+# copy readable only by it, so the key on disk stays 0600 root-owned. Both stay
+# commented by default because LoadCredential fails the unit when its source
+# file is missing, which would break the PAT setup.
+#LoadCredential=app.pem:/etc/runner-vm/app.pem
+#Environment=GITHUB_APP_PRIVATE_KEY=%d/app.pem
 
 ExecStart=/usr/local/bin/runner-vm.sh run --name %i
 
 # Every start registers a new runner, because a VM keeps nothing. That needs a
-# valid registration token, and a pasted one expires an hour after it is
-# issued — so a service that survives a reboot needs the PAT path. Fail loudly
-# rather than boot a VM that cannot register.
-ExecStartPre=/bin/sh -c '[ -n "$GITHUB_TOKEN" ] || { echo "GITHUB_TOKEN is required: a registration token pasted into the environment file expires an hour after it is issued and will not survive a reboot" >&2; exit 1; }'
+# registration token, and a pasted one expires an hour after it is issued — so
+# a service that survives a reboot needs a credential that can mint them:
+# either a PAT or a GitHub App. Fail loudly rather than boot a VM that cannot
+# register.
+ExecStartPre=/bin/sh -c '[ -n "$GITHUB_TOKEN" ] || [ -n "$GITHUB_APP_ID" ] || { echo "set GITHUB_TOKEN (a PAT) or GITHUB_APP_ID with GITHUB_APP_PRIVATE_KEY in /etc/runner-vm/env: a pasted registration token expires an hour after it is issued and will not survive a reboot" >&2; exit 1; }'
 
 Restart=always
 RestartSec=15

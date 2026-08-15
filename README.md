@@ -235,17 +235,46 @@ The token is the one from *Settings → Actions → Runners → New self-hosted
 runner*, the same as `.env`. An existing `.env` from the container setup is
 read automatically, so `./runner-vm.sh` on its own also works.
 
-A VM never keeps its registration — it is deleted along with everything else —
-so every start needs a valid token. Rather than pasting one per hour, give the
-script a PAT and it mints one per boot:
+### Tokens, and why a reboot needs no human
+
+There are two different tokens, and it is worth keeping them apart:
+
+- a **registration token** is what a runner registers with. It expires an hour
+  after GitHub issues it, and a VM keeps nothing, so a new one is needed on
+  every boot.
+- a **long-lived credential** is what mints those. It is configured once.
+
+Pasting a registration token with `--token` therefore works exactly once, for
+an hour. Give the script a credential instead and it mints a registration token
+per boot, so restarts — including a host reboot at 4am — need nobody:
 
 ```bash
 GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/OWNER/REPO
 ```
 
 The PAT needs the `repo` scope for a repository runner, or `admin:org` for an
-organisation one. It stays on the host: what reaches the VM is the registration
-token it mints, which is good for an hour and nothing else.
+organisation one.
+
+**A GitHub App is the better credential for a server.** A PAT belongs to a
+person: it expires — a fine-grained one after a year at most — and it stops
+working when they leave the organisation, which surfaces as runners silently
+failing to come back after a reboot months later. An app belongs to the
+organisation instead, and its private key does not expire:
+
+```bash
+./runner-vm.sh --url https://github.com/OWNER \
+  --app-id 123456 --app-key /etc/runner-vm/app.pem
+```
+
+Create it under *Organisation settings → Developer settings → GitHub Apps*,
+give it the **Self-hosted runners: Read and write** organisation permission (or
+**Administration: Read and write** for a repository runner), install it on the
+organisation, and download a private key. The installation is discovered
+automatically; `GITHUB_APP_INSTALLATION_ID` overrides that if the app is
+installed in more than one place.
+
+Either way the credential stays on the host. What reaches the VM is only the
+registration token minted from it, which is good for an hour and nothing else.
 
 The first run builds a golden image — a cloud image with Docker, QEMU and the
 runner already installed — which takes a few minutes. Later runs boot a
@@ -343,13 +372,23 @@ Build the golden image first, as above, or the service's first start spends a
 few minutes doing it. Run more runners by enabling more instances:
 `runner-vm@build2`, and so on.
 
-**A PAT is effectively required here.** A VM keeps nothing, so every start
-registers a new runner, and a registration token expires an hour after GitHub
-issues it — a pasted one cannot survive a reboot. The unit refuses to start
-without `GITHUB_TOKEN` rather than boot a VM that cannot register. The PAT is
-read by systemd as root before it drops to the service user, so
-`/etc/runner-vm/env` stays `0600` root-owned and nothing a job runs can read
-it; the VM only ever receives the hour-long registration token minted from it.
+**A minting credential is required here** — a PAT or an app, not a pasted
+token, for the reasons above. The unit refuses to start without one rather than
+boot a VM that cannot register. systemd reads `/etc/runner-vm/env` as root
+before dropping to the service user, so it stays `0600` root-owned and nothing
+a job runs can read it; the VM only ever receives the hour-long registration
+token minted from it.
+
+For a GitHub App, uncomment the two `LoadCredential` lines in the unit and put
+the private key at `/etc/runner-vm/app.pem`. systemd then hands the service a
+copy readable only by it, so the key on disk also stays `0600` root-owned:
+
+```
+LoadCredential=app.pem:/etc/runner-vm/app.pem
+Environment=GITHUB_APP_PRIVATE_KEY=%d/app.pem
+```
+
+with `GITHUB_APP_ID=123456` in `/etc/runner-vm/env`.
 
 Two settings in the unit are worth knowing about:
 
