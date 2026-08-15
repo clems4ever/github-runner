@@ -318,6 +318,54 @@ clean runner available:
 while :; do GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/OWNER/REPO --ephemeral; done
 ```
 
+### Starting with the host, under systemd
+
+`systemd/runner-vm@.service` is a template unit, so the instance name is the
+runner name:
+
+```bash
+sudo install -m 0755 runner-vm.sh /usr/local/bin/runner-vm.sh
+sudo install -m 0644 systemd/runner-vm@.service /etc/systemd/system/
+sudo useradd --system --create-home --home-dir /var/lib/runner-vm runner-vm
+sudo usermod -aG kvm runner-vm
+
+sudo install -d -m 0755 /etc/runner-vm
+printf 'GITHUB_URL=https://github.com/OWNER/REPO\nGITHUB_TOKEN=ghp_...\n' \
+  | sudo tee /etc/runner-vm/env >/dev/null
+sudo chmod 0600 /etc/runner-vm/env
+
+sudo -u runner-vm RUNNER_VM_HOME=/var/lib/runner-vm /usr/local/bin/runner-vm.sh build
+sudo systemctl daemon-reload
+sudo systemctl enable --now runner-vm@build1
+```
+
+Build the golden image first, as above, or the service's first start spends a
+few minutes doing it. Run more runners by enabling more instances:
+`runner-vm@build2`, and so on.
+
+**A PAT is effectively required here.** A VM keeps nothing, so every start
+registers a new runner, and a registration token expires an hour after GitHub
+issues it — a pasted one cannot survive a reboot. The unit refuses to start
+without `GITHUB_TOKEN` rather than boot a VM that cannot register. The PAT is
+read by systemd as root before it drops to the service user, so
+`/etc/runner-vm/env` stays `0600` root-owned and nothing a job runs can read
+it; the VM only ever receives the hour-long registration token minted from it.
+
+Two settings in the unit are worth knowing about:
+
+- `KillMode=mixed`. QEMU daemonises itself but stays in the service's cgroup,
+  so the default would signal it directly — the equivalent of pulling the VM's
+  power cord. `mixed` sends `SIGTERM` to the script alone, which then asks the
+  guest to shut down.
+- `SHUTDOWN_TIMEOUT=3600` with `TimeoutStopSec=3660`. Stopping is deliberately
+  not instant: the runner inside the VM finishes the job it is on first. The
+  two have to stay in step — the first is how long the script waits before
+  killing QEMU, the second how long systemd waits before killing the script.
+
+`Restart=always` also gives ephemeral runners for free: the VM powers off after
+its job, systemd starts a new one. Set `EPHEMERAL=true` in
+`/etc/runner-vm/env` and drop the `while` loop above.
+
 ### Caveats
 
 - Boot costs a few seconds and the VM holds its memory for as long as it runs,
