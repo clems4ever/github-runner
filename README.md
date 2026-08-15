@@ -189,6 +189,146 @@ Bump `ARG RUNNER_VERSION` and the checksums in the `Dockerfile`
 `main`. The workflow republishes `latest` and tags the image with the new
 runner version; `docker compose pull && docker compose up -d` picks it up.
 
+## Running in a VM instead of a container
+
+`runner-vm.sh` runs the same runner inside a throwaway QEMU virtual machine. It
+is a wrapper, not a second implementation: the VM does what the `Dockerfile`
+does — download the runner package, verify it, extract it — and then runs
+`entrypoint.sh` exactly as the container does.
+
+The VM belongs to the process that started it. Stop the script and the machine
+is powered off and its disk deleted, so nothing a job did survives into the
+next one.
+
+What a job gets that the container cannot give it safely:
+
+| | container | VM |
+| --- | --- | --- |
+| Docker | the host's daemon through `docker.sock`, which is root on the host | a daemon of its own |
+| `/dev/kvm` | the host's, shared | the VM's own, through nested virtualisation |
+| kernel | the host's | its own, free to break |
+| cleanup | whatever the job left in the volume | the disk is deleted |
+
+### Requirements
+
+```bash
+sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
+./runner-vm.sh doctor
+```
+
+`doctor` checks KVM, nested virtualisation and the tools, and prints the fix
+for anything missing. Nested virtualisation is the one that usually needs
+turning on:
+
+```bash
+sudo modprobe -r kvm_amd && sudo modprobe kvm_amd nested=1   # kvm_intel on Intel
+echo 'options kvm_amd nested=1' | sudo tee /etc/modprobe.d/kvm_amd.conf
+```
+
+### Use
+
+```bash
+./runner-vm.sh --url https://github.com/OWNER/REPO --token AAAA...
+```
+
+The token is the one from *Settings → Actions → Runners → New self-hosted
+runner*, the same as `.env`. An existing `.env` from the container setup is
+read automatically, so `./runner-vm.sh` on its own also works.
+
+A VM never keeps its registration — it is deleted along with everything else —
+so every start needs a valid token. Rather than pasting one per hour, give the
+script a PAT and it mints one per boot:
+
+```bash
+GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/OWNER/REPO
+```
+
+The PAT needs the `repo` scope for a repository runner, or `admin:org` for an
+organisation one. It stays on the host: what reaches the VM is the registration
+token it mints, which is good for an hour and nothing else.
+
+The first run builds a golden image — a cloud image with Docker, QEMU and the
+runner already installed — which takes a few minutes. Later runs boot a
+copy-on-write overlay on top of it in seconds. Rebuild it after bumping
+`RUNNER_VERSION` with `./runner-vm.sh build --force`.
+
+Run several by starting the script several times; each VM gets its own name,
+disk and ssh port.
+
+### Flags
+
+Every flag has an environment variable equivalent, so `.env` keeps working.
+
+| Flag | Variable | Default | Description |
+| --- | --- | --- | --- |
+| `--url` | `GITHUB_URL` | — | Repository or organisation URL |
+| `--token` | `RUNNER_TOKEN` | — | Registration token |
+| `--github-token` | `GITHUB_TOKEN` | — | PAT, to mint a registration token per boot |
+| `--name` | `RUNNER_NAME` | `vm-<host>-<pid>` | Runner name |
+| `--labels` | `RUNNER_LABELS` | — | Extra comma-separated labels |
+| `--group` | `RUNNER_GROUP` | `Default` | Runner group |
+| `--cpus` | `VM_CPUS` | `2` | vCPUs |
+| `--memory` | `VM_MEMORY_MB` | `4096` | Memory in MiB |
+| `--disk` | `VM_DISK_GB` | `40` | Disk in GiB |
+| `--ephemeral` | `EPHEMERAL` | `false` | Take one job, then stop — the VM powers off and is deleted |
+| `--no-nested` | `VM_NESTED` | nested on | Do not expose `vmx`/`svm` to the VM |
+| `--env-file` | | `.env` | Read settings from this file when it exists |
+
+`RUNNER_VM_HOME` moves the cached images and VM disks, which default to
+`~/.local/share/runner-vm`.
+
+### Verifying it from a workflow
+
+```yaml
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - run: docker run --rm hello-world     # the VM's own daemon
+      - run: |
+          sudo apt-get update && sudo apt-get install -y cpu-checker
+          kvm-ok                             # nested virtualisation
+```
+
+### How it works
+
+- `runner-vm.sh build` boots the Ubuntu cloud image once with a cloud-init
+  seed that installs Docker, QEMU and the runner package, then powers off. The
+  result is the golden image.
+- `runner-vm.sh run` creates a qcow2 overlay on that image and a second seed
+  carrying the registration details and `entrypoint.sh`, and boots it with
+  `-cpu host,+svm` (or `+vmx`) so the guest can run VMs of its own.
+- Inside, a systemd unit runs `entrypoint.sh` as the unprivileged `runner`
+  user, with its output on the serial console — which is what the script
+  streams to the terminal.
+- When the runner stops, the unit powers the machine off; when the machine is
+  gone, the script deletes the disk. Interrupting the script does the same
+  thing from the other direction: it asks the guest to power off, waits, and
+  then deletes the disk.
+
+### Ephemeral runners, without the token churn
+
+`--ephemeral` is far more useful here than it is for the container. The runner
+takes one job and stops, the VM powers off, and the script deletes it — a
+genuinely clean machine per job rather than a clean workspace. Combined with
+`--github-token` there is no token to paste, so a loop is enough to keep a
+clean runner available:
+
+```bash
+while :; do GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/OWNER/REPO --ephemeral; done
+```
+
+### Caveats
+
+- Boot costs a few seconds and the VM holds its memory for as long as it runs,
+  so this is heavier than a container. That is the trade for the isolation.
+- Nested virtualisation only accelerates guests of the host's architecture, and
+  an L2 guest is slower than an L1 one.
+- With `--github-token` the runner is deleted from *Settings → Actions →
+  Runners* on the way out. Without one there is no credential to do that with,
+  so the entry stays there as offline until a runner of the same name takes it
+  over, exactly as it does for the container.
+
 ## Publishing
 
 `.github/workflows/build.yml` builds the image with buildx (QEMU for arm64) and
