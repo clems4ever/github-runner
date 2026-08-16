@@ -209,11 +209,38 @@ What a job gets that the container cannot give it safely:
 | kernel | the host's | its own, free to break |
 | cleanup | whatever the job left in the volume | the disk is deleted |
 
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/clems4ever/github-runner/main/runner-vm.sh \
+  | sudo bash -s -- install
+```
+
+That puts `runner-vm.sh` in `/usr/local/bin` and prints how to boot a first
+runner. It touches nothing else — no user, no unit, no configuration — so it is
+safe to run on a host before deciding anything.
+
+Installing from a branch means telling it where it came from, or it would fetch
+`main` instead of the version being piped:
+
+```bash
+URL=https://raw.githubusercontent.com/clems4ever/github-runner/feat/qemu-runner-vm/runner-vm.sh
+curl -fsSL "$URL" | sudo SCRIPT_URL="$URL" bash -s -- install
+```
+
+Or just download it and run it from anywhere — it is a single self-contained
+script with no repository around it:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/clems4ever/github-runner/main/runner-vm.sh
+chmod +x runner-vm.sh
+```
+
 ### Requirements
 
 ```bash
 sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
-./runner-vm.sh doctor
+sudo runner-vm.sh doctor
 ```
 
 `doctor` checks KVM, nested virtualisation and the tools, and prints the fix

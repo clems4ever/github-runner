@@ -30,8 +30,8 @@ set -euo pipefail
 #   list      Show the VMs on this host and the services managing them
 #   clean     Stop the services and every VM, and delete local state, to start
 #             over after a bad credential. Keeps the images unless --all is given
-#   install   Install the script, the systemd unit and the service user, so
-#             runners start with the host. Run as root
+#   install   Install the script, the systemd unit and the service user, build
+#             the image and start a runner. Run as root
 #   uninstall Remove everything: services, unit, configuration, state and this
 #             script
 #   print-unit  Print the systemd unit install would write
@@ -56,6 +56,11 @@ set -euo pipefail
 #   --ephemeral           EPHEMERAL        take one job, then stop
 #   --no-nested           VM_NESTED=false  do not expose vmx/svm to the VM
 #   --env-file FILE                        default .env, when present
+#
+# Flags for install:
+#   --name NAME           the runner to enable (default runner-1)
+#   --no-build            do not build the golden image
+#   --no-start            do not enable and start the service
 #
 # Flags for clean:
 #   --all                 also delete the images and the ssh key, i.e. all of
@@ -160,6 +165,11 @@ RUNNER_GROUP=${RUNNER_GROUP:-Default}
 EPHEMERAL=${EPHEMERAL:-false}
 DISABLE_UPDATE=${DISABLE_UPDATE:-false}
 
+# Where the script fetches itself from when it was piped into bash and so has
+# no file of its own to install. Override when installing from a branch, or
+# install would fetch a different version than the one being run.
+SCRIPT_URL=${SCRIPT_URL:-https://raw.githubusercontent.com/clems4ever/github-runner/main/runner-vm.sh}
+
 # Where "install" puts things, and who the service runs as.
 INSTALL_BIN=${INSTALL_BIN:-/usr/local/bin/runner-vm.sh}
 SERVICE_USER=${SERVICE_USER:-runner-vm}
@@ -169,16 +179,29 @@ ENV_FILE=${ENV_FILE:-.env}
 FORCE=false
 CLEAN_ALL=false
 ASSUME_YES=false
+# install does the whole job by default: a host with a runner on it, not a host
+# with the pieces of one.
+INSTALL_SERVICE=false
+INSTALL_BUILD=true
+INSTALL_START=true
 
 # print_help echoes the comment block at the top of this file, so the usage
 # text and the documentation cannot drift apart.
 print_help() {
+  # Piped from curl there is no file to read the comment block out of.
+  local self=${BASH_SOURCE[0]:-}
+  if [[ -z "$self" || ! -f "$self" ]]; then
+    echo "runner-vm ${VERSION} — self-hosted GitHub Actions runners in QEMU VMs"
+    echo "Commands: run, build, list, doctor, install, uninstall, clean, print-unit"
+    echo "Full help: ${SCRIPT_URL}"
+    return 0
+  fi
   # Skips the shebang and "set" line, then prints the comment block, stopping
   # at the first line that is not a comment once the block has started — the
   # blank line between the two is why this cannot simply stop at line three.
   awk 'NR <= 2 { next }
        /^#/    { seen = 1; sub(/^# ?/, ""); print; next }
-       seen    { exit }' "${BASH_SOURCE[0]}"
+       seen    { exit }' "$self"
 }
 
 log()  { echo "[runner-vm] $*"; }
@@ -1548,15 +1571,123 @@ WantedBy=multi-user.target
 UNIT
 }
 
+# print_getting_started is what a fresh install leaves on the screen: the
+# shortest path from "the script is here" to "a runner is registered", in the
+# order the steps actually have to happen.
+print_getting_started() {
+  local url=${GITHUB_URL:-https://github.com/OWNER/REPO}
+  cat <<GUIDE
+
+  runner-vm is installed at ${INSTALL_BIN}
+
+  It runs a self-hosted GitHub Actions runner inside a throwaway QEMU VM: one
+  machine per runner, deleted when it stops, with its own Docker daemon and
+  /dev/kvm so jobs can build images and boot VMs of their own.
+
+  Boot your first runner
+  ----------------------
+
+  1. Check the host has KVM and nested virtualisation. It prints the fix for
+     anything missing.
+
+       sudo ${INSTALL_BIN} doctor
+
+  2. Build the golden image. Once per host, a few minutes; every VM afterwards
+     boots from a copy-on-write overlay on it in seconds.
+
+       sudo ${INSTALL_BIN} build
+
+  3. Give it a credential. A registration token from
+     ${url}/settings/actions/runners/new
+     works for one hour, which is enough to try it out:
+
+       sudo ${INSTALL_BIN} run --url ${url} --token AAAA...
+
+     For anything lasting, use a PAT or a GitHub App instead: a VM keeps no
+     registration, so every boot needs a fresh registration token, and the
+     script mints one per boot from either.
+
+       sudoedit /etc/runner-vm/pat          # paste the PAT, save
+       sudo ${INSTALL_BIN} run --url ${url} --github-token-file /etc/runner-vm/pat
+
+     A fine-grained PAT needs Administration: Read and write on the repository,
+     or the organisation's Self-hosted runners: Read and write.
+
+  4. That runs in the foreground and the VM dies with it, which is the right
+     way to check it works. To have runners start with the host instead:
+
+       sudo ${INSTALL_BIN} install --service \\
+         --url ${url} --github-token-file /etc/runner-vm/pat
+
+     which adds a systemd unit, an unprivileged service user, builds the image
+     and starts runner-vm@runner-1. Add more with:
+
+       sudo systemctl enable --now runner-vm@runner-2
+
+  Then
+  ----
+
+    ${INSTALL_BIN} list          what is running, with ssh ports and uptime
+    ${INSTALL_BIN} --help        every flag
+    sudo ${INSTALL_BIN} clean    stop everything, keep the image cache
+
+  Jobs target it with "runs-on: self-hosted".
+
+GUIDE
+}
+
+# install_source is the file to install.
+#
+# Piped into bash — "curl ... | sudo bash -s -- install" — there is no file to
+# copy, so the canonical one is fetched instead. That is also why SCRIPT_URL
+# has to point at the same branch being piped, or the installed copy would be a
+# different version than the one that ran.
+install_source() {
+  local self=${BASH_SOURCE[0]:-} src=""
+  [[ -n "$self" ]] && src=$(readlink -f "$self" 2>/dev/null || true)
+  if [[ -n "$src" && -f "$src" ]]; then
+    echo "$src"
+    return 0
+  fi
+
+  local tmp; tmp=$(mktemp)
+  log "fetching ${SCRIPT_URL}" >&2
+  curl -fsSL -o "$tmp" "$SCRIPT_URL" || die "cannot fetch ${SCRIPT_URL}"
+  bash -n "$tmp" || die "${SCRIPT_URL} is not a valid script"
+  echo "$tmp"
+}
+
 # cmd_install puts the script, the unit and the service user in place. It is
 # the runbook, so that getting a host ready is one command rather than ten
 # that are easy to get subtly wrong.
 cmd_install() {
   [[ $(id -u) -eq 0 ]] || die "install has to run as root: sudo $0 install ..."
 
-  local source; source=$(readlink -f "${BASH_SOURCE[0]}")
+  local source; source=$(install_source)
   install -m 0755 "$source" "$INSTALL_BIN"
   log "installed ${INSTALL_BIN}"
+
+  # Plain "install" puts the management script on the host and stops there,
+  # touching nothing else. Setting a machine up involves decisions — which
+  # repository, which credential, how many runners — so printing them beats
+  # guessing, and leaves a host that is easy to undo.
+  if [[ "$INSTALL_SERVICE" != "true" ]]; then
+    print_getting_started
+    return 0
+  fi
+
+  require_host
+
+  # Check the credential before anything slow. Discovering a bad token after
+  # six minutes of building an image is the wrong order to find out.
+  resolve_token_files
+  if [[ -n "$GITHUB_URL" && -n "$GITHUB_TOKEN" ]]; then
+    log "checking the credential against ${GITHUB_URL}"
+    mint_token "$GITHUB_URL" >/dev/null
+    log "the credential can register runners"
+  elif [[ -z "$GITHUB_TOKEN" && -z "$GITHUB_APP_ID" && -z "$RUNNER_TOKEN" ]]; then
+    warn "no credential given; put one in /etc/runner-vm/env before starting a runner"
+  fi
 
   if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     useradd --system --create-home --home-dir "$SERVICE_STATE" "$SERVICE_USER"
@@ -1594,9 +1725,27 @@ cmd_install() {
   log "wrote /etc/systemd/system/runner-vm@.service"
   systemctl daemon-reload
 
-  log "installed. Next:"
-  log "  sudo -u ${SERVICE_USER} RUNNER_VM_HOME=${SERVICE_STATE} ${INSTALL_BIN} build"
-  log "  sudo systemctl enable --now runner-vm@${RUNNER_NAME:-runner-1}"
+  local instance=${RUNNER_NAME:-runner-1}
+
+  if [[ "$INSTALL_BUILD" == "true" ]]; then
+    log "building the golden image (a few minutes, once per host)"
+    sudo -u "$SERVICE_USER" \
+      env RUNNER_VM_HOME="$SERVICE_STATE" SCRIPT_URL="$SCRIPT_URL" \
+      "$INSTALL_BIN" build \
+      || die "the image build failed; fix it and rerun, or use --no-build"
+  fi
+
+  if [[ "$INSTALL_START" == "true" ]]; then
+    systemctl enable --now "runner-vm@${instance}"
+    log "started runner-vm@${instance}"
+    log ""
+    log "the runner appears at ${GITHUB_URL:-<your repo>}/settings/actions/runners in about a minute"
+    log "watch it come up with:"
+    log "  sudo journalctl -u runner-vm@${instance} -f"
+  else
+    log "installed. Start a runner with:"
+    log "  sudo systemctl enable --now runner-vm@${instance}"
+  fi
 }
 
 # cmd_uninstall removes the whole installation: the services, the unit, the
@@ -1660,7 +1809,9 @@ cmd_uninstall() {
 # Entry point
 # --------------------------------------------------------------------------
 
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Empty when piped from curl, in which case entrypoint.sh is fetched rather
+# than found next to the script.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || echo /nonexistent)
 
 main() {
   local command=run
@@ -1722,6 +1873,9 @@ main() {
       --no-nested)      VM_NESTED=false; shift ;;
       --force)          FORCE=true; shift ;;
       --all)            CLEAN_ALL=true; shift ;;
+      --service)        INSTALL_SERVICE=true; shift ;;
+      --no-build)       INSTALL_BUILD=false; shift ;;
+      --no-start)       INSTALL_START=false; shift ;;
       -y|--yes)         ASSUME_YES=true; shift ;;
       # Already handled before the loop, when the file was sourced.
       --env-file)       shift; [[ $# -gt 0 ]] && shift ;;
