@@ -24,7 +24,7 @@ jobs:
       - name: Read runner version
         id: runner
         run: |
-          version=$(grep -oP '^ARG RUNNER_VERSION=\K.*' Dockerfile)
+          version=$(grep -oP '^ARG RUNNER_VERSION=\K.*' docker/Dockerfile)
           echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
@@ -52,7 +52,10 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
+          # The root is the build context because the image copies
+          # entrypoint.sh, which lives there and is shared with the VM setup.
           context: .
+          file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           # The published image ships the Docker CLI; it is inert unless a
           # docker socket is mounted into the container.

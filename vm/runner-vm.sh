@@ -168,7 +168,7 @@ DISABLE_UPDATE=${DISABLE_UPDATE:-false}
 # Where the script fetches itself from when it was piped into bash and so has
 # no file of its own to install. Override when installing from a branch, or
 # install would fetch a different version than the one being run.
-SCRIPT_URL=${SCRIPT_URL:-https://raw.githubusercontent.com/clems4ever/github-runner/main/runner-vm.sh}
+SCRIPT_URL=${SCRIPT_URL:-https://raw.githubusercontent.com/clems4ever/github-runner/main/vm/runner-vm.sh}
 
 # Where "install" puts things, and who the service runs as.
 INSTALL_BIN=${INSTALL_BIN:-/usr/local/bin/runner-vm.sh}
@@ -978,9 +978,15 @@ deregister_runner() {
 # fetch_entrypoint returns the path to entrypoint.sh: the copy next to this
 # script when run from a clone, otherwise a downloaded one.
 fetch_entrypoint() {
-  local work=$1
-  local local_copy="${SCRIPT_DIR}/entrypoint.sh"
-  if [[ -f "$local_copy" ]]; then
+  local work=$1 local_copy=""
+  # Next to the script when it was copied out on its own, or one level up in a
+  # clone, where entrypoint.sh sits at the root and is shared with the
+  # container setup.
+  for candidate in "${SCRIPT_DIR}/entrypoint.sh" "${SCRIPT_DIR}/../entrypoint.sh"; do
+    if [[ -f "$candidate" ]]; then local_copy=$candidate; break; fi
+  done
+
+  if [[ -n "$local_copy" ]]; then
     cp "$local_copy" "${work}/entrypoint.sh"
   else
     curl -fsSL -o "${work}/entrypoint.sh" "$ENTRYPOINT_URL" \
