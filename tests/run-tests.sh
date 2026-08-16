@@ -395,6 +395,36 @@ if test_case "help"; then
   contains "documents the token flags" "$out" "--github-token-file"
 fi
 
+if test_case "service-config"; then
+  # The unit runs "run --name %i" and takes everything else from this file, so
+  # a setting install accepts but does not record is one it silently ignored —
+  # which is what happened to --cpus.
+  GITHUB_URL=https://github.com/o/r
+  VM_CPUS=8 VM_MEMORY_MB=16384 VM_DISK_GB=100 VM_NESTED=false
+  RUNNER_GROUP=mygroup EPHEMERAL=true RUNNER_LABELS=big GITHUB_APP_ID=42
+  env_out=$(service_env_file)
+
+  is "records the cores asked for"  "VM_CPUS=8"           "$(grep '^VM_CPUS=' <<<"$env_out")"
+  is "records the memory"           "VM_MEMORY_MB=16384"  "$(grep '^VM_MEMORY_MB=' <<<"$env_out")"
+  is "records the disk"             "VM_DISK_GB=100"      "$(grep '^VM_DISK_GB=' <<<"$env_out")"
+  is "records nested virtualisation" "VM_NESTED=false"    "$(grep '^VM_NESTED=' <<<"$env_out")"
+  is "records the runner group"     "RUNNER_GROUP=mygroup" "$(grep '^RUNNER_GROUP=' <<<"$env_out")"
+  is "records ephemeral"            "EPHEMERAL=true"      "$(grep '^EPHEMERAL=' <<<"$env_out")"
+  is "records the labels"           "RUNNER_LABELS=big"   "$(grep '^RUNNER_LABELS=' <<<"$env_out")"
+  is "records the app id"           "GITHUB_APP_ID=42"    "$(grep '^GITHUB_APP_ID=' <<<"$env_out")"
+  is "records the repository"       "GITHUB_URL=https://github.com/o/r" "$(grep '^GITHUB_URL=' <<<"$env_out")"
+
+  # The credential is never in there: it lives in its own root-only file.
+  lacks "keeps the credential out of it" "$env_out" "GITHUB_TOKEN="
+
+  # Empty optional values are left out rather than written blank, which
+  # systemd would read as a deliberate empty string.
+  RUNNER_LABELS="" GITHUB_APP_ID=""
+  lacks "omits labels when there are none" "$(service_env_file)" "RUNNER_LABELS="
+
+  VM_CPUS=2 VM_MEMORY_MB=4096 VM_DISK_GB=40 VM_NESTED=true RUNNER_GROUP=Default EPHEMERAL=false
+fi
+
 if test_case "install-guards"; then
   fails "install refuses to run as a normal user" \
     bash -c "source $SCRIPT; id() { echo 1000; }; cmd_install"
