@@ -27,7 +27,8 @@ set -euo pipefail
 #   run       Boot a VM and run a runner in it until stopped (the default)
 #   build     Build the golden image the VMs boot from
 #   doctor    Check the host for KVM, nested virtualisation and QEMU
-#   clean     Delete the cached images and any leftover VM state
+#   clean     Stop every VM and delete local state, to start over after a bad
+#             credential. Keeps the images unless --all is given
 #
 # Flags for run (each has an environment variable equivalent, so an existing
 # .env from the container setup works unchanged):
@@ -50,6 +51,11 @@ set -euo pipefail
 #   --no-nested           VM_NESTED=false  do not expose vmx/svm to the VM
 #   --env-file FILE                        default .env, when present
 #
+# Flags for clean:
+#   --all                 also delete the images and the ssh key, i.e. all of
+#                         the state directory
+#   -y, --yes             do not ask for confirmation
+#
 # Examples:
 #   ./runner-vm.sh --url https://github.com/runyard-ai --token AAA...
 #   GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/runyard-ai
@@ -57,6 +63,7 @@ set -euo pipefail
 #   ./runner-vm.sh --url https://github.com/runyard-ai --app-id 123456 \
 #     --app-key /etc/runner-vm/app.pem
 #   ./runner-vm.sh build --force
+#   ./runner-vm.sh clean --all --yes
 
 VERSION=0.1.0
 
@@ -112,6 +119,8 @@ DISABLE_UPDATE=${DISABLE_UPDATE:-false}
 
 ENV_FILE=${ENV_FILE:-.env}
 FORCE=false
+CLEAN_ALL=false
+ASSUME_YES=false
 
 # print_help echoes the comment block at the top of this file, so the usage
 # text and the documentation cannot drift apart.
@@ -1134,16 +1143,104 @@ cmd_run() {
   cleanup
 }
 
+# stop_stray_vms shuts down VMs whose owning process is gone — a wrapper killed
+# with SIGKILL, or a host that lost power — and deletes what they left behind.
+stop_stray_vms() {
+  local dir name pid waited
+  shopt -s nullglob
+  for dir in "$STATE_DIR"/vms/*/; do
+    name=$(basename "$dir")
+    pid=""
+    [[ -f "${dir}qemu.pid" ]] && pid=$(cat "${dir}qemu.pid" 2>/dev/null || true)
+
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "stopping VM ${name} (pid ${pid})"
+      kill "$pid" 2>/dev/null || true
+      waited=0
+      while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 15 ]]; do
+        sleep 1
+        waited=$((waited + 1))
+      done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+
+    rm -rf "$dir"
+    log "removed the VM ${name}"
+  done
+  shopt -u nullglob
+}
+
+# cmd_clean throws local state away so that a run can start over — most often
+# after a credential turned out to be wrong, when a half-registered runner and
+# a stale VM only make the next attempt harder to read.
+#
+# The images are caches and are kept: nothing about a token lives in them, and
+# rebuilding the golden image costs a download and several minutes. --all is
+# there for when the image itself is the problem, such as a runner version that
+# needs rebaking.
 cmd_clean() {
-  local golden; golden=$(golden_path)
-  rm -f "$golden"
-  log "removed ${golden}"
-  if [[ "$FORCE" == "true" ]]; then
-    rm -rf "$IMAGES_DIR"
-    log "removed the cached cloud images too"
+  local all=$CLEAN_ALL
+
+  echo "This will remove:"
+  echo "  - every runner VM in ${STATE_DIR}/vms, stopping any that are running"
+  if [[ "$all" == "true" ]]; then
+    echo "  - the golden image and the cached cloud image"
+    echo "  - the ssh key used to reach the VMs"
+    echo "  - ${STATE_DIR}, entirely"
   else
-    log "the cloud image is kept; add --force to delete it as well"
+    echo "  the images are kept, so the next run starts in seconds rather than"
+    echo "  rebuilding; --all removes those and the ssh key too"
   fi
+
+  # A VM that systemd owns would be restarted from under us, so say so rather
+  # than let the cleanup look as though it failed.
+  if have systemctl && systemctl list-units --state=active --no-legend 'runner-vm@*' 2>/dev/null | grep -q .; then
+    echo
+    warn "runner-vm services are still active; stop them first, or they will start new VMs:"
+    systemctl list-units --state=active --no-legend 'runner-vm@*' 2>/dev/null \
+      | awk '{ printf "    sudo systemctl stop %s\n", $1 }'
+  fi
+
+  if [[ "$ASSUME_YES" != "true" ]]; then
+    if [[ -t 0 ]]; then
+      local reply
+      read -r -p "Continue? [y/N] " reply
+      [[ "$reply" == [yY]* ]] || die "nothing was removed"
+    else
+      die "refusing to remove anything without a terminal to confirm at; pass --yes"
+    fi
+  fi
+
+  deregister_known_runners
+  stop_stray_vms
+
+  if [[ "$all" == "true" ]]; then
+    rm -rf "$STATE_DIR"
+    log "removed ${STATE_DIR}"
+  else
+    log "kept the golden image, so the next run starts in seconds"
+  fi
+
+  log "clean. Start again with a new token:"
+  log "  $0 --url ${GITHUB_URL:-https://github.com/OWNER/REPO} --github-token-file /path/to/pat"
+}
+
+# deregister_known_runners removes the GitHub entries for the VMs still on
+# disk, so a fresh start does not leave a list of offline runners behind. It is
+# best effort: the credential is often exactly what is being replaced.
+deregister_known_runners() {
+  [[ -n "$GITHUB_URL" ]] || return 0
+  resolve_token_files
+  [[ -n "$GITHUB_TOKEN" ]] || return 0
+  have jq || return 0
+
+  local dir name
+  shopt -s nullglob
+  for dir in "$STATE_DIR"/vms/*/; do
+    name=$(basename "$dir")
+    RUNNER_NAME=$name deregister_runner 2>/dev/null || true
+  done
+  shopt -u nullglob
 }
 
 # --------------------------------------------------------------------------
@@ -1211,6 +1308,8 @@ main() {
       --nested)         VM_NESTED=true; shift ;;
       --no-nested)      VM_NESTED=false; shift ;;
       --force)          FORCE=true; shift ;;
+      --all)            CLEAN_ALL=true; shift ;;
+      -y|--yes)         ASSUME_YES=true; shift ;;
       # Already handled before the loop, when the file was sourced.
       --env-file)       shift; [[ $# -gt 0 ]] && shift ;;
       --env-file=*)     shift ;;
