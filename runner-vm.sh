@@ -92,9 +92,42 @@ UBUNTU_RELEASE=${UBUNTU_RELEASE:-noble}
 # own.
 ENTRYPOINT_URL=${ENTRYPOINT_URL:-https://raw.githubusercontent.com/clems4ever/github-runner/main/entrypoint.sh}
 
-# Size of the golden image. It has to hold the runner, Docker and whatever a
-# job pulls; the VM disk on top of it is sized separately with --disk.
+# Size of the golden image. It has to hold the runner, Docker, the toolchain
+# below and whatever a job pulls; the VM disk on top of it is sized separately
+# with --disk.
 GOLDEN_SIZE_GB=${GOLDEN_SIZE_GB:-30}
+
+# What the golden image ships with.
+#
+# A GitHub-hosted runner comes with an enormous toolchain preinstalled, and
+# workflows written against one quietly assume a lot of it is simply there —
+# which is why a job that needed no "apt-get install" step on a hosted runner
+# suddenly needs one here. The full image is around 90 GB and cannot be
+# reproduced, so this is the practical subset: compilers, the interpreters and
+# the utilities that workflows reach for without thinking.
+#
+# Anything language-version specific is deliberately left out: setup-node,
+# setup-python, setup-go and setup-java download into the tool cache at job
+# time and work exactly as they do on a hosted runner.
+RUNNER_PACKAGES_DEFAULT="\
+ca-certificates curl wget gnupg software-properties-common apt-transport-https \
+git git-lfs openssh-client rsync \
+build-essential pkg-config cmake autoconf automake libtool make patch \
+python3 python3-pip python3-venv python3-dev python3-setuptools \
+nodejs npm \
+jq xz-utils bzip2 zstd unzip zip tar \
+libssl-dev zlib1g-dev libffi-dev libbz2-dev libreadline-dev libsqlite3-dev \
+libcurl4-openssl-dev libxml2-dev sqlite3 \
+dnsutils iputils-ping netcat-openbsd net-tools \
+file tree time parallel moreutils shellcheck \
+locales tzdata sudo lsb-release uuid-runtime \
+docker.io docker-compose-v2 \
+qemu-system-x86 qemu-utils cpu-checker"
+
+# Added to the list above, for whatever a given fleet also needs:
+#   EXTRA_PACKAGES="ffmpeg imagemagick" ./runner-vm.sh build
+EXTRA_PACKAGES=${EXTRA_PACKAGES:-}
+RUNNER_PACKAGES=${RUNNER_PACKAGES:-$RUNNER_PACKAGES_DEFAULT}
 
 VM_CPUS=${VM_CPUS:-2}
 VM_MEMORY_MB=${VM_MEMORY_MB:-4096}
@@ -333,11 +366,21 @@ cloud_image_name() { echo "${UBUNTU_RELEASE}-server-cloudimg-$(deb_arch).img"; }
 cloud_image_url()  { echo "https://cloud-images.ubuntu.com/${UBUNTU_RELEASE}/current/$(cloud_image_name)"; }
 cloud_image_path() { echo "${IMAGES_DIR}/$(cloud_image_name)"; }
 
+effective_packages() {
+  echo "${RUNNER_PACKAGES} ${EXTRA_PACKAGES}" | tr ' ' '\n' | sed '/^$/d' | sort -u
+}
+
+# packages_hash goes in the image name so that changing the package list builds
+# a new image rather than silently reusing one without the new tools in it.
+packages_hash() {
+  effective_packages | sha256sum | cut -c1-8
+}
+
 # The golden image is named after everything baked into it, so bumping the
-# runner version or the release builds a new one instead of silently reusing
-# the old.
+# runner version, the release or the package list builds a new one instead of
+# silently reusing the old.
 golden_path() {
-  echo "${IMAGES_DIR}/golden-${UBUNTU_RELEASE}-$(deb_arch)-runner${RUNNER_VERSION}.qcow2"
+  echo "${IMAGES_DIR}/golden-${UBUNTU_RELEASE}-$(deb_arch)-runner${RUNNER_VERSION}-$(packages_hash).qcow2"
 }
 
 # pull_cloud_image downloads the base image and checks it against the
@@ -390,6 +433,23 @@ make_seed() {
       die "no ISO builder found"
       ;;
   esac
+}
+
+# Several of these can run at once on one host — that is the point of naming
+# VMs — but a few things are shared: the golden image, the build directory and
+# the ssh key. flock serialises those, so the second VM waits for the first to
+# finish building rather than both writing the same files.
+acquire_lock() {
+  mkdir -p "$STATE_DIR"
+  exec 9>"${STATE_DIR}/.lock"
+  if ! flock -w "${LOCK_TIMEOUT:-3600}" 9; then
+    die "timed out waiting for another runner-vm on this host to finish building"
+  fi
+}
+
+release_lock() {
+  flock -u 9 2>/dev/null || true
+  exec 9>&- 2>/dev/null || true
 }
 
 ensure_ssh_key() {
@@ -453,6 +513,22 @@ systemctl enable docker
 getent group kvm >/dev/null || groupadd -r kvm
 usermod -aG kvm runner
 
+# The GitHub CLI is on a hosted runner and is not in the Ubuntu archive, so it
+# needs its own repository. Workflows use it for releases and for anything
+# awkward to express as an action.
+install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+  -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+  > /etc/apt/sources.list.d/github-cli.list
+apt-get update
+apt-get install -y --no-install-recommends gh
+
+# A hosted runner has a UTF-8 locale, and tools that format output assume one.
+locale-gen en_US.UTF-8
+update-locale LANG=en_US.UTF-8
+
 # What the Dockerfile does: download the runner package, verify it, extract it,
 # install its dependencies. entrypoint.sh expects to find it at this path.
 install -d -o runner -g runner /home/runner/actions-runner /home/runner/_work
@@ -490,19 +566,7 @@ users:
 package_update: true
 package_upgrade: true
 packages:
-  - ca-certificates
-  - curl
-  - git
-  - jq
-  - sudo
-  - tar
-  - unzip
-  - zip
-  - docker.io
-  - docker-compose-v2
-  - qemu-system-x86
-  - qemu-utils
-  - cpu-checker
+$(effective_packages | sed 's/^/  - /')
 
 write_files:
   - path: /usr/local/bin/runner-vm-provision.sh
@@ -518,8 +582,15 @@ EOF
 
 cmd_build() {
   require_host
-  ensure_ssh_key
   mkdir -p "$IMAGES_DIR"
+
+  # Held for the whole build: two VMs starting together on a host with no image
+  # yet would otherwise both provision into the same directory. The second one
+  # waits here and finds the finished image below.
+  acquire_lock
+  trap release_lock RETURN
+
+  ensure_ssh_key
 
   local golden; golden=$(golden_path)
   if [[ -f "$golden" && "$FORCE" != "true" ]]; then
@@ -961,11 +1032,17 @@ runcmd:
 EOF
 }
 
-# free_port finds a loopback port for the ssh forward. Several of these VMs can
-# run at once, each from its own process, so the port cannot be fixed.
+# free_port finds a loopback port for the ssh forward.
+#
+# Testing whether a port is free is not enough on its own: QEMU only binds it
+# seconds later, so two VMs starting together would both pick the same one and
+# the second would fail to boot. Each VM therefore writes its choice into its
+# own directory, and this skips anything already claimed.
 free_port() {
-  local port
+  local port claimed
+  claimed=" $(cat "$STATE_DIR"/vms/*/ssh_port 2>/dev/null | tr '\n' ' ') "
   for port in $(seq 2222 4222); do
+    [[ "$claimed" == *" ${port} "* ]] && continue
     if ! (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; then
       echo "$port"
       return 0
@@ -973,6 +1050,23 @@ free_port() {
     exec 3>&- 2>/dev/null || true
   done
   die "no free port between 2222 and 4222"
+}
+
+# claim_port reserves the port under this VM's directory, then confirms no
+# other VM claimed the same one in the meantime. The window is small, and
+# losing the race simply means trying the next port.
+claim_port() {
+  local port other
+  for _ in 1 2 3 4 5; do
+    port=$(free_port)
+    echo "$port" > "${VM_DIR}/ssh_port"
+    other=$(grep -l "^${port}$" "$STATE_DIR"/vms/*/ssh_port 2>/dev/null | grep -cv "^${VM_DIR}/ssh_port$" || true)
+    if [[ "$other" -eq 0 ]]; then
+      echo "$port"
+      return 0
+    fi
+  done
+  die "could not claim a free ssh port after 5 attempts"
 }
 
 QEMU_PID=""
@@ -1035,7 +1129,9 @@ cmd_run() {
   [[ -n "$GITHUB_URL" ]] || die "no GitHub URL: pass --url https://github.com/OWNER/REPO (or set GITHUB_URL)"
 
   require_host
+  acquire_lock
   ensure_ssh_key
+  release_lock
 
   local golden; golden=$(golden_path)
   if [[ ! -f "$golden" ]]; then
@@ -1066,9 +1162,17 @@ cmd_run() {
   # The disk lives in the state directory, not /tmp: a job can write tens of
   # gigabytes into the overlay, and /tmp is memory on many distributions.
   VM_DIR="${STATE_DIR}/vms/${VM_NAME}"
+
+  # Several VMs can share a host, but not a name: they would share a directory,
+  # a disk and a runner registration. Refuse rather than delete someone else's
+  # machine out from under them.
+  if [[ -f "${VM_DIR}/qemu.pid" ]] && kill -0 "$(cat "${VM_DIR}/qemu.pid" 2>/dev/null)" 2>/dev/null; then
+    die "a VM named '${VM_NAME}' is already running on this host
+  give this one a different name with --name, or stop that one first"
+  fi
   rm -rf "$VM_DIR"
   mkdir -p "$VM_DIR"
-  SSH_PORT=$(free_port)
+  SSH_PORT=$(claim_port)
 
   # A signal has to end the script, not just run the handler and resume the
   # wait loop below, or Ctrl-C would leave the terminal apparently idle.
