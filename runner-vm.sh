@@ -116,18 +116,30 @@ GOLDEN_SIZE_GB=${GOLDEN_SIZE_GB:-30}
 # Anything language-version specific is deliberately left out: setup-node,
 # setup-python, setup-go and setup-java download into the tool cache at job
 # time and work exactly as they do on a hosted runner.
+# The list below is the apt section of the ubuntu-24.04 image manifest at
+# https://github.com/actions/runner-images, plus what a VM needs that a hosted
+# runner gets from its host. It is kept close to that manifest on purpose: the
+# gap between the two is exactly what makes a job fail here after passing on a
+# hosted runner, and "make: command not found" is a poor way to discover it.
+#
+# Not everything there is worth carrying — Android SDKs, browsers, several
+# JDKs and the cloud CLIs are tens of gigabytes — and language versions are
+# left to setup-node, setup-python, setup-go and setup-java, which download
+# into the tool cache at job time exactly as they do on a hosted runner.
 RUNNER_PACKAGES_DEFAULT="\
-ca-certificates curl wget gnupg software-properties-common apt-transport-https \
-git git-lfs openssh-client rsync \
+ca-certificates curl wget gnupg gnupg2 software-properties-common apt-transport-https \
+git git-lfs mercurial openssh-client ssh sshpass rsync \
 build-essential pkg-config cmake autoconf automake libtool make patch \
-python3 python3-pip python3-venv python3-dev python3-setuptools \
+bison flex swig texinfo m4 fakeroot dpkg-dev rpm patchelf upx \
+python3 python3-pip python3-venv python3-dev python3-setuptools python-is-python3 \
 nodejs npm \
-jq xz-utils bzip2 zstd unzip zip tar \
+jq xz-utils bzip2 zstd lz4 brotli pigz unzip zip tar p7zip-full p7zip-rar aria2 zsync \
 libssl-dev zlib1g-dev libffi-dev libbz2-dev libreadline-dev libsqlite3-dev \
-libcurl4-openssl-dev libxml2-dev sqlite3 \
-dnsutils iputils-ping netcat-openbsd net-tools \
-file tree time parallel moreutils shellcheck \
-locales tzdata sudo lsb-release uuid-runtime \
+libcurl4-openssl-dev libxml2-dev libicu-dev libyaml-dev libnss3-tools sqlite3 \
+dnsutils iputils-ping netcat-openbsd net-tools iproute2 telnet ftp \
+file tree time parallel moreutils shellcheck acl dbus haveged xvfb mediainfo \
+ tk sphinxsearch systemd-coredump pollinate \
+locales tzdata sudo lsb-release uuid-runtime fonts-noto-color-emoji \
 docker.io docker-compose-v2 \
 qemu-system-x86 qemu-utils cpu-checker"
 
@@ -360,6 +372,10 @@ require_host() {
   have "$(qemu_binary)" || { install_hint >&2; die "$(qemu_binary) not found"; }
   have qemu-img || { install_hint >&2; die "qemu-img not found"; }
   seed_tool >/dev/null || { install_hint >&2; die "no ISO builder found (cloud-localds, genisoimage, xorriso or mkisofs)"; }
+  # Checked here rather than where they are used: discovering a missing tool
+  # part-way through provisioning an image wastes the minutes already spent.
+  have curl || { install_hint >&2; die "curl not found"; }
+  have ssh-keygen || { install_hint >&2; die "ssh-keygen not found (install openssh-client)"; }
   [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm is not usable by $(id -un); run '$0 doctor'"
   if [[ "$VM_NESTED" == "true" ]] && ! nested_enabled; then
     die "nested virtualisation is not enabled on this host; run '$0 doctor', or pass --no-nested"
