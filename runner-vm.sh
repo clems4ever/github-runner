@@ -28,8 +28,8 @@ set -euo pipefail
 #   build     Build the golden image the VMs boot from
 #   doctor    Check the host for KVM, nested virtualisation and QEMU
 #   list      Show the VMs on this host and the services managing them
-#   clean     Stop the services and every VM, and delete local state, to start
-#             over after a bad credential. Keeps the images unless --all is given
+#   clean     Stop and delete VMs. Named ones only, or all of them when none is
+#             named. Keeps the images unless --all is given
 #   install   Install the script, the systemd unit and the service user, build
 #             the image and start a runner. Run as root
 #   uninstall Remove everything: services, unit, configuration, state and this
@@ -63,6 +63,7 @@ set -euo pipefail
 #   --no-start            do not enable and start the service
 #
 # Flags for clean:
+#   [NAME...]             remove only these VMs, leaving the others alone
 #   --all                 also delete the images and the ssh key, i.e. all of
 #                         the state directory
 #   -y, --yes             do not ask for confirmation
@@ -74,6 +75,7 @@ set -euo pipefail
 #   ./runner-vm.sh --url https://github.com/runyard-ai --app-id 123456 \
 #     --app-key /etc/runner-vm/app.pem
 #   ./runner-vm.sh build --force
+#   ./runner-vm.sh clean runner-2
 #   ./runner-vm.sh clean --all --yes
 #   sudo ./runner-vm.sh install --url https://github.com/OWNER/REPO \
 #     --github-token-file /root/pat
@@ -185,6 +187,8 @@ SERVICE_STATE=${SERVICE_STATE:-/var/lib/runner-vm}
 ENV_FILE=${ENV_FILE:-.env}
 FORCE=false
 CLEAN_ALL=false
+# The VMs "clean" was asked to remove; empty means all of them.
+CLEAN_TARGETS=()
 ASSUME_YES=false
 # install does the whole job by default: a host with a runner on it, not a host
 # with the pieces of one.
@@ -1369,9 +1373,21 @@ runner_vm_services() {
 
 # stop_services stops those instances. Cleaning up underneath a running service
 # is pointless: systemd starts a replacement VM within seconds.
+# stop_services stops the instances named, or every one when given nothing.
 stop_services() {
-  local unit failed=false
-  local services; services=$(runner_vm_services)
+  local unit failed=false services
+
+  if [[ $# -gt 0 ]]; then
+    # Only the instances that exist: naming a VM that no service manages is
+    # normal, not an error.
+    services=""
+    local name all; all=$(runner_vm_services)
+    for name in "$@"; do
+      grep -qx "runner-vm@${name}.service" <<<"$all" && services+="runner-vm@${name}.service"$'\n'
+    done
+  else
+    services=$(runner_vm_services)
+  fi
   [[ -n "$services" ]] || return 0
 
   while read -r unit; do
@@ -1394,11 +1410,16 @@ stop_services() {
 
 # stop_stray_vms shuts down VMs whose owning process is gone — a wrapper killed
 # with SIGKILL, or a host that lost power — and deletes what they left behind.
+# stop_stray_vms removes the VMs named, or every one when given nothing.
 stop_stray_vms() {
   local dir name pid waited
   shopt -s nullglob
   for dir in "$STATE_DIR"/vms/*/; do
     name=$(basename "$dir")
+    # With names given, skip everything else.
+    if [[ $# -gt 0 ]] && ! printf '%s\n' "$@" | grep -qx "$name"; then
+      continue
+    fi
     pid=""
     [[ -f "${dir}qemu.pid" ]] && pid=$(cat "${dir}qemu.pid" 2>/dev/null || true)
 
@@ -1429,19 +1450,49 @@ stop_stray_vms() {
 # needs rebaking.
 cmd_clean() {
   local all=$CLEAN_ALL
+  local targets=("${CLEAN_TARGETS[@]}")
 
-  echo "This will remove:"
-  echo "  - every runner VM in ${STATE_DIR}/vms, stopping any that are running"
-  if [[ "$all" == "true" ]]; then
-    echo "  - the golden image and the cached cloud image"
-    echo "  - the ssh key used to reach the VMs"
-    echo "  - ${STATE_DIR}, entirely"
-  else
-    echo "  the images are kept, so the next run starts in seconds rather than"
-    echo "  rebuilding; --all removes those and the ssh key too"
+  if [[ ${#targets[@]} -gt 0 && "$all" == "true" ]]; then
+    die "--all removes everything, so it cannot be combined with a VM name"
   fi
 
-  local services; services=$(runner_vm_services)
+  echo "This will remove:"
+  if [[ ${#targets[@]} -gt 0 ]]; then
+    local name found=false
+    for name in "${targets[@]}"; do
+      if [[ -d "${STATE_DIR}/vms/${name}" ]] || runner_vm_services | grep -qx "runner-vm@${name}.service"; then
+        found=true
+        echo "  - the VM ${name}, stopping it if it is running"
+      else
+        die "no VM or service named '${name}'; run '$0 list' to see them"
+      fi
+    done
+    [[ "$found" == "true" ]] || die "nothing to remove"
+    echo "  everything else is left alone"
+  else
+    echo "  - every runner VM in ${STATE_DIR}/vms, stopping any that are running"
+    if [[ "$all" == "true" ]]; then
+      echo "  - the golden image and the cached cloud image"
+      echo "  - the ssh key used to reach the VMs"
+      echo "  - ${STATE_DIR}, entirely"
+    else
+      echo "  the images are kept, so the next run starts in seconds rather than"
+      echo "  rebuilding; --all removes those and the ssh key too"
+    fi
+  fi
+
+  local services
+  if [[ ${#targets[@]} -gt 0 ]]; then
+    services=""
+    local all_units; all_units=$(runner_vm_services)
+    local t
+    for t in "${targets[@]}"; do
+      grep -qx "runner-vm@${t}.service" <<<"$all_units" && services+="runner-vm@${t}.service"$'\n'
+    done
+    services=$(grep . <<<"$services" || true)
+  else
+    services=$(runner_vm_services)
+  fi
   if [[ -n "$services" ]]; then
     echo "  - and first, these services will be stopped, since systemd would"
     echo "    otherwise start a new VM the moment this one is removed:"
@@ -1458,9 +1509,14 @@ cmd_clean() {
     fi
   fi
 
-  stop_services
-  deregister_known_runners
-  stop_stray_vms
+  stop_services "${targets[@]}"
+  deregister_known_runners "${targets[@]}"
+  stop_stray_vms "${targets[@]}"
+
+  if [[ ${#targets[@]} -gt 0 ]]; then
+    log "done; the other VMs and the images were left alone"
+    return 0
+  fi
 
   if [[ "$all" == "true" ]]; then
     rm -rf "$STATE_DIR"
@@ -1486,6 +1542,9 @@ deregister_known_runners() {
   shopt -s nullglob
   for dir in "$STATE_DIR"/vms/*/; do
     name=$(basename "$dir")
+    if [[ $# -gt 0 ]] && ! printf '%s\n' "$@" | grep -qx "$name"; then
+      continue
+    fi
     RUNNER_NAME=$name deregister_runner 2>/dev/null || true
   done
   shopt -u nullglob
@@ -2028,7 +2087,9 @@ main() {
       --env-file)       shift; [[ $# -gt 0 ]] && shift ;;
       --env-file=*)     shift ;;
       -h|--help)        print_help; exit 0 ;;
-      *)                die "unknown flag: $1 (try --help)" ;;
+      -*)               die "unknown flag: $1 (try --help)" ;;
+      # A bare word is a VM name, which only clean takes.
+      *)                CLEAN_TARGETS+=("$1"); shift ;;
     esac
   done
 
