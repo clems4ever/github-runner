@@ -1708,7 +1708,28 @@ cmd_install() {
     mint_token "$GITHUB_URL" >/dev/null
     log "the credential can register runners"
   elif [[ -z "$GITHUB_TOKEN" && -z "$GITHUB_APP_ID" && -z "$RUNNER_TOKEN" ]]; then
-    warn "no credential given; put one in /etc/runner-vm/env before starting a runner"
+    # Refuse rather than warn. Without a credential the service cannot start,
+    # so carrying on means several minutes building an image and then a unit
+    # that fails immediately. The unit would also be written without the
+    # LoadCredential lines, so adding the token afterwards would not be enough
+    # on its own — install has to run again to regenerate it.
+    die "no credential given, and the service cannot start without one.
+
+  Pass one and it is stored in /etc/runner-vm/pat, root-owned and 0600, and
+  wired into the unit through systemd's credential mechanism. Any of:
+
+    sudo ${INSTALL_BIN} install --service --url ${GITHUB_URL:-<repo>} --github-token github_pat_...
+    sudo GITHUB_TOKEN=github_pat_... ${INSTALL_BIN} install --service --url ${GITHUB_URL:-<repo>}
+    sudo ${INSTALL_BIN} install --service --url ${GITHUB_URL:-<repo>} --github-token-file /path/to/pat
+    printf %s \"\$PAT\" | sudo ${INSTALL_BIN} install --service --url ${GITHUB_URL:-<repo>} --github-token-file -
+
+  The last two keep it off the command line, where ps shows it to every user on
+  the machine. Note that sudo drops the environment, so GITHUB_TOKEN has to be
+  set on the sudo line itself as above, or passed through with sudo -E.
+
+  A registration token (--token) will not do here: it expires an hour after it
+  is issued, and a VM registers afresh on every boot. Add --no-start to set the
+  host up without starting anything."
   fi
 
   if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -1716,16 +1737,36 @@ cmd_install() {
     log "created the ${SERVICE_USER} user"
   fi
   # /dev/kvm is rw for its group only, and the service user is not in it by
-  # default. The group's name is read from the device rather than assumed.
-  usermod -aG "$(stat -c %G /dev/kvm 2>/dev/null || echo kvm)" "$SERVICE_USER"
+  # default. The group is read from the device rather than assumed, since its
+  # name and gid both vary by distribution.
+  local kvm_group kvm_gid
+  kvm_group=$(stat -c %G /dev/kvm 2>/dev/null || true)
+  if [[ -z "$kvm_group" || "$kvm_group" == "UNKNOWN" ]]; then
+    # The device's gid has no entry in /etc/group, which happens in containers
+    # and on hosts where the module was loaded before the package that names
+    # the group. usermod cannot add anyone to a group that has no name.
+    kvm_gid=$(stat -c %g /dev/kvm 2>/dev/null || true)
+    if [[ -n "$kvm_gid" ]]; then
+      getent group "$kvm_gid" >/dev/null || groupadd -g "$kvm_gid" kvm || true
+      kvm_group=$(getent group "$kvm_gid" | cut -d: -f1)
+    fi
+  fi
+  if [[ -n "$kvm_group" && "$kvm_group" != "UNKNOWN" ]]; then
+    usermod -aG "$kvm_group" "$SERVICE_USER" \
+      || warn "could not add ${SERVICE_USER} to the ${kvm_group} group; it will not be able to use /dev/kvm"
+  else
+    warn "cannot tell which group owns /dev/kvm, so ${SERVICE_USER} was not added to it"
+  fi
   install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SERVICE_STATE"
 
   install -d -m 0755 /etc/runner-vm
   if [[ -n "$GITHUB_URL" ]]; then
+    install -m 0600 /dev/null /etc/runner-vm/env
     printf 'GITHUB_URL=%s\n' "$GITHUB_URL" > /etc/runner-vm/env
     [[ -n "$RUNNER_LABELS" ]] && printf 'RUNNER_LABELS=%s\n' "$RUNNER_LABELS" >> /etc/runner-vm/env
     [[ "$EPHEMERAL" == "true" ]] && printf 'EPHEMERAL=true\n' >> /etc/runner-vm/env
-    chmod 0600 /etc/runner-vm/env
+    # The app id is not secret, but the unit needs it alongside the key.
+    [[ -n "$GITHUB_APP_ID" ]] && printf 'GITHUB_APP_ID=%s\n' "$GITHUB_APP_ID" >> /etc/runner-vm/env
     log "wrote /etc/runner-vm/env"
   elif [[ ! -f /etc/runner-vm/env ]]; then
     printf 'GITHUB_URL=\n' > /etc/runner-vm/env
@@ -1733,13 +1774,21 @@ cmd_install() {
     warn "no --url given; put GITHUB_URL in /etc/runner-vm/env before starting"
   fi
 
-  # The credential is copied into a file of its own so it never appears in a
-  # command line or in the unit.
-  resolve_token_files
+  # However the credential arrived — a flag, the environment, a file, stdin —
+  # it ends up in one root-owned file that the unit reads through systemd's
+  # credential mechanism, so it is never in the unit and never in a command
+  # line the service runs.
+  #
+  # Created empty at 0600 before anything is written to it: a plain redirect
+  # would make it world-readable for the instant between creation and chmod.
   if [[ -n "$GITHUB_TOKEN" ]]; then
+    install -m 0600 /dev/null /etc/runner-vm/pat
     printf '%s' "$GITHUB_TOKEN" > /etc/runner-vm/pat
-    chmod 0600 /etc/runner-vm/pat
-    log "wrote /etc/runner-vm/pat"
+    log "stored the credential in /etc/runner-vm/pat (0600, root)"
+  fi
+  if [[ -n "$GITHUB_APP_PRIVATE_KEY" && "$GITHUB_APP_PRIVATE_KEY" != /etc/runner-vm/app.pem ]]; then
+    install -m 0600 "$GITHUB_APP_PRIVATE_KEY" /etc/runner-vm/app.pem
+    log "stored the app key in /etc/runner-vm/app.pem (0600, root)"
   fi
 
   systemd_unit > /etc/systemd/system/runner-vm@.service
