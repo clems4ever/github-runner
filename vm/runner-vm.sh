@@ -1670,8 +1670,22 @@ cmd_install() {
   [[ $(id -u) -eq 0 ]] || die "install has to run as root: sudo $0 install ..."
 
   local source; source=$(install_source)
-  install -m 0755 "$source" "$INSTALL_BIN"
-  log "installed ${INSTALL_BIN}"
+  if [[ "$source" -ef "$INSTALL_BIN" ]]; then
+    # Already the installed copy: "runner-vm.sh install --service" run from
+    # /usr/local/bin is a normal thing to do, and copying a file onto itself is
+    # an error rather than a no-op.
+    log "already installed at ${INSTALL_BIN}"
+  else
+    # Written beside the destination and renamed into place, rather than
+    # copied over it: the destination may be the script currently executing,
+    # and bash reads a script as it goes. A rename leaves the running inode
+    # alone.
+    local staged="${INSTALL_BIN}.new.$$"
+    cp "$source" "$staged"
+    chmod 0755 "$staged"
+    mv -f "$staged" "$INSTALL_BIN"
+    log "installed ${INSTALL_BIN}"
+  fi
 
   # Plain "install" puts the management script on the host and stops there,
   # touching nothing else. Setting a machine up involves decisions — which
