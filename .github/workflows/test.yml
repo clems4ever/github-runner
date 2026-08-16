@@ -21,12 +21,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck python3-yaml
 
       - name: Shellcheck
-        run: shellcheck -S warning entrypoint.sh vm/runner-vm.sh tests/run-tests.sh
+        run: shellcheck -S warning runner-vm.sh tests/run-tests.sh
 
       - name: Syntax
         run: |
-          bash -n entrypoint.sh
-          bash -n vm/runner-vm.sh
+          bash -n runner-vm.sh
 
       - name: Unit tests
         run: tests/run-tests.sh
@@ -40,7 +39,7 @@ jobs:
 
       - name: Install with the one-liner, from a local copy of this revision
         run: |
-          python3 -m http.server 8099 --directory vm >/dev/null 2>&1 &
+          python3 -m http.server 8099 --directory . >/dev/null 2>&1 &
           for _ in $(seq 1 20); do
             curl -fsS -o /dev/null http://127.0.0.1:8099/runner-vm.sh && break
             sleep 0.5

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Tests for vm/runner-vm.sh.
+# Tests for runner-vm.sh.
 #
 # These cover the parts that can be checked without a hypervisor: URL and
 # credential handling, the generated cloud-init and systemd files, image
 # naming, and the listing and cleanup commands against fixtures. Booting a
 # guest needs /dev/kvm, which CI runners do not have, so that stays a manual
-# check — see the testing notes in vm/README.md.
+# check — see the testing notes in README.md.
 #
 # Usage: tests/run-tests.sh [name-filter]
 
@@ -17,9 +17,9 @@
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
-SCRIPT=vm/runner-vm.sh
+SCRIPT=runner-vm.sh
 
-# shellcheck source=../vm/runner-vm.sh
+# shellcheck source=../runner-vm.sh
 source "$SCRIPT"
 # The script sets -e for its own execution; tests must survive a failing case.
 set +e
@@ -213,10 +213,10 @@ if test_case "run-user-data"; then
   VM_NAME=vm-under-test
   GITHUB_URL=https://github.com/o/r RUNNER_TOKEN='tok"with\quotes' RUNNER_NAME=vm-under-test
   RUNNER_LABELS=a,b RUNNER_GROUP=Default EPHEMERAL=false DISABLE_UPDATE=false
-  ud=$(run_user_data entrypoint.sh)
+  ud=$(run_user_data)
 
   contains "writes the runner environment"   "$ud" "/etc/runner-vm/runner.env"
-  contains "ships entrypoint.sh"             "$ud" "/usr/local/bin/entrypoint.sh"
+  contains "ships the guest runner script"   "$ud" "/usr/local/bin/runner-vm-runner.sh"
   contains "defines the runner service"      "$ud" "github-runner.service"
   contains "runs the runner unprivileged"    "$ud" "User=runner"
   contains "powers off with full privileges" "$ud" "ExecStopPost=+/usr/bin/systemctl poweroff"
@@ -229,15 +229,34 @@ if test_case "run-user-data"; then
   if command -v python3 >/dev/null; then
     printf '%s' "$ud" > "$WORK/run.yaml"
     succeeds "is valid YAML" python3 -c "import yaml; yaml.safe_load(open('$WORK/run.yaml'))"
-    # entrypoint.sh is embedded as an indented block; it has to come back out
-    # byte for byte or the guest runs a mangled script.
-    python3 - "$WORK/run.yaml" entrypoint.sh <<'PY' && ok "entrypoint.sh round-trips unchanged" || bad "entrypoint.sh round-trips unchanged"
+    # The runner script is embedded as an indented block; it has to come back
+    # out byte for byte, and still be valid bash, or the guest runs something
+    # mangled and the failure only shows up on the VM's console.
+    guest_runner_script > "$WORK/guest.sh"
+    python3 - "$WORK/run.yaml" "$WORK/guest.sh" <<'PY' && ok "the guest script round-trips unchanged" || bad "the guest script round-trips unchanged"
 import sys, yaml
 doc = yaml.safe_load(open(sys.argv[1]))
-embedded = [f for f in doc['write_files'] if f['path'].endswith('entrypoint.sh')][0]['content']
+embedded = [f for f in doc['write_files'] if f['path'].endswith('runner-vm-runner.sh')][0]['content']
 sys.exit(0 if embedded.rstrip('\n') == open(sys.argv[2]).read().rstrip('\n') else 1)
 PY
   fi
+fi
+
+if test_case "guest-script"; then
+  guest=$(guest_runner_script)
+  succeeds "is valid bash"                       bash -n <(printf '%s' "$guest")
+  contains "registers unattended"                "$guest" "--unattended"
+  contains "takes over a stale entry of the same name" "$guest" "--replace"
+  contains "passes the token to config.sh"       "$guest" '--token "$RUNNER_TOKEN"'
+  contains "execs run.sh, so it receives SIGTERM" "$guest" "exec ./run.sh"
+  contains "requires a URL"                      "$guest" 'GITHUB_URL:?'
+  contains "requires a token"                    "$guest" 'RUNNER_TOKEN:?'
+  # The VM is thrown away, so there is nothing to restore and no state to keep.
+  lacks    "carries no saved-registration logic" "$guest" "RUNNER_STATE_DIR"
+
+  EPHEMERAL=true
+  contains "ephemeral runners are configured as such" "$guest" "--ephemeral"
+  EPHEMERAL=false
 fi
 
 if test_case "meta-data"; then

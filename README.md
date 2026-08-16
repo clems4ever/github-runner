@@ -1,75 +1,216 @@
 # github-runner
 
-A [self-hosted GitHub Actions runner](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners)
-you can run on your own machine, two ways: in a container, or in a virtual
-machine that is thrown away after use.
+[![test](https://github.com/clems4ever/github-runner/actions/workflows/test.yml/badge.svg)](https://github.com/clems4ever/github-runner/actions/workflows/test.yml)
 
-Both follow the download / configure / run procedure GitHub shows on the
-*Settings → Actions → Runners → New self-hosted runner* page, and both run the
-same `entrypoint.sh`. The difference is what a job is allowed to touch.
+Run [self-hosted GitHub Actions runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners)
+in throwaway QEMU virtual machines. One VM per runner, deleted when it stops.
 
-## Which one
+A job gets a machine of its own: its own Docker daemon, its own `/dev/kvm` so
+it can boot VMs, and a kernel it is free to break. Nothing it does survives
+into the next job.
 
-|  | [container](docker/) | [VM](vm/) |
-| --- | --- | --- |
-| Isolation | a container, sharing the host kernel | a machine of its own, with its own kernel |
-| Docker for jobs | the host's daemon through `docker.sock`, which is root on the host | a daemon of its own, inside the VM |
-| `/dev/kvm` for jobs | the host's, shared | its own, through nested virtualisation |
-| Preinstalled tools | the runner and the Docker CLI | compilers, python, node, `gh`, docker, qemu |
-| After a job | whatever it left behind in the volume | the disk is deleted |
-| Cost | a few MB, starts instantly | a few GB of RAM, boots in seconds |
-| Needs | Docker | KVM and QEMU, plus nested virtualisation for VMs in jobs |
+It is one bash script with no dependencies beyond QEMU.
 
-Use the container when the workflows are yours and you trust them. Use the VM
-when they are not, when jobs need Docker or KVM without being handed the host,
-or when you want a genuinely clean machine per job.
+## Getting started
 
-## Quick start
-
-**Container** — [docker/README.md](docker/README.md):
+**1. Install**
 
 ```bash
-cd docker
-cp .env.example .env      # set GITHUB_URL and RUNNER_TOKEN
-docker compose up -d
-```
-
-**VM** — [vm/README.md](vm/README.md):
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/clems4ever/github-runner/main/vm/runner-vm.sh \
+curl -fsSL https://raw.githubusercontent.com/clems4ever/github-runner/main/runner-vm.sh \
   | sudo bash -s -- install
 ```
 
-That installs the management script and prints how to boot a first runner. It
-touches nothing else on the host.
+**2. Check the host**
 
-## Layout
-
-```
-entrypoint.sh          registers the runner and runs it — used by both
-docker/                the container: Dockerfile, compose files, .env.example
-vm/                    the VM: runner-vm.sh, a single self-contained script
-.github/workflows/     builds and publishes the container image
+```bash
+sudo runner-vm.sh doctor
 ```
 
-`entrypoint.sh` sits at the root deliberately: it is the one piece both setups
-share, and neither owns it. The container bakes it into the image; the VM ships
-it into the guest through cloud-init at boot, so the registration logic exists
-once rather than twice.
+It prints the fix for anything missing — usually installing QEMU, or turning on
+nested virtualisation:
+
+```bash
+sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
+echo 'options kvm_amd nested=1' | sudo tee /etc/modprobe.d/kvm_amd.conf   # kvm_intel on Intel
+sudo modprobe -r kvm_amd && sudo modprobe kvm_amd nested=1
+```
+
+**3. Build the image**
+
+Once per host, a few minutes. Every VM afterwards boots from a copy-on-write
+overlay on it, in seconds.
+
+```bash
+sudo runner-vm.sh build
+```
+
+**4. Run a runner**
+
+Take a registration token from *Settings → Actions → Runners → New self-hosted
+runner* and:
+
+```bash
+sudo runner-vm.sh run --url https://github.com/OWNER/REPO --token AAAA...
+```
+
+The runner appears in that page within a minute, and jobs reach it with
+`runs-on: self-hosted`. Ctrl-C stops it and deletes the VM.
+
+**5. Keep it running across reboots**
+
+A registration token is good for an hour, and a VM registers afresh on every
+boot, so anything long-lived needs a credential that can mint tokens — a PAT or
+a GitHub App. Then:
+
+```bash
+sudo runner-vm.sh install --service \
+  --url https://github.com/OWNER/REPO \
+  --github-token github_pat_...
+```
+
+That stores the credential at `/etc/runner-vm/pat` (root-only), installs a
+systemd unit, and starts `runner-vm@runner-1`. It comes back after a reboot.
+
+```bash
+runner-vm.sh list                         # what is running
+sudo journalctl -u runner-vm@runner-1 -f  # what it is doing
+sudo systemctl enable --now runner-vm@runner-2   # another one
+```
+
+## Commands
+
+| | |
+| --- | --- |
+| `doctor` | Check KVM, nested virtualisation and QEMU, and say how to fix what is missing |
+| `build` | Build the golden image the VMs boot from |
+| `run` | Boot a VM and run a runner in it until stopped |
+| `list` | The VMs on this host: state, repository, size, ssh port, uptime |
+| `install` | Install this script; `--service` also sets up systemd |
+| `clean` | Stop the services and VMs and delete their disks, keeping the image cache |
+| `uninstall` | Remove everything: services, unit, configuration, state, the script |
+| `print-unit` | Print the systemd unit `install --service` writes |
+
+`runner-vm.sh --help` lists every flag.
+
+## Credentials
+
+Three ways in, in increasing order of how long they last:
+
+| | Lasts | Good for |
+| --- | --- | --- |
+| `--token` | one hour | trying it out |
+| `--github-token` (a PAT) | until the PAT expires | a machine you revisit |
+| `--app-id` + `--app-key` | indefinitely | a machine that must stay up |
+
+A fine-grained PAT needs **Administration: Read and write** on the repository,
+or the organisation's **Self-hosted runners: Read and write**. A GitHub App
+needs the same, and belongs to the organisation rather than to a person, so it
+does not expire or leave when someone does.
+
+Any of them can come from a file or stdin instead of the command line, where
+`ps` would show it to every user on the machine:
+
+```bash
+sudo runner-vm.sh run --url ... --github-token-file /etc/runner-vm/pat
+printf %s "$PAT" | sudo runner-vm.sh run --url ... --github-token-file -
+```
+
+Whatever you pass to `install --service` is stored at `/etc/runner-vm/pat`,
+`0600` and root-owned, and handed to the service through systemd's credential
+mechanism — so it is never in the unit, never in a command line, and not
+readable by the service user.
+
+## What the VM has
+
+Ubuntu 24.04 with the runner, Docker, QEMU, and the toolchain workflows written
+against GitHub-hosted runners tend to assume: compilers and autotools, python3,
+node and npm, the GitHub CLI, git-lfs, the common `-dev` libraries, and the
+usual utilities. Language versions are left to `setup-node`, `setup-python` and
+friends, which work exactly as they do on a hosted runner.
+
+Anything else, without editing the script:
+
+```bash
+EXTRA_PACKAGES="ffmpeg imagemagick" sudo runner-vm.sh build
+```
+
+The package list is hashed into the image name, so changing it builds a new
+image rather than reusing one without the new tools.
+
+Verify it from a workflow:
+
+```yaml
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - run: docker run --rm hello-world   # the VM's own daemon
+      - run: kvm-ok                        # nested virtualisation
+```
+
+## How it works
+
+- `build` boots the Ubuntu cloud image once with a cloud-init seed that
+  installs everything, then powers off. That is the golden image.
+- `run` creates a qcow2 overlay on it and a second seed carrying the
+  registration details and the guest runner script, and boots it with
+  `-cpu host,+svm` (or `+vmx`) so the guest can run VMs of its own.
+- Inside, a systemd unit registers the runner and runs it as an unprivileged
+  user, with its output on the serial console — which is what the script
+  streams to your terminal.
+- When the runner stops, the VM powers off; when the VM is gone, its disk is
+  deleted. Interrupting the script does the same from the other end.
+
+Images and VM disks live in `~/.local/share/runner-vm`, or
+`/var/lib/runner-vm` for the service. `RUNNER_VM_HOME` moves them.
+
+## Options
+
+Every flag has an environment variable equivalent.
+
+| Flag | Variable | Default | |
+| --- | --- | --- | --- |
+| `--url` | `GITHUB_URL` | — | Repository or organisation |
+| `--token` | `RUNNER_TOKEN` | — | Registration token |
+| `--github-token` | `GITHUB_TOKEN` | — | PAT, to mint tokens per boot |
+| `--github-token-file` | `GITHUB_TOKEN_FILE` | — | Read the PAT from a file, or `-` for stdin |
+| `--app-id` | `GITHUB_APP_ID` | — | GitHub App id |
+| `--app-key` | `GITHUB_APP_PRIVATE_KEY` | — | The app's PEM private key |
+| `--name` | `RUNNER_NAME` | `vm-<host>-<pid>` | Runner name |
+| `--labels` | `RUNNER_LABELS` | — | Extra labels |
+| `--group` | `RUNNER_GROUP` | `Default` | Runner group |
+| `--cpus` | `VM_CPUS` | `2` | vCPUs |
+| `--memory` | `VM_MEMORY_MB` | `4096` | Memory, MiB |
+| `--disk` | `VM_DISK_GB` | `40` | Disk, GiB |
+| `--ephemeral` | `EPHEMERAL` | `false` | One job per VM |
+| `--no-nested` | `VM_NESTED` | nested on | Do not expose `vmx`/`svm` |
+
+With `--ephemeral` the runner takes one job, the VM powers off, and under
+systemd `Restart=always` starts a clean one — a genuinely fresh machine per job.
+
+## Tests
+
+```bash
+tests/run-tests.sh
+```
+
+Covers what does not need a hypervisor: the generated cloud-init and systemd
+files, credential handling, image naming, port allocation, `list` and `clean`.
+CI runs those on every push, and separately installs the script the documented
+way to check it touches nothing else and that `uninstall` reverses it. Booting
+a guest needs `/dev/kvm`, which hosted runners do not have, so that part is
+checked by hand.
 
 ## Security
 
 GitHub recommends self-hosted runners only for **private** repositories: on a
 public one, a pull request from a fork can run arbitrary code on the runner.
-That applies to both setups here.
 
-The VM is the stronger boundary of the two, and the only one that can safely
-give a job Docker and `/dev/kvm`. It is not a promise, though: a job can exhaust
-the host's memory and CPU either way, and a VM only gets a clean disk when it is
-replaced — use `--ephemeral` if you want that per job.
+A VM is a much harder boundary than a container, and the only way to give a job
+Docker and `/dev/kvm` without handing over the host. It is not a promise,
+though: a job can still exhaust the host's memory and CPU, and a VM only gets a
+clean disk when it is replaced — use `--ephemeral` if you want that per job.
 
-The only credential either setup needs is a registration token, which enrols one
-runner and expires an hour after it is issued. The VM setup optionally takes a
-PAT or a GitHub App to mint those itself, which is what lets a runner come back
-after a reboot without anyone pasting anything.
+## Licence
+
+[MIT](LICENSE)
