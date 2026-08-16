@@ -1,0 +1,83 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Everything that can be checked without a hypervisor: the generated
+  # cloud-init and systemd files, credential handling, image naming, and the
+  # listing and cleanup commands against fixtures.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install what the tests need
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck python3-yaml
+
+      - name: Shellcheck
+        run: shellcheck -S warning entrypoint.sh vm/runner-vm.sh tests/run-tests.sh
+
+      - name: Syntax
+        run: |
+          bash -n entrypoint.sh
+          bash -n vm/runner-vm.sh
+
+      - name: Unit tests
+        run: tests/run-tests.sh
+
+  # The documented install path, run exactly as a user would. It needs no KVM,
+  # because plain install only puts the script in place.
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install with the one-liner, from a local copy of this revision
+        run: |
+          python3 -m http.server 8099 --directory vm >/dev/null 2>&1 &
+          for _ in $(seq 1 20); do
+            curl -fsS -o /dev/null http://127.0.0.1:8099/runner-vm.sh && break
+            sleep 0.5
+          done
+          URL=http://127.0.0.1:8099/runner-vm.sh
+          curl -fsSL "$URL" | sudo SCRIPT_URL="$URL" bash -s -- install
+
+      - name: It installed the script, and nothing else
+        run: |
+          test -x /usr/local/bin/runner-vm.sh
+          # Plain install deliberately creates no user, unit or configuration.
+          test ! -e /etc/systemd/system/runner-vm@.service
+          test ! -d /etc/runner-vm
+          ! id runner-vm 2>/dev/null
+
+      - name: The installed copy runs
+        run: |
+          runner-vm.sh --help | grep -q '^Commands:'
+          runner-vm.sh list | grep -q 'no VMs'
+          runner-vm.sh print-unit | grep -q 'KillMode=mixed'
+
+      - name: Installing again over itself is not an error
+        run: sudo runner-vm.sh install | grep -q 'already installed'
+
+      - name: doctor reports the missing pieces rather than crashing
+        run: |
+          # No KVM on a hosted runner, so this must fail — but cleanly, naming
+          # what is wrong.
+          set +e
+          out=$(sudo runner-vm.sh doctor 2>&1)
+          status=$?
+          set -e
+          echo "$out"
+          test "$status" -ne 0
+          grep -q 'kvm' <<<"$out"
+
+      - name: uninstall puts the host back
+        run: |
+          sudo runner-vm.sh uninstall --yes
+          test ! -e /usr/local/bin/runner-vm.sh

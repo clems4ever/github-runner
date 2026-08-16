@@ -268,11 +268,11 @@ seed_tool() {
 
 install_hint() {
   if have apt-get; then
-    echo "  sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils"
+    echo "  sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl"
   elif have dnf; then
-    echo "  sudo dnf install -y qemu-kvm qemu-img cloud-utils"
+    echo "  sudo dnf install -y qemu-kvm qemu-img cloud-utils openssh-clients curl"
   elif have pacman; then
-    echo "  sudo pacman -S qemu-full cloud-image-utils"
+    echo "  sudo pacman -S qemu-full cloud-image-utils openssh curl"
   else
     echo "  install: qemu-system-x86, qemu-img, cloud-image-utils (or genisoimage)"
   fi
@@ -995,6 +995,19 @@ fetch_entrypoint() {
   echo "${work}/entrypoint.sh"
 }
 
+# env_quote renders a value for a systemd EnvironmentFile.
+#
+# Double quotes rather than single: systemd processes C-style escapes inside
+# them, so a value containing a quote or a backslash survives. Writing values
+# raw meant a label or token containing a quote produced a file that parsed as
+# something else entirely.
+env_quote() {
+  local v=${1:-}
+  v=${v//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf '"%s"' "$v"
+}
+
 # run_user_data drops the configuration and entrypoint.sh into the guest and
 # starts it under systemd. The service writes to the console, so its output
 # lands in the log this script streams.
@@ -1019,14 +1032,14 @@ write_files:
     permissions: '0600'
     owner: 'root:root'
     content: |
-      GITHUB_URL='${GITHUB_URL}'
-      RUNNER_TOKEN='${RUNNER_TOKEN}'
-      RUNNER_NAME='${RUNNER_NAME}'
-      RUNNER_LABELS='${RUNNER_LABELS}'
-      RUNNER_GROUP='${RUNNER_GROUP}'
-      EPHEMERAL='${EPHEMERAL}'
-      DISABLE_UPDATE='${DISABLE_UPDATE}'
-      RUNNER_STATE_DIR='/home/runner/.runner-state'
+      GITHUB_URL=$(env_quote "$GITHUB_URL")
+      RUNNER_TOKEN=$(env_quote "$RUNNER_TOKEN")
+      RUNNER_NAME=$(env_quote "$RUNNER_NAME")
+      RUNNER_LABELS=$(env_quote "$RUNNER_LABELS")
+      RUNNER_GROUP=$(env_quote "$RUNNER_GROUP")
+      EPHEMERAL=$(env_quote "$EPHEMERAL")
+      DISABLE_UPDATE=$(env_quote "$DISABLE_UPDATE")
+      RUNNER_STATE_DIR="/home/runner/.runner-state"
 
   # The very same script the container runs.
   - path: /usr/local/bin/entrypoint.sh
@@ -1990,4 +2003,11 @@ main() {
   esac
 }
 
-main "$@"
+# Run unless sourced, so the tests can call the functions above directly.
+#
+# The first condition matters as much as the second: piped into bash there is
+# no BASH_SOURCE at all, and that is the one-liner install, which must still
+# run main.
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
