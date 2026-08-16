@@ -634,6 +634,75 @@ api_call() {
     "$url"
 }
 
+# HTTP_STATUS and HTTP_BODY are set by http_call, which keeps both rather than
+# letting curl -f throw the response away. What GitHub says about a refusal is
+# the only thing that distinguishes a bad token from a missing permission, and
+# guessing between them sends people to the wrong settings page.
+HTTP_STATUS=""
+HTTP_BODY=""
+
+http_call() {
+  local method=$1 url=$2 response
+  response=$(curl -sS -X "$method" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+    -w $'\n%{http_code}' \
+    "$url" 2>&1) || {
+      HTTP_STATUS="000"
+      HTTP_BODY=$response
+      return 1
+    }
+  HTTP_STATUS=${response##*$'\n'}
+  HTTP_BODY=${response%$'\n'*}
+  [[ "$HTTP_STATUS" == 2* ]]
+}
+
+# api_error turns a refusal into the specific thing to go and check. The three
+# statuses have genuinely different causes, and the advice for one is useless
+# for the others.
+api_error() {
+  local what=$1 scope=$2 message
+  message=$(json_str message <<<"$HTTP_BODY")
+  [[ -n "$message" ]] || message=$(head -c 200 <<<"$HTTP_BODY")
+
+  case "$HTTP_STATUS" in
+    000)
+      die "${what}: could not reach GitHub
+  ${message}"
+      ;;
+    401)
+      die "${what}: GitHub rejected the credential (401 ${message})
+  The token itself is wrong, not its permissions. Check the value actually
+  reaching the script — a truncated paste or a leftover placeholder looks
+  exactly like this:
+    sudo grep -c . /etc/runner-vm/env   # confirm the file has the lines you expect
+  A fine-grained token starts with github_pat_ and a classic one with ghp_."
+      ;;
+    403)
+      die "${what}: GitHub refused (403 ${message})
+  The credential is valid but not allowed to do this. For ${scope}:
+    fine-grained PAT  Administration: Read and write, with ${scope} listed
+                      under Repository access
+    classic PAT       the 'repo' scope, or 'admin:org' for an organisation
+  If the organisation uses SAML, the token also has to be authorised for it."
+      ;;
+    404)
+      die "${what}: GitHub returned 404 for ${scope}
+  A 404 here usually means the credential cannot see the repository at all,
+  rather than that it is missing:
+    - the token's Resource owner is the wrong account or organisation
+    - ${scope} is not listed under the token's Repository access
+    - the name in GITHUB_URL is misspelled
+  ${message}"
+      ;;
+    *)
+      die "${what}: GitHub returned ${HTTP_STATUS}
+  ${message}"
+      ;;
+  esac
+}
+
 # json_str pulls a top-level string field out of a JSON response. jq when it is
 # available, because the sed fallback cannot cope with nesting — which is fine
 # for the two flat responses read here.
@@ -758,15 +827,13 @@ resolve_token_files() {
 # because a registration token expires an hour after GitHub issues it and a VM
 # never keeps its registration.
 mint_token() {
-  local url=$1
-  local response
-  response=$(api_call POST "$(github_api_prefix "$url")/actions/runners/registration-token" 2>/dev/null) || {
-    local need="the 'admin:org' scope"
-    [[ "$(github_api_prefix "$url")" == */repos/* ]] && need="the 'repo' scope"
-    die "GitHub refused to mint a registration token: a classic PAT needs ${need}, a fine-grained one needs 'Administration' (read and write)"
-  }
+  local url=$1 scope
+  scope=$(sed -E 's#^https?://[^/]+/##; s#/$##' <<<"$url")
 
-  json_str token <<<"$response"
+  http_call POST "$(github_api_prefix "$url")/actions/runners/registration-token" \
+    || api_error "cannot mint a registration token" "$scope"
+
+  json_str token <<<"$HTTP_BODY"
 }
 
 # deregister_runner removes the runner entry a non-ephemeral VM leaves behind.
