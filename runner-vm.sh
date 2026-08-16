@@ -27,10 +27,14 @@ set -euo pipefail
 #   run       Boot a VM and run a runner in it until stopped (the default)
 #   build     Build the golden image the VMs boot from
 #   doctor    Check the host for KVM, nested virtualisation and QEMU
+#   list      Show the VMs on this host and the services managing them
 #   clean     Stop the services and every VM, and delete local state, to start
 #             over after a bad credential. Keeps the images unless --all is given
+#   install   Install the script, the systemd unit and the service user, so
+#             runners start with the host. Run as root
 #   uninstall Remove everything: services, unit, configuration, state and this
 #             script
+#   print-unit  Print the systemd unit install would write
 #
 # Flags for run (each has an environment variable equivalent, so an existing
 # .env from the container setup works unchanged):
@@ -66,6 +70,9 @@ set -euo pipefail
 #     --app-key /etc/runner-vm/app.pem
 #   ./runner-vm.sh build --force
 #   ./runner-vm.sh clean --all --yes
+#   sudo ./runner-vm.sh install --url https://github.com/OWNER/REPO \
+#     --github-token-file /root/pat
+#   ./runner-vm.sh list
 #   sudo ./runner-vm.sh uninstall
 
 VERSION=0.1.0
@@ -152,6 +159,11 @@ RUNNER_LABELS=${RUNNER_LABELS:-}
 RUNNER_GROUP=${RUNNER_GROUP:-Default}
 EPHEMERAL=${EPHEMERAL:-false}
 DISABLE_UPDATE=${DISABLE_UPDATE:-false}
+
+# Where "install" puts things, and who the service runs as.
+INSTALL_BIN=${INSTALL_BIN:-/usr/local/bin/runner-vm.sh}
+SERVICE_USER=${SERVICE_USER:-runner-vm}
+SERVICE_STATE=${SERVICE_STATE:-/var/lib/runner-vm}
 
 ENV_FILE=${ENV_FILE:-.env}
 FORCE=false
@@ -1231,6 +1243,20 @@ cmd_run() {
     ${QEMU_EXTRA_ARGS:-}
 
   QEMU_PID=$(cat "${VM_DIR}/qemu.pid")
+
+  # What "list" reports. Written after the boot succeeds, so a directory with
+  # no meta file is a VM that never got off the ground.
+  cat > "${VM_DIR}/meta" <<META
+NAME=${VM_NAME}
+URL=${GITHUB_URL}
+LABELS=${RUNNER_LABELS}
+EPHEMERAL=${EPHEMERAL}
+CPUS=${VM_CPUS}
+MEMORY_MB=${VM_MEMORY_MB}
+DISK_GB=${VM_DISK_GB}
+NESTED=${VM_NESTED}
+STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+META
   log "VM pid ${QEMU_PID}, ssh: ssh -i ${SSH_KEY} -p ${SSH_PORT} ubuntu@127.0.0.1"
   log "registering '${VM_NAME}' on ${GITHUB_URL} — Ctrl-C stops the runner and deletes the VM"
   echo
@@ -1386,17 +1412,204 @@ deregister_known_runners() {
   shopt -u nullglob
 }
 
+# cmd_list shows the VMs on this host and the services that manage them.
+#
+# A VM whose process is gone but whose directory remains is reported as stopped
+# rather than hidden: that is the state a crashed wrapper leaves behind, and
+# "clean" is what clears it.
+cmd_list() {
+  local dir name pid port state uptime url ephemeral found=false
+
+  printf '%-22s %-8s %-8s %-6s %-10s %s\n' NAME STATE PID SSH UPTIME URL
+  shopt -s nullglob
+  for dir in "$STATE_DIR"/vms/*/; do
+    found=true
+    name=$(basename "$dir")
+    pid=""; port="-"; url="-"; ephemeral=""
+    [[ -f "${dir}qemu.pid" ]] && pid=$(cat "${dir}qemu.pid" 2>/dev/null || true)
+    [[ -f "${dir}ssh_port" ]] && port=$(cat "${dir}ssh_port" 2>/dev/null || true)
+    if [[ -f "${dir}meta" ]]; then
+      url=$(sed -n 's/^URL=//p' "${dir}meta")
+      [[ "$(sed -n 's/^EPHEMERAL=//p' "${dir}meta")" == "true" ]] && ephemeral=" (ephemeral)"
+    fi
+
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      state=running
+      uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || echo '-')
+    else
+      state=stopped
+      pid="-"
+      uptime="-"
+    fi
+    printf '%-22s %-8s %-8s %-6s %-10s %s\n' "$name" "$state" "$pid" "$port" "$uptime" "${url}${ephemeral}"
+  done
+  shopt -u nullglob
+
+  if [[ "$found" != "true" ]]; then
+    echo "(no VMs)"
+  else
+    echo
+    echo "ssh into one with:"
+    echo "  ssh -i ${SSH_KEY} -p <SSH> ubuntu@127.0.0.1"
+    echo "its console is at ${STATE_DIR}/vms/<NAME>/console.log"
+  fi
+
+  local services; services=$(runner_vm_services)
+  if [[ -n "$services" ]]; then
+    echo
+    echo "systemd services:"
+    local unit
+    while read -r unit; do
+      [[ -n "$unit" ]] || continue
+      printf '  %-34s %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
+    done <<<"$services"
+  fi
+}
+
+# systemd_unit prints the template unit. It lives here rather than in a file of
+# its own so that a single copied script can install itself, and so the two
+# cannot drift apart.
+systemd_unit() {
+  local credential=""
+  # Only reference the credential file if there is one: LoadCredential fails
+  # the unit when its source is missing.
+  if [[ -f /etc/runner-vm/pat ]]; then
+    credential="LoadCredential=pat:/etc/runner-vm/pat
+Environment=GITHUB_TOKEN_FILE=%d/pat"
+  elif [[ -f /etc/runner-vm/app.pem ]]; then
+    credential="LoadCredential=app.pem:/etc/runner-vm/app.pem
+Environment=GITHUB_APP_PRIVATE_KEY=%d/app.pem"
+  fi
+
+  cat <<UNIT
+# Installed by runner-vm.sh install. Regenerate with: runner-vm.sh print-unit
+#
+# A template unit, so the instance name is the runner name:
+#   systemctl enable --now runner-vm@build1
+
+[Unit]
+Description=GitHub Actions runner in a QEMU VM (%i)
+Documentation=https://github.com/clems4ever/github-runner
+# The runner polls GitHub over the network, so wait for that.
+#
+# There is deliberately no dependency on dev-kvm.device: systemd only creates
+# device units for devices udev tags with "systemd", which never includes misc,
+# where kvm lives. Requiring it fails on every host. The script checks /dev/kvm
+# itself, and Restart= covers a module that loads late.
+After=network-online.target
+Wants=network-online.target
+
+# A runner that cannot register would otherwise restart every 15 seconds for
+# ever. Ten starts in five minutes is clear of normal ephemeral churn.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+
+# An unprivileged user in the kvm group: the VM needs /dev/kvm, and nothing
+# else on the host.
+User=${SERVICE_USER}
+SupplementaryGroups=kvm
+
+StateDirectory=runner-vm
+Environment=RUNNER_VM_HOME=${SERVICE_STATE}
+WorkingDirectory=${SERVICE_STATE}
+
+# systemd reads this as root before dropping to User=, so it can stay 0600
+# root-owned and the credential is never readable by the service user.
+EnvironmentFile=/etc/runner-vm/env
+${credential}
+
+ExecStart=${INSTALL_BIN} run --name %i
+
+# Every start registers a new runner, because a VM keeps nothing, and that
+# needs a credential that can mint registration tokens. Fail loudly rather than
+# boot a VM that cannot register.
+ExecStartPre=/bin/sh -c '[ -n "\$GITHUB_TOKEN" ] || [ -n "\$GITHUB_TOKEN_FILE" ] || [ -n "\$GITHUB_APP_ID" ] || { echo "set GITHUB_TOKEN or GITHUB_TOKEN_FILE (a PAT), or GITHUB_APP_ID with GITHUB_APP_PRIVATE_KEY: a pasted registration token expires an hour after it is issued and will not survive a reboot" >&2; exit 1; }'
+
+Restart=always
+RestartSec=15
+
+# SIGTERM must reach the script alone. QEMU daemonises itself but stays in the
+# service cgroup, so the default would signal it directly — the equivalent of
+# pulling the VM's power cord — instead of letting the script shut the guest
+# down.
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Stopping is not instant by design: the runner finishes the job it is on
+# first. These two have to stay in step.
+Environment=SHUTDOWN_TIMEOUT=3600
+TimeoutStopSec=3660
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# cmd_install puts the script, the unit and the service user in place. It is
+# the runbook, so that getting a host ready is one command rather than ten
+# that are easy to get subtly wrong.
+cmd_install() {
+  [[ $(id -u) -eq 0 ]] || die "install has to run as root: sudo $0 install ..."
+
+  local source; source=$(readlink -f "${BASH_SOURCE[0]}")
+  install -m 0755 "$source" "$INSTALL_BIN"
+  log "installed ${INSTALL_BIN}"
+
+  if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir "$SERVICE_STATE" "$SERVICE_USER"
+    log "created the ${SERVICE_USER} user"
+  fi
+  # /dev/kvm is rw for its group only, and the service user is not in it by
+  # default. The group's name is read from the device rather than assumed.
+  usermod -aG "$(stat -c %G /dev/kvm 2>/dev/null || echo kvm)" "$SERVICE_USER"
+  install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SERVICE_STATE"
+
+  install -d -m 0755 /etc/runner-vm
+  if [[ -n "$GITHUB_URL" ]]; then
+    printf 'GITHUB_URL=%s\n' "$GITHUB_URL" > /etc/runner-vm/env
+    [[ -n "$RUNNER_LABELS" ]] && printf 'RUNNER_LABELS=%s\n' "$RUNNER_LABELS" >> /etc/runner-vm/env
+    [[ "$EPHEMERAL" == "true" ]] && printf 'EPHEMERAL=true\n' >> /etc/runner-vm/env
+    chmod 0600 /etc/runner-vm/env
+    log "wrote /etc/runner-vm/env"
+  elif [[ ! -f /etc/runner-vm/env ]]; then
+    printf 'GITHUB_URL=\n' > /etc/runner-vm/env
+    chmod 0600 /etc/runner-vm/env
+    warn "no --url given; put GITHUB_URL in /etc/runner-vm/env before starting"
+  fi
+
+  # The credential is copied into a file of its own so it never appears in a
+  # command line or in the unit.
+  resolve_token_files
+  if [[ -n "$GITHUB_TOKEN" ]]; then
+    printf '%s' "$GITHUB_TOKEN" > /etc/runner-vm/pat
+    chmod 0600 /etc/runner-vm/pat
+    log "wrote /etc/runner-vm/pat"
+  fi
+
+  systemd_unit > /etc/systemd/system/runner-vm@.service
+  chmod 0644 /etc/systemd/system/runner-vm@.service
+  log "wrote /etc/systemd/system/runner-vm@.service"
+  systemctl daemon-reload
+
+  log "installed. Next:"
+  log "  sudo -u ${SERVICE_USER} RUNNER_VM_HOME=${SERVICE_STATE} ${INSTALL_BIN} build"
+  log "  sudo systemctl enable --now runner-vm@${RUNNER_NAME:-runner-1}"
+}
+
 # cmd_uninstall removes the whole installation: the services, the unit, the
 # configuration, the state and the script itself. "clean" deliberately leaves
 # all of that alone — it is for starting a run over — so this is the one that
 # genuinely puts the host back as it was.
 cmd_uninstall() {
   local unit=/etc/systemd/system/runner-vm@.service
-  local script=/usr/local/bin/runner-vm.sh
+  local script=$INSTALL_BIN
   # The service keeps its state here rather than under the invoking user's
   # home, so it has to be named explicitly or uninstalling as root would miss
   # it entirely.
-  local service_state=/var/lib/runner-vm
+  local service_state=$SERVICE_STATE
 
   echo "This will remove:"
   local services; services=$(runner_vm_services)
@@ -1410,7 +1623,7 @@ cmd_uninstall() {
   [[ -d "$service_state" && "$service_state" != "$STATE_DIR" ]] && echo "  - ${service_state}"
   [[ -f "$script" ]] && echo "  - ${script}"
   echo
-  echo "The runner-vm user is left alone; remove it with: sudo userdel -r runner-vm"
+  echo "The ${SERVICE_USER} user is left alone; remove it with: sudo userdel -r ${SERVICE_USER}"
 
   if [[ "$ASSUME_YES" != "true" ]]; then
     if [[ -t 0 ]]; then
@@ -1452,7 +1665,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main() {
   local command=run
   case "${1:-}" in
-    run|build|doctor|clean|uninstall) command=$1; shift ;;
+    run|build|doctor|clean|install|uninstall|list|ls|print-unit) command=$1; shift ;;
     -h|--help|help) print_help; exit 0 ;;
     --version) echo "runner-vm ${VERSION}"; exit 0 ;;
   esac
@@ -1525,7 +1738,10 @@ main() {
     build)  cmd_build ;;
     doctor) cmd_doctor ;;
     clean)  cmd_clean ;;
+    install)   cmd_install ;;
     uninstall) cmd_uninstall ;;
+    list|ls)   cmd_list ;;
+    print-unit) systemd_unit ;;
   esac
 }
 
