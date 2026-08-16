@@ -4,19 +4,19 @@ set -euo pipefail
 # Runs a self-hosted GitHub Actions runner inside a throwaway QEMU virtual
 # machine.
 #
-# This is a wrapper around entrypoint.sh: the VM does what the Dockerfile does
-# — download the runner package, verify it, extract it — and then runs
-# entrypoint.sh exactly as the container does, so the download / configure /
-# run procedure lives in one place.
+# The VM does the same download / configure / run procedure GitHub shows on the
+# Settings > Actions > Runners > New self-hosted runner page: it downloads the
+# runner package, verifies its checksum, extracts it, registers with the token
+# you give it, and runs it.
 #
 # The VM is tied to this process. Stop it with Ctrl-C, or send it a signal, and
 # the machine is powered off and its disk deleted. Nothing a job did survives,
 # which is the point: a long-lived runner accumulates state from every job it
 # has run, and a VM is a much harder boundary than a container.
 #
-# Compared with running the container, a job here gets:
-#   - a Docker daemon of its own, rather than a socket to the host's, which is
-#     equivalent to root on the host
+# A job gets:
+#   - a Docker daemon of its own, inside the VM, rather than a socket to the
+#     host's, which is equivalent to root on the host
 #   - /dev/kvm, so jobs can boot VMs of their own (nested virtualisation)
 #   - a kernel of its own to break
 #
@@ -37,7 +37,7 @@ set -euo pipefail
 #   print-unit  Print the systemd unit install would write
 #
 # Flags for run (each has an environment variable equivalent, so an existing
-# .env from the container setup works unchanged):
+# .env file in the working directory is read if present):
 #   --url URL             GITHUB_URL       repository or organisation
 #   --token TOKEN         RUNNER_TOKEN     registration token
 #   --github-token PAT    GITHUB_TOKEN     PAT, to mint a token automatically
@@ -90,19 +90,14 @@ STATE_DIR=${RUNNER_VM_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/runner-vm}
 IMAGES_DIR=$STATE_DIR/images
 SSH_KEY=$STATE_DIR/ssh/id_ed25519
 
-# Version of the runner package to bake in, kept in step with the Dockerfile so
-# the VM and the container run the same runner.
+# Version of the runner package to bake into the image. See
+# https://github.com/actions/runner/releases for the checksums below.
 RUNNER_VERSION=${RUNNER_VERSION:-2.336.0}
 RUNNER_SHA256_X64=${RUNNER_SHA256_X64:-04cf0be1aff4c3ec3554466c39124ca250e3effd8873bb7e8d68535aa9505d5d}
 RUNNER_SHA256_ARM64=${RUNNER_SHA256_ARM64:-58b758e420b87093fbd4bfddd368074960053e2f1388f01848c82624b90f27d1}
 
 # Ubuntu cloud image series to base the golden image on.
 UBUNTU_RELEASE=${UBUNTU_RELEASE:-noble}
-
-# Where entrypoint.sh comes from: the copy next to this script when it is run
-# from a clone, otherwise the published one, so the script also works on its
-# own.
-ENTRYPOINT_URL=${ENTRYPOINT_URL:-https://raw.githubusercontent.com/clems4ever/github-runner/main/entrypoint.sh}
 
 # Size of the golden image. It has to hold the runner, Docker, the toolchain
 # below and whatever a job pulls; the VM disk on top of it is sized separately
@@ -168,7 +163,7 @@ DISABLE_UPDATE=${DISABLE_UPDATE:-false}
 # Where the script fetches itself from when it was piped into bash and so has
 # no file of its own to install. Override when installing from a branch, or
 # install would fetch a different version than the one being run.
-SCRIPT_URL=${SCRIPT_URL:-https://raw.githubusercontent.com/clems4ever/github-runner/main/vm/runner-vm.sh}
+SCRIPT_URL=${SCRIPT_URL:-https://raw.githubusercontent.com/clems4ever/github-runner/main/runner-vm.sh}
 
 # Where "install" puts things, and who the service runs as.
 INSTALL_BIN=${INSTALL_BIN:-/usr/local/bin/runner-vm.sh}
@@ -511,9 +506,9 @@ sentinel_seen() {
   grep -qE "^${sentinel}" "$console" 2>/dev/null
 }
 
-# build_provision_script is what actually provisions the image: everything the
-# Dockerfile installs, plus a Docker daemon and the packages a job needs to use
-# /dev/kvm.
+# build_provision_script is what actually provisions the image: the runner
+# package and its dependencies, a Docker daemon, and the packages a job needs
+# to use /dev/kvm.
 #
 # It is shipped as a file of its own rather than inlined into runcmd because
 # cloud-init writes runcmd into a script that already starts with "#!/bin/sh" —
@@ -533,7 +528,7 @@ systemctl disable --now apt-daily.timer apt-daily-upgrade.timer \
   unattended-upgrades.service 2>/dev/null || true
 
 # The runner refuses to run as root. 1001 because the cloud image already ships
-# uid 1000 as "ubuntu" — the same reasoning as the Dockerfile.
+# uid 1000 as "ubuntu".
 id runner >/dev/null 2>&1 || useradd --create-home --shell /bin/bash --uid 1001 runner
 echo "runner ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/runner
 chmod 0440 /etc/sudoers.d/runner
@@ -564,8 +559,8 @@ apt-get install -y --no-install-recommends gh
 locale-gen en_US.UTF-8
 update-locale LANG=en_US.UTF-8
 
-# What the Dockerfile does: download the runner package, verify it, extract it,
-# install its dependencies. entrypoint.sh expects to find it at this path.
+# Download the runner package, verify its checksum, extract it and
+# install its dependencies, at the path the guest runner script expects.
 install -d -o runner -g runner /home/runner/actions-runner /home/runner/_work
 cd /home/runner/actions-runner
 tarball="actions-runner-linux-$(runner_arch)-${RUNNER_VERSION}.tar.gz"
@@ -975,24 +970,54 @@ deregister_runner() {
   fi
 }
 
-# fetch_entrypoint returns the path to entrypoint.sh: the copy next to this
-# script when run from a clone, otherwise a downloaded one.
-fetch_entrypoint() {
-  local work=$1 local_copy=""
-  # Next to the script when it was copied out on its own, or one level up in a
-  # clone, where entrypoint.sh sits at the root and is shared with the
-  # container setup.
-  for candidate in "${SCRIPT_DIR}/entrypoint.sh" "${SCRIPT_DIR}/../entrypoint.sh"; do
-    if [[ -f "$candidate" ]]; then local_copy=$candidate; break; fi
-  done
+# guest_runner_script is what actually registers the runner, run inside the VM
+# by the systemd unit below. Its configuration arrives as environment
+# variables, from the unit's EnvironmentFile.
+#
+# It is short because the machine is thrown away: there is no saved
+# registration to restore, no state directory to take ownership of, and no
+# second boot to plan for. It registers, runs, and the VM is deleted.
+guest_runner_script() {
+  cat <<'GUEST'
+#!/usr/bin/env bash
+set -euo pipefail
 
-  if [[ -n "$local_copy" ]]; then
-    cp "$local_copy" "${work}/entrypoint.sh"
-  else
-    curl -fsSL -o "${work}/entrypoint.sh" "$ENTRYPOINT_URL" \
-      || die "cannot fetch entrypoint.sh from ${ENTRYPOINT_URL}"
-  fi
-  echo "${work}/entrypoint.sh"
+# Registers this VM as a self-hosted GitHub Actions runner and runs it. The
+# runner refuses to run as root, so the unit starts this as "runner".
+
+: "${GITHUB_URL:?GITHUB_URL is required}"
+: "${RUNNER_TOKEN:?RUNNER_TOKEN is required}"
+RUNNER_NAME=${RUNNER_NAME:-$(hostname)}
+RUNNER_GROUP=${RUNNER_GROUP:-Default}
+EPHEMERAL=${EPHEMERAL:-false}
+DISABLE_UPDATE=${DISABLE_UPDATE:-false}
+
+cd /home/runner/actions-runner
+
+args=(
+  --url "$GITHUB_URL"
+  --name "$RUNNER_NAME"
+  --runnergroup "$RUNNER_GROUP"
+  --work /home/runner/_work
+  --unattended
+  # Take over an entry of the same name left behind by an earlier VM. Nothing
+  # de-registers one when a VM is deleted, as that needs a token of its own.
+  --replace
+)
+[[ -n "${RUNNER_LABELS:-}" ]] && args+=(--labels "$RUNNER_LABELS")
+[[ "$EPHEMERAL" == "true" ]] && args+=(--ephemeral)
+[[ "$DISABLE_UPDATE" == "true" ]] && args+=(--disableupdate)
+
+echo "registering runner '${RUNNER_NAME}' on ${GITHUB_URL}"
+if ! ./config.sh "${args[@]}" --token "$RUNNER_TOKEN"; then
+  echo "registration failed: a registration token expires one hour after it is issued" >&2
+  exit 1
+fi
+
+# exec so that the runner receives the unit's SIGTERM directly and can finish
+# the job it is on before stopping.
+exec ./run.sh
+GUEST
 }
 
 # env_quote renders a value for a systemd EnvironmentFile.
@@ -1008,11 +1033,10 @@ env_quote() {
   printf '"%s"' "$v"
 }
 
-# run_user_data drops the configuration and entrypoint.sh into the guest and
+# run_user_data drops the configuration and the runner script into the guest and
 # starts it under systemd. The service writes to the console, so its output
 # lands in the log this script streams.
 run_user_data() {
-  local entrypoint=$1
   cat <<EOF
 #cloud-config
 hostname: ${VM_NAME}
@@ -1039,14 +1063,12 @@ write_files:
       RUNNER_GROUP=$(env_quote "$RUNNER_GROUP")
       EPHEMERAL=$(env_quote "$EPHEMERAL")
       DISABLE_UPDATE=$(env_quote "$DISABLE_UPDATE")
-      RUNNER_STATE_DIR="/home/runner/.runner-state"
 
-  # The very same script the container runs.
-  - path: /usr/local/bin/entrypoint.sh
+  - path: /usr/local/bin/runner-vm-runner.sh
     permissions: '0755'
     owner: 'root:root'
     content: |
-$(sed 's/^/      /' "$entrypoint")
+$(guest_runner_script | sed 's/^/      /')
 
   - path: /etc/systemd/system/github-runner.service
     permissions: '0644'
@@ -1061,7 +1083,7 @@ $(sed 's/^/      /' "$entrypoint")
       User=runner
       WorkingDirectory=/home/runner/actions-runner
       EnvironmentFile=/etc/runner-vm/runner.env
-      ExecStart=/usr/local/bin/entrypoint.sh
+      ExecStart=/usr/local/bin/runner-vm-runner.sh
       # The runner has to finish the job it is on before it stops.
       KillSignal=SIGTERM
       TimeoutStopSec=3h
@@ -1233,8 +1255,7 @@ cmd_run() {
   trap cleanup EXIT
   trap 'cleanup; exit 130' INT TERM
 
-  local entrypoint; entrypoint=$(fetch_entrypoint "$VM_DIR")
-  run_user_data "$entrypoint" > "${VM_DIR}/user-data"
+  run_user_data > "${VM_DIR}/user-data"
   # A new instance ID on every boot, or cloud-init treats the golden image's
   # own build as the current instance and skips configuring the runner.
   echo -e "instance-id: ${VM_NAME}-$(date +%s)\nlocal-hostname: ${VM_NAME}" > "${VM_DIR}/meta-data"
@@ -1661,69 +1682,27 @@ WantedBy=multi-user.target
 UNIT
 }
 
-# print_getting_started is what a fresh install leaves on the screen: the
-# shortest path from "the script is here" to "a runner is registered", in the
-# order the steps actually have to happen.
+# print_getting_started is what a fresh install leaves on the screen: three
+# commands and where to get the token. Everything else — services, PATs,
+# ephemeral runners — is in --help and the README, and printing it here only
+# buries the one thing someone wants to do next.
 print_getting_started() {
-  local url=${GITHUB_URL:-https://github.com/OWNER/REPO}
+  local cmd=$INSTALL_BIN
+  # /usr/local/bin is on PATH, so the bare name is what they will actually type.
+  [[ "$cmd" == /usr/local/bin/* ]] && cmd=$(basename "$cmd")
+
   cat <<GUIDE
 
-  runner-vm is installed at ${INSTALL_BIN}
+Installed. To boot a runner:
 
-  It runs a self-hosted GitHub Actions runner inside a throwaway QEMU VM: one
-  machine per runner, deleted when it stops, with its own Docker daemon and
-  /dev/kvm so jobs can build images and boot VMs of their own.
+  sudo ${cmd} doctor     # check this host can run VMs
+  sudo ${cmd} build      # build the VM image, once per host
+  sudo ${cmd} run --url https://github.com/OWNER/REPO --token AAAA...
 
-  Boot your first runner
-  ----------------------
+The token is on Settings > Actions > Runners > New self-hosted runner.
 
-  1. Check the host has KVM and nested virtualisation. It prints the fix for
-     anything missing.
-
-       sudo ${INSTALL_BIN} doctor
-
-  2. Build the golden image. Once per host, a few minutes; every VM afterwards
-     boots from a copy-on-write overlay on it in seconds.
-
-       sudo ${INSTALL_BIN} build
-
-  3. Give it a credential. A registration token from
-     ${url}/settings/actions/runners/new
-     works for one hour, which is enough to try it out:
-
-       sudo ${INSTALL_BIN} run --url ${url} --token AAAA...
-
-     For anything lasting, use a PAT or a GitHub App instead: a VM keeps no
-     registration, so every boot needs a fresh registration token, and the
-     script mints one per boot from either.
-
-       sudo install -d -m 0755 /etc/runner-vm
-       sudo install -m 0600 /dev/null /etc/runner-vm/pat
-       sudoedit /etc/runner-vm/pat          # paste the PAT, save
-       sudo ${INSTALL_BIN} run --url ${url} --github-token-file /etc/runner-vm/pat
-
-     A fine-grained PAT needs Administration: Read and write on the repository,
-     or the organisation's Self-hosted runners: Read and write.
-
-  4. That runs in the foreground and the VM dies with it, which is the right
-     way to check it works. To have runners start with the host instead:
-
-       sudo ${INSTALL_BIN} install --service \\
-         --url ${url} --github-token-file /etc/runner-vm/pat
-
-     which adds a systemd unit, an unprivileged service user, builds the image
-     and starts runner-vm@runner-1. Add more with:
-
-       sudo systemctl enable --now runner-vm@runner-2
-
-  Then
-  ----
-
-    ${INSTALL_BIN} list          what is running, with ssh ports and uptime
-    ${INSTALL_BIN} --help        every flag
-    sudo ${INSTALL_BIN} clean    stop everything, keep the image cache
-
-  Jobs target it with "runs-on: self-hosted".
+For runners that start with the host, and credentials that outlive an hour:
+  ${cmd} --help
 
 GUIDE
 }
@@ -1964,9 +1943,6 @@ cmd_uninstall() {
 # Entry point
 # --------------------------------------------------------------------------
 
-# Empty when piped from curl, in which case entrypoint.sh is fetched rather
-# than found next to the script.
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-/nonexistent}")" 2>/dev/null && pwd || echo /nonexistent)
 
 main() {
   local command=run
@@ -1976,7 +1952,7 @@ main() {
     --version) echo "runner-vm ${VERSION}"; exit 0 ;;
   esac
 
-  # An .env from the container setup works as-is, and explicit flags still win.
+  # An .env in the working directory is read if present; explicit flags win.
   local env_file=$ENV_FILE
   local -a args=("$@")
   for ((i = 0; i < ${#args[@]}; i++)); do
