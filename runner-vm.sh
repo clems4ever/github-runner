@@ -27,8 +27,10 @@ set -euo pipefail
 #   run       Boot a VM and run a runner in it until stopped (the default)
 #   build     Build the golden image the VMs boot from
 #   doctor    Check the host for KVM, nested virtualisation and QEMU
-#   clean     Stop every VM and delete local state, to start over after a bad
-#             credential. Keeps the images unless --all is given
+#   clean     Stop the services and every VM, and delete local state, to start
+#             over after a bad credential. Keeps the images unless --all is given
+#   uninstall Remove everything: services, unit, configuration, state and this
+#             script
 #
 # Flags for run (each has an environment variable equivalent, so an existing
 # .env from the container setup works unchanged):
@@ -64,6 +66,7 @@ set -euo pipefail
 #     --app-key /etc/runner-vm/app.pem
 #   ./runner-vm.sh build --force
 #   ./runner-vm.sh clean --all --yes
+#   sudo ./runner-vm.sh uninstall
 
 VERSION=0.1.0
 
@@ -1143,6 +1146,43 @@ cmd_run() {
   cleanup
 }
 
+# runner_vm_services lists every runner-vm@ instance systemd knows about.
+#
+# --all matters: an instance that is failed, or restart-looping after a bad
+# credential, is exactly the one in the way, and a plain listing shows only the
+# active ones. --plain drops the bullet systemd puts in front of failed units,
+# which would otherwise end up in the unit name.
+runner_vm_services() {
+  have systemctl || return 0
+  systemctl list-units --all --plain --no-legend 'runner-vm@*.service' 2>/dev/null \
+    | awk '{ print $1 }' | grep . || true
+}
+
+# stop_services stops those instances. Cleaning up underneath a running service
+# is pointless: systemd starts a replacement VM within seconds.
+stop_services() {
+  local unit failed=false
+  local services; services=$(runner_vm_services)
+  [[ -n "$services" ]] || return 0
+
+  while read -r unit; do
+    [[ -n "$unit" ]] || continue
+    log "stopping ${unit}"
+    if ! systemctl stop "$unit" 2>/dev/null; then
+      failed=true
+      warn "could not stop ${unit}"
+    fi
+    # A failed unit keeps its restart counter, which would refuse to start
+    # again later with "start request repeated too quickly".
+    systemctl reset-failed "$unit" 2>/dev/null || true
+  done <<<"$services"
+
+  if [[ "$failed" == "true" ]]; then
+    die "could not stop every service; rerun this as root:
+  sudo $0 clean${CLEAN_ALL:+ --all} --yes"
+  fi
+}
+
 # stop_stray_vms shuts down VMs whose owning process is gone — a wrapper killed
 # with SIGKILL, or a host that lost power — and deletes what they left behind.
 stop_stray_vms() {
@@ -1192,13 +1232,11 @@ cmd_clean() {
     echo "  rebuilding; --all removes those and the ssh key too"
   fi
 
-  # A VM that systemd owns would be restarted from under us, so say so rather
-  # than let the cleanup look as though it failed.
-  if have systemctl && systemctl list-units --state=active --no-legend 'runner-vm@*' 2>/dev/null | grep -q .; then
-    echo
-    warn "runner-vm services are still active; stop them first, or they will start new VMs:"
-    systemctl list-units --state=active --no-legend 'runner-vm@*' 2>/dev/null \
-      | awk '{ printf "    sudo systemctl stop %s\n", $1 }'
+  local services; services=$(runner_vm_services)
+  if [[ -n "$services" ]]; then
+    echo "  - and first, these services will be stopped, since systemd would"
+    echo "    otherwise start a new VM the moment this one is removed:"
+    sed 's/^/      /' <<<"$services"
   fi
 
   if [[ "$ASSUME_YES" != "true" ]]; then
@@ -1211,6 +1249,7 @@ cmd_clean() {
     fi
   fi
 
+  stop_services
   deregister_known_runners
   stop_stray_vms
 
@@ -1243,6 +1282,63 @@ deregister_known_runners() {
   shopt -u nullglob
 }
 
+# cmd_uninstall removes the whole installation: the services, the unit, the
+# configuration, the state and the script itself. "clean" deliberately leaves
+# all of that alone — it is for starting a run over — so this is the one that
+# genuinely puts the host back as it was.
+cmd_uninstall() {
+  local unit=/etc/systemd/system/runner-vm@.service
+  local script=/usr/local/bin/runner-vm.sh
+  # The service keeps its state here rather than under the invoking user's
+  # home, so it has to be named explicitly or uninstalling as root would miss
+  # it entirely.
+  local service_state=/var/lib/runner-vm
+
+  echo "This will remove:"
+  local services; services=$(runner_vm_services)
+  if [[ -n "$services" ]]; then
+    echo "  - these services, stopped and disabled:"
+    sed 's/^/      /' <<<"$services"
+  fi
+  [[ -f "$unit" ]] && echo "  - ${unit}"
+  [[ -d /etc/runner-vm ]] && echo "  - /etc/runner-vm, including any credentials in it"
+  [[ -d "$STATE_DIR" ]] && echo "  - ${STATE_DIR} (VMs, images, ssh key)"
+  [[ -d "$service_state" && "$service_state" != "$STATE_DIR" ]] && echo "  - ${service_state}"
+  [[ -f "$script" ]] && echo "  - ${script}"
+  echo
+  echo "The runner-vm user is left alone; remove it with: sudo userdel -r runner-vm"
+
+  if [[ "$ASSUME_YES" != "true" ]]; then
+    if [[ -t 0 ]]; then
+      local reply
+      read -r -p "Continue? [y/N] " reply
+      [[ "$reply" == [yY]* ]] || die "nothing was removed"
+    else
+      die "refusing to remove anything without a terminal to confirm at; pass --yes"
+    fi
+  fi
+
+  local u
+  if [[ -n "$services" ]]; then
+    while read -r u; do
+      [[ -n "$u" ]] || continue
+      systemctl disable --now "$u" 2>/dev/null || warn "could not disable ${u}"
+      systemctl reset-failed "$u" 2>/dev/null || true
+    done <<<"$services"
+  fi
+
+  stop_stray_vms
+
+  rm -f "$unit"
+  rm -rf /etc/runner-vm "$STATE_DIR"
+  [[ "$service_state" != "$STATE_DIR" ]] && rm -rf "$service_state"
+  have systemctl && systemctl daemon-reload 2>/dev/null || true
+
+  # Last, because it is the file being executed.
+  rm -f "$script"
+  log "uninstalled"
+}
+
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
@@ -1252,7 +1348,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main() {
   local command=run
   case "${1:-}" in
-    run|build|doctor|clean) command=$1; shift ;;
+    run|build|doctor|clean|uninstall) command=$1; shift ;;
     -h|--help|help) print_help; exit 0 ;;
     --version) echo "runner-vm ${VERSION}"; exit 0 ;;
   esac
@@ -1325,6 +1421,7 @@ main() {
     build)  cmd_build ;;
     doctor) cmd_doctor ;;
     clean)  cmd_clean ;;
+    uninstall) cmd_uninstall ;;
   esac
 }
 
