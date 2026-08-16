@@ -1636,9 +1636,27 @@ cmd_list() {
 
     # Fall back to the configuration for a service whose VM has not booted, so
     # the row still says what it would run and how big it would be.
-    if [[ "$repo" == "-" && -r /etc/runner-vm/env ]]; then
-      repo=$(short_scope "$(sed -n 's/^GITHUB_URL=//p' /etc/runner-vm/env)")
-      repo=${repo:--}
+    # For a service whose VM has not booted, the configuration is what it will
+    # use — which is not the same as this script's defaults once install has
+    # recorded a size.
+    if [[ -r /etc/runner-vm/env ]]; then
+      local configured
+      if [[ "$repo" == "-" ]]; then
+        repo=$(short_scope "$(sed -n 's/^GITHUB_URL=//p' /etc/runner-vm/env)")
+        repo=${repo:--}
+      fi
+      if [[ "$cpus" == "-" ]]; then
+        configured=$(sed -n 's/^VM_CPUS=//p' /etc/runner-vm/env)
+        [[ -n "$configured" ]] && cpus=$configured
+      fi
+      if [[ "$mem" == "-" ]]; then
+        configured=$(sed -n 's/^VM_MEMORY_MB=//p' /etc/runner-vm/env)
+        [[ -n "$configured" ]] && mem="${configured}M"
+      fi
+      if [[ "$disk" == "-" ]]; then
+        configured=$(sed -n 's/^VM_DISK_GB=//p' /etc/runner-vm/env)
+        [[ -n "$configured" ]] && disk="${configured}G"
+      fi
     fi
     [[ "$cpus" == "-" ]] && cpus=$VM_CPUS
     [[ "$mem"  == "-" ]] && mem="${VM_MEMORY_MB}M"
@@ -1803,6 +1821,27 @@ install_source() {
   echo "$tmp"
 }
 
+# service_env_file renders the configuration the unit reads.
+#
+# The unit runs "run --name %i" and takes everything else from here, so a
+# setting that is not written is one that install accepted and then silently
+# ignored — which is what happened to --cpus. The sizing is written even at its
+# default value, so the file says what a VM will actually be and is the one
+# place to change it afterwards.
+service_env_file() {
+  printf 'GITHUB_URL=%s\n' "$GITHUB_URL"
+  printf 'VM_CPUS=%s\n' "$VM_CPUS"
+  printf 'VM_MEMORY_MB=%s\n' "$VM_MEMORY_MB"
+  printf 'VM_DISK_GB=%s\n' "$VM_DISK_GB"
+  printf 'VM_NESTED=%s\n' "$VM_NESTED"
+  printf 'RUNNER_GROUP=%s\n' "$RUNNER_GROUP"
+  printf 'EPHEMERAL=%s\n' "$EPHEMERAL"
+  [[ -n "$RUNNER_LABELS" ]] && printf 'RUNNER_LABELS=%s\n' "$RUNNER_LABELS"
+  # The app id is not secret, but the unit needs it alongside the key.
+  [[ -n "$GITHUB_APP_ID" ]] && printf 'GITHUB_APP_ID=%s\n' "$GITHUB_APP_ID"
+  true
+}
+
 # cmd_install puts the script, the unit and the service user in place. It is
 # the runbook, so that getting a host ready is one command rather than ten
 # that are easy to get subtly wrong.
@@ -1898,19 +1937,10 @@ cmd_install() {
   install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SERVICE_STATE"
 
   install -d -m 0755 /etc/runner-vm
-  if [[ -n "$GITHUB_URL" ]]; then
-    install -m 0600 /dev/null /etc/runner-vm/env
-    printf 'GITHUB_URL=%s\n' "$GITHUB_URL" > /etc/runner-vm/env
-    [[ -n "$RUNNER_LABELS" ]] && printf 'RUNNER_LABELS=%s\n' "$RUNNER_LABELS" >> /etc/runner-vm/env
-    [[ "$EPHEMERAL" == "true" ]] && printf 'EPHEMERAL=true\n' >> /etc/runner-vm/env
-    # The app id is not secret, but the unit needs it alongside the key.
-    [[ -n "$GITHUB_APP_ID" ]] && printf 'GITHUB_APP_ID=%s\n' "$GITHUB_APP_ID" >> /etc/runner-vm/env
-    log "wrote /etc/runner-vm/env"
-  elif [[ ! -f /etc/runner-vm/env ]]; then
-    printf 'GITHUB_URL=\n' > /etc/runner-vm/env
-    chmod 0600 /etc/runner-vm/env
-    warn "no --url given; put GITHUB_URL in /etc/runner-vm/env before starting"
-  fi
+  install -m 0600 /dev/null /etc/runner-vm/env
+  service_env_file > /etc/runner-vm/env
+  log "wrote /etc/runner-vm/env (${VM_CPUS} vCPU, ${VM_MEMORY_MB} MiB, ${VM_DISK_GB} GiB)"
+  [[ -n "$GITHUB_URL" ]] || warn "no --url given; put GITHUB_URL in /etc/runner-vm/env before starting"
 
   # However the credential arrived — a flag, the environment, a file, stdin —
   # it ends up in one root-owned file that the unit reads through systemd's
