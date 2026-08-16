@@ -27,11 +27,16 @@
 [Unit]
 Description=GitHub Actions runner in a QEMU VM (%i)
 Documentation=https://github.com/clems4ever/github-runner
-# The runner polls GitHub over the network, and the VM cannot start at all
-# without KVM, so wait for both rather than fail and rely on a restart.
-After=network-online.target dev-kvm.device
+# The runner polls GitHub over the network, so wait for that.
+#
+# There is deliberately no dependency on dev-kvm.device. systemd only creates
+# device units for devices udev tags with "systemd", which covers block, net,
+# tty and a few others — never misc, where kvm lives. Requiring it therefore
+# fails with "a dependency job for this unit failed" on every host. The script
+# checks /dev/kvm itself and says what to do about it, and Restart= retries,
+# which also covers a kvm module that loads late.
+After=network-online.target
 Wants=network-online.target
-Requires=dev-kvm.device
 
 # A runner that cannot register — a revoked PAT, a repository that no longer
 # exists — would otherwise restart every 15 seconds for ever. Ten starts in
