@@ -253,7 +253,26 @@ GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/OWNER/REPO
 ```
 
 The PAT needs the `repo` scope for a repository runner, or `admin:org` for an
-organisation one.
+organisation one. A fine-grained token wants **Administration: Read and write**
+on the repository, or the organisation's **Self-hosted runners: Read and
+write**.
+
+Every setting is read from the environment, so nothing sensitive has to be
+edited into a file or typed on a command line — where `ps` would show it to
+every user on the machine, and the shell would keep it in the history:
+
+```bash
+read -rs GITHUB_TOKEN && export GITHUB_TOKEN     # typed, not echoed, not recorded
+./runner-vm.sh --url https://github.com/OWNER/REPO
+```
+
+Or keep it in a file and never handle it again:
+
+```bash
+sudoedit /etc/runner-vm/pat                       # paste, save
+./runner-vm.sh --url https://github.com/OWNER/REPO --github-token-file /etc/runner-vm/pat
+pass show github/pat | ./runner-vm.sh --url ... --github-token-file -   # or from stdin
+```
 
 **A GitHub App is the better credential for a server.** A PAT belongs to a
 person: it expires — a fine-grained one after a year at most — and it stops
@@ -379,16 +398,22 @@ before dropping to the service user, so it stays `0600` root-owned and nothing
 a job runs can read it; the VM only ever receives the hour-long registration
 token minted from it.
 
-For a GitHub App, uncomment the two `LoadCredential` lines in the unit and put
-the private key at `/etc/runner-vm/app.pem`. systemd then hands the service a
-copy readable only by it, so the key on disk also stays `0600` root-owned:
+To keep the credential out of the environment file as well, put it in a file of
+its own and uncomment the matching `LoadCredential` pair in the unit. systemd
+hands the service a private copy, so the file on disk stays `0600` root-owned
+and the service user never reads it directly:
+
+```
+LoadCredential=pat:/etc/runner-vm/pat
+Environment=GITHUB_TOKEN_FILE=%d/pat
+```
+
+and for a GitHub App, with `GITHUB_APP_ID=123456` in `/etc/runner-vm/env`:
 
 ```
 LoadCredential=app.pem:/etc/runner-vm/app.pem
 Environment=GITHUB_APP_PRIVATE_KEY=%d/app.pem
 ```
-
-with `GITHUB_APP_ID=123456` in `/etc/runner-vm/env`.
 
 Two settings in the unit are worth knowing about:
 

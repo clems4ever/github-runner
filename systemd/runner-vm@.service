@@ -60,13 +60,21 @@ WorkingDirectory=/var/lib/runner-vm
 # which only ever sees the hour-long registration token minted from it.
 EnvironmentFile=/etc/runner-vm/env
 
-# For GitHub App authentication, uncomment both lines and drop the app's
-# private key at /etc/runner-vm/app.pem. LoadCredential hands the service a
-# copy readable only by it, so the key on disk stays 0600 root-owned. Both stay
-# commented by default because LoadCredential fails the unit when its source
-# file is missing, which would break the PAT setup.
+# Keeping the credential out of the environment file entirely: put the PAT on
+# its own in /etc/runner-vm/pat and uncomment these two. LoadCredential hands
+# the service a copy readable only by it, so the file on disk stays 0600
+# root-owned, and the token never appears in a command line — where ps would
+# show it to every user on the machine — nor in anyone's shell history.
+#LoadCredential=pat:/etc/runner-vm/pat
+#Environment=GITHUB_TOKEN_FILE=%d/pat
+
+# The same for a GitHub App private key.
 #LoadCredential=app.pem:/etc/runner-vm/app.pem
 #Environment=GITHUB_APP_PRIVATE_KEY=%d/app.pem
+#
+# All four stay commented by default because LoadCredential fails the unit when
+# its source file is missing, which would break the plain environment-file
+# setup.
 
 ExecStart=/usr/local/bin/runner-vm.sh run --name %i
 
@@ -75,7 +83,7 @@ ExecStart=/usr/local/bin/runner-vm.sh run --name %i
 # a service that survives a reboot needs a credential that can mint them:
 # either a PAT or a GitHub App. Fail loudly rather than boot a VM that cannot
 # register.
-ExecStartPre=/bin/sh -c '[ -n "$GITHUB_TOKEN" ] || [ -n "$GITHUB_APP_ID" ] || { echo "set GITHUB_TOKEN (a PAT) or GITHUB_APP_ID with GITHUB_APP_PRIVATE_KEY in /etc/runner-vm/env: a pasted registration token expires an hour after it is issued and will not survive a reboot" >&2; exit 1; }'
+ExecStartPre=/bin/sh -c '[ -n "$GITHUB_TOKEN" ] || [ -n "$GITHUB_TOKEN_FILE" ] || [ -n "$GITHUB_APP_ID" ] || { echo "set GITHUB_TOKEN or GITHUB_TOKEN_FILE (a PAT), or GITHUB_APP_ID with GITHUB_APP_PRIVATE_KEY: a pasted registration token expires an hour after it is issued and will not survive a reboot" >&2; exit 1; }'
 
 Restart=always
 RestartSec=15

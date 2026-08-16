@@ -34,6 +34,10 @@ set -euo pipefail
 #   --url URL             GITHUB_URL       repository or organisation
 #   --token TOKEN         RUNNER_TOKEN     registration token
 #   --github-token PAT    GITHUB_TOKEN     PAT, to mint a token automatically
+#   --github-token-file F GITHUB_TOKEN_FILE  read the PAT from a file, or "-"
+#                                            for stdin, so it is never on a
+#                                            command line or in shell history
+#   --token-file FILE     RUNNER_TOKEN_FILE  same, for a registration token
 #   --app-id ID           GITHUB_APP_ID    GitHub App id, instead of a PAT
 #   --app-key FILE        GITHUB_APP_PRIVATE_KEY   the app's PEM private key
 #   --name NAME           RUNNER_NAME      runner name
@@ -49,6 +53,7 @@ set -euo pipefail
 # Examples:
 #   ./runner-vm.sh --url https://github.com/runyard-ai --token AAA...
 #   GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/runyard-ai
+#   ./runner-vm.sh --url https://github.com/OWNER/REPO --github-token-file /etc/runner-vm/pat
 #   ./runner-vm.sh --url https://github.com/runyard-ai --app-id 123456 \
 #     --app-key /etc/runner-vm/app.pem
 #   ./runner-vm.sh build --force
@@ -94,6 +99,11 @@ GITHUB_TOKEN=${GITHUB_TOKEN:-${GH_TOKEN:-}}
 GITHUB_APP_ID=${GITHUB_APP_ID:-}
 GITHUB_APP_PRIVATE_KEY=${GITHUB_APP_PRIVATE_KEY:-}
 GITHUB_APP_INSTALLATION_ID=${GITHUB_APP_INSTALLATION_ID:-}
+# Credentials can come from a file instead, so that nothing sensitive is typed
+# on a command line, where ps would show it to every user on the machine, or
+# into a shell, where the history file would keep it. "-" reads stdin.
+GITHUB_TOKEN_FILE=${GITHUB_TOKEN_FILE:-}
+RUNNER_TOKEN_FILE=${RUNNER_TOKEN_FILE:-}
 RUNNER_NAME=${RUNNER_NAME:-}
 RUNNER_LABELS=${RUNNER_LABELS:-}
 RUNNER_GROUP=${RUNNER_GROUP:-Default}
@@ -706,10 +716,41 @@ app_installation_token() {
 # credential is configured. Both paths end in the same place: a credential that
 # can mint a registration token per boot, so a reboot needs no human.
 resolve_github_token() {
+  resolve_token_files
   [[ -n "$GITHUB_TOKEN" ]] && return 0
   [[ -n "$GITHUB_APP_ID" && -n "$GITHUB_APP_PRIVATE_KEY" ]] || return 0
   log "authenticating as GitHub App ${GITHUB_APP_ID}"
   GITHUB_TOKEN=$(app_installation_token "$GITHUB_URL")
+}
+
+# read_secret reads a credential from a file, or from standard input when the
+# path is "-", and trims the trailing newline an editor or "echo" leaves behind.
+#
+# A file beats both of the alternatives: a token on the command line is visible
+# in ps to every user on the machine, and one typed into the shell is kept in
+# the history file.
+read_secret() {
+  local path=$1 value
+  if [[ "$path" == "-" ]]; then
+    IFS= read -r value || true
+  else
+    [[ -r "$path" ]] || die "cannot read the credential file ${path}"
+    IFS= read -r value < "$path" || true
+  fi
+  # Trim whitespace, so a stray space or CR in the file is not sent to GitHub.
+  value=${value#"${value%%[![:space:]]*}"}
+  value=${value%"${value##*[![:space:]]}"}
+  [[ -n "$value" ]] || die "the credential file ${path} is empty"
+  printf '%s' "$value"
+}
+
+resolve_token_files() {
+  if [[ -z "$GITHUB_TOKEN" && -n "$GITHUB_TOKEN_FILE" ]]; then
+    GITHUB_TOKEN=$(read_secret "$GITHUB_TOKEN_FILE")
+  fi
+  if [[ -z "$RUNNER_TOKEN" && -n "$RUNNER_TOKEN_FILE" ]]; then
+    RUNNER_TOKEN=$(read_secret "$RUNNER_TOKEN_FILE")
+  fi
 }
 
 # mint_token exchanges the long-lived credential for a registration token,
@@ -935,6 +976,7 @@ cmd_run() {
   --token TOKEN         a registration token from ${GITHUB_URL}/settings/actions/runners/new
                         (good for an hour, so it will not survive a reboot)
   --github-token PAT    mints one per boot; expires when the PAT does
+  --github-token-file F reads that PAT from a file, or from stdin given -
   --app-id / --app-key  mints one per boot from a GitHub App, which belongs to
                         the organisation rather than to a person"
     fi
@@ -1076,6 +1118,10 @@ main() {
       --token=*)        RUNNER_TOKEN=${1#*=}; shift ;;
       --github-token)   GITHUB_TOKEN=$2; shift 2 ;;
       --github-token=*) GITHUB_TOKEN=${1#*=}; shift ;;
+      --github-token-file)   GITHUB_TOKEN_FILE=$2; shift 2 ;;
+      --github-token-file=*) GITHUB_TOKEN_FILE=${1#*=}; shift ;;
+      --token-file)     RUNNER_TOKEN_FILE=$2; shift 2 ;;
+      --token-file=*)   RUNNER_TOKEN_FILE=${1#*=}; shift ;;
       --app-id)         GITHUB_APP_ID=$2; shift 2 ;;
       --app-id=*)       GITHUB_APP_ID=${1#*=}; shift ;;
       --app-key)        GITHUB_APP_PRIVATE_KEY=$2; shift 2 ;;
