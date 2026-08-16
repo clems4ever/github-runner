@@ -1682,69 +1682,27 @@ WantedBy=multi-user.target
 UNIT
 }
 
-# print_getting_started is what a fresh install leaves on the screen: the
-# shortest path from "the script is here" to "a runner is registered", in the
-# order the steps actually have to happen.
+# print_getting_started is what a fresh install leaves on the screen: three
+# commands and where to get the token. Everything else — services, PATs,
+# ephemeral runners — is in --help and the README, and printing it here only
+# buries the one thing someone wants to do next.
 print_getting_started() {
-  local url=${GITHUB_URL:-https://github.com/OWNER/REPO}
+  local cmd=$INSTALL_BIN
+  # /usr/local/bin is on PATH, so the bare name is what they will actually type.
+  [[ "$cmd" == /usr/local/bin/* ]] && cmd=$(basename "$cmd")
+
   cat <<GUIDE
 
-  runner-vm is installed at ${INSTALL_BIN}
+Installed. To boot a runner:
 
-  It runs a self-hosted GitHub Actions runner inside a throwaway QEMU VM: one
-  machine per runner, deleted when it stops, with its own Docker daemon and
-  /dev/kvm so jobs can build images and boot VMs of their own.
+  sudo ${cmd} doctor     # check this host can run VMs
+  sudo ${cmd} build      # build the VM image, once per host
+  sudo ${cmd} run --url https://github.com/OWNER/REPO --token AAAA...
 
-  Boot your first runner
-  ----------------------
+The token is on Settings > Actions > Runners > New self-hosted runner.
 
-  1. Check the host has KVM and nested virtualisation. It prints the fix for
-     anything missing.
-
-       sudo ${INSTALL_BIN} doctor
-
-  2. Build the golden image. Once per host, a few minutes; every VM afterwards
-     boots from a copy-on-write overlay on it in seconds.
-
-       sudo ${INSTALL_BIN} build
-
-  3. Give it a credential. A registration token from
-     ${url}/settings/actions/runners/new
-     works for one hour, which is enough to try it out:
-
-       sudo ${INSTALL_BIN} run --url ${url} --token AAAA...
-
-     For anything lasting, use a PAT or a GitHub App instead: a VM keeps no
-     registration, so every boot needs a fresh registration token, and the
-     script mints one per boot from either.
-
-       sudo install -d -m 0755 /etc/runner-vm
-       sudo install -m 0600 /dev/null /etc/runner-vm/pat
-       sudoedit /etc/runner-vm/pat          # paste the PAT, save
-       sudo ${INSTALL_BIN} run --url ${url} --github-token-file /etc/runner-vm/pat
-
-     A fine-grained PAT needs Administration: Read and write on the repository,
-     or the organisation's Self-hosted runners: Read and write.
-
-  4. That runs in the foreground and the VM dies with it, which is the right
-     way to check it works. To have runners start with the host instead:
-
-       sudo ${INSTALL_BIN} install --service \\
-         --url ${url} --github-token-file /etc/runner-vm/pat
-
-     which adds a systemd unit, an unprivileged service user, builds the image
-     and starts runner-vm@runner-1. Add more with:
-
-       sudo systemctl enable --now runner-vm@runner-2
-
-  Then
-  ----
-
-    ${INSTALL_BIN} list          what is running, with ssh ports and uptime
-    ${INSTALL_BIN} --help        every flag
-    sudo ${INSTALL_BIN} clean    stop everything, keep the image cache
-
-  Jobs target it with "runs-on: self-hosted".
+For runners that start with the host, and credentials that outlive an hour:
+  ${cmd} --help
 
 GUIDE
 }
