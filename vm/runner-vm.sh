@@ -1446,52 +1446,123 @@ deregister_known_runners() {
 # A VM whose process is gone but whose directory remains is reported as stopped
 # rather than hidden: that is the state a crashed wrapper leaves behind, and
 # "clean" is what clears it.
-cmd_list() {
-  local dir name pid port state uptime url ephemeral found=false
+# state_dirs lists the directories VMs might be under.
+#
+# A runner started by hand keeps its VM under the invoking user's state
+# directory, while the service keeps its own under /var/lib/runner-vm. Listing
+# only the first is why "list" could report no VMs while a service was plainly
+# running.
+state_dirs() {
+  echo "$STATE_DIR"
+  [[ "$SERVICE_STATE" != "$STATE_DIR" && -d "$SERVICE_STATE" ]] && echo "$SERVICE_STATE"
+  return 0
+}
 
-  printf '%-22s %-8s %-8s %-6s %-10s %s\n' NAME STATE PID SSH UPTIME URL
+# vm_dir_for finds a named VM in any of those directories.
+vm_dir_for() {
+  local name=$1 root
+  while read -r root; do
+    [[ -d "${root}/vms/${name}" ]] && { echo "${root}/vms/${name}"; return 0; }
+  done < <(state_dirs)
+  return 1
+}
+
+meta_field() {
+  local dir=$1 field=$2
+  [[ -f "${dir}/meta" ]] || return 0
+  sed -n "s/^${field}=//p" "${dir}/meta"
+}
+
+# short_scope turns a URL into owner/repo, which is what identifies a runner at
+# a glance; the scheme and host are the same for every row.
+short_scope() {
+  sed -E 's#^https?://[^/]+/##; s#/$##' <<<"${1:-}"
+}
+
+cmd_list() {
+  local names="" name dir root unit
   shopt -s nullglob
-  for dir in "$STATE_DIR"/vms/*/; do
-    found=true
-    name=$(basename "$dir")
-    pid=""; port="-"; url="-"; ephemeral=""
-    [[ -f "${dir}qemu.pid" ]] && pid=$(cat "${dir}qemu.pid" 2>/dev/null || true)
-    [[ -f "${dir}ssh_port" ]] && port=$(cat "${dir}ssh_port" 2>/dev/null || true)
-    if [[ -f "${dir}meta" ]]; then
-      url=$(sed -n 's/^URL=//p' "${dir}meta")
-      [[ "$(sed -n 's/^EPHEMERAL=//p' "${dir}meta")" == "true" ]] && ephemeral=" (ephemeral)"
+
+  # Every VM on disk, plus every service instance, since a service that has not
+  # booted its VM yet still has a repository and a size worth showing.
+  while read -r root; do
+    for dir in "${root}"/vms/*/; do
+      names+="$(basename "$dir")"$'\n'
+    done
+  done < <(state_dirs)
+  while read -r unit; do
+    [[ -n "$unit" ]] || continue
+    # runner-vm@NAME.service
+    name=${unit#runner-vm@}
+    names+="${name%.service}"$'\n'
+  done <<<"$(runner_vm_services)"
+  shopt -u nullglob
+
+  names=$(sort -u <<<"$names" | sed '/^$/d')
+  if [[ -z "$names" ]]; then
+    echo "(no VMs and no services)"
+    return 0
+  fi
+
+  printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-10s %s\n' \
+    NAME STATE SERVICE CPU MEM DISK SSH UPTIME REPO
+
+  local pid port state uptime cpus mem disk repo service ephemeral
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    dir=$(vm_dir_for "$name" || true)
+
+    pid=""; port="-"; uptime="-"; ephemeral=""
+    cpus="-"; mem="-"; disk="-"; repo="-"
+
+    if [[ -n "$dir" ]]; then
+      [[ -f "${dir}/qemu.pid" ]] && pid=$(cat "${dir}/qemu.pid" 2>/dev/null || true)
+      [[ -f "${dir}/ssh_port" ]] && port=$(cat "${dir}/ssh_port" 2>/dev/null || true)
+      cpus=$(meta_field "$dir" CPUS); cpus=${cpus:--}
+      mem=$(meta_field "$dir" MEMORY_MB); mem=${mem:+${mem}M}; mem=${mem:--}
+      disk=$(meta_field "$dir" DISK_GB); disk=${disk:+${disk}G}; disk=${disk:--}
+      repo=$(short_scope "$(meta_field "$dir" URL)"); repo=${repo:--}
+      [[ "$(meta_field "$dir" EPHEMERAL)" == "true" ]] && ephemeral="*"
     fi
+
+    # Fall back to the configuration for a service whose VM has not booted, so
+    # the row still says what it would run and how big it would be.
+    if [[ "$repo" == "-" && -r /etc/runner-vm/env ]]; then
+      repo=$(short_scope "$(sed -n 's/^GITHUB_URL=//p' /etc/runner-vm/env)")
+      repo=${repo:--}
+    fi
+    [[ "$cpus" == "-" ]] && cpus=$VM_CPUS
+    [[ "$mem"  == "-" ]] && mem="${VM_MEMORY_MB}M"
+    [[ "$disk" == "-" ]] && disk="${VM_DISK_GB}G"
 
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       state=running
       uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || echo '-')
-    else
+    elif [[ -n "$dir" ]]; then
       state=stopped
       pid="-"
-      uptime="-"
+    else
+      state="-"
+      pid="-"
     fi
-    printf '%-22s %-8s %-8s %-6s %-10s %s\n' "$name" "$state" "$pid" "$port" "$uptime" "${url}${ephemeral}"
-  done
-  shopt -u nullglob
 
-  if [[ "$found" != "true" ]]; then
-    echo "(no VMs)"
-  else
-    echo
-    echo "ssh into one with:"
-    echo "  ssh -i ${SSH_KEY} -p <SSH> ubuntu@127.0.0.1"
-    echo "its console is at ${STATE_DIR}/vms/<NAME>/console.log"
-  fi
+    service="-"
+    if have systemctl; then
+      service=$(systemctl is-active "runner-vm@${name}.service" 2>/dev/null || true)
+      [[ -n "$service" ]] || service="-"
+    fi
 
-  local services; services=$(runner_vm_services)
-  if [[ -n "$services" ]]; then
+    printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-10s %s\n' \
+      "$name" "$state" "$service" "$cpus" "$mem" "$disk" "$port" "$uptime" "${repo}${ephemeral}"
+  done <<<"$names"
+
+  echo
+  echo "* ephemeral: the VM stops after one job and the service starts a clean one"
+  echo "ssh into one with:  ssh -i ${SSH_KEY} -p <SSH> ubuntu@127.0.0.1"
+  echo "consoles are under: <state dir>/vms/<NAME>/console.log"
+  if [[ "$SERVICE_STATE" != "$STATE_DIR" && -d "$SERVICE_STATE" && ! -r "$SERVICE_STATE/vms" ]]; then
     echo
-    echo "systemd services:"
-    local unit
-    while read -r unit; do
-      [[ -n "$unit" ]] || continue
-      printf '  %-34s %s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || echo unknown)"
-    done <<<"$services"
+    warn "cannot read ${SERVICE_STATE}; rerun with sudo to see the VMs the service owns"
   fi
 }
 
