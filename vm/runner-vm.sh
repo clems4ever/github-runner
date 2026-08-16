@@ -1613,6 +1613,8 @@ print_getting_started() {
      registration, so every boot needs a fresh registration token, and the
      script mints one per boot from either.
 
+       sudo install -d -m 0755 /etc/runner-vm
+       sudo install -m 0600 /dev/null /etc/runner-vm/pat
        sudoedit /etc/runner-vm/pat          # paste the PAT, save
        sudo ${INSTALL_BIN} run --url ${url} --github-token-file /etc/runner-vm/pat
 
