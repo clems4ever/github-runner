@@ -3,6 +3,9 @@
 services:
   runner:
     build:
-      context: .
+      # The repository root, not this directory: the image copies
+      # ../entrypoint.sh, which both this and the VM setup share.
+      context: ..
+      dockerfile: docker/Dockerfile
       args:
         INSTALL_DOCKER_CLI: ${INSTALL_DOCKER_CLI:-true}

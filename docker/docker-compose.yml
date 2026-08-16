@@ -1,3 +1,8 @@
+# Pinned so the project name does not follow the directory this file sits in:
+# compose would otherwise call it "docker" and give the runner-state volume a
+# new name, orphaning the registrations saved by an earlier layout.
+name: github-runner
+
 services:
   runner:
     # Published by .github/workflows/build.yml. To build locally instead:
