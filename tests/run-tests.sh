@@ -17,7 +17,10 @@
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
-SCRIPT=runner-vm.sh
+# Absolute, and never a bare name: "source runner-vm.sh" searches PATH when the
+# argument has no slash, so on a host where the script is installed the tests
+# would silently exercise /usr/local/bin/runner-vm.sh instead of this checkout.
+SCRIPT=$PWD/runner-vm.sh
 
 # shellcheck source=../runner-vm.sh
 source "$SCRIPT"
@@ -358,6 +361,31 @@ if test_case "clean"; then
   STATE_DIR="$WORK/clean-state2"; mkdir -p "$STATE_DIR/vms"
   ASSUME_YES=false CLEAN_ALL=false
   fails "refuses unattended without --yes" bash -c "source $SCRIPT; STATE_DIR='$STATE_DIR' ASSUME_YES=false cmd_clean </dev/null"
+fi
+
+if test_case "clean-one"; then
+  STATE_DIR="$WORK/one-state"
+  mkdir -p "$STATE_DIR/vms/keep" "$STATE_DIR/vms/drop" "$STATE_DIR/images"
+  echo golden > "$STATE_DIR/images/golden-test.qcow2"
+  GITHUB_URL="" ASSUME_YES=true CLEAN_ALL=false
+
+  CLEAN_TARGETS=(drop)
+  cmd_clean </dev/null >/dev/null 2>&1
+
+  if [[ ! -d "$STATE_DIR/vms/drop" ]]; then ok "the named VM is removed"; else bad "the named VM is removed"; fi
+  if [[ -d "$STATE_DIR/vms/keep" ]]; then ok "the others are left alone"; else bad "the others are left alone"; fi
+  if [[ -f "$STATE_DIR/images/golden-test.qcow2" ]]; then ok "the images are left alone"; else bad "the images are left alone"; fi
+
+  # Naming something that does not exist is a mistake worth reporting, not a
+  # silent no-op that looks like success.
+  CLEAN_TARGETS=(nosuchvm)
+  fails "refuses a name that matches no VM" \
+    bash -c "source $SCRIPT; STATE_DIR='$STATE_DIR' ASSUME_YES=true CLEAN_TARGETS=(nosuchvm) cmd_clean </dev/null"
+
+  fails "refuses --all together with a name" \
+    bash -c "source $SCRIPT; STATE_DIR='$STATE_DIR' ASSUME_YES=true CLEAN_ALL=true CLEAN_TARGETS=(keep) cmd_clean </dev/null"
+
+  CLEAN_TARGETS=()
 fi
 
 if test_case "help"; then
