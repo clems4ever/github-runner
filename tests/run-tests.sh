@@ -305,6 +305,32 @@ if test_case "ports"; then
   is "the claim is recorded for the next VM" "$port_a" "$(cat "$STATE_DIR/vms/a/ssh_port")"
 fi
 
+if test_case "pid-alive"; then
+  # pid 1 belongs to root, so unless these tests run as root "kill -0 1" fails
+  # with EPERM — which is the whole reason pid_alive does not use it. That is
+  # what made an unprivileged "list" report the service's VMs as stopped.
+  succeeds "sees a process it cannot signal" pid_alive 1
+  fails    "sees through a dead pid"         pid_alive 999999999
+  fails    "sees through an empty pid"       pid_alive ""
+fi
+
+if test_case "image-size"; then
+  if have qemu-img; then
+    qemu-img create -q -f qcow2 "$WORK/backing.qcow2" 30G
+    is "reads the virtual size in bytes" "32212254720" "$(image_virtual_bytes "$WORK/backing.qcow2")"
+
+    # qemu-img creates this overlay without complaint, and a guest cannot boot
+    # from it: the truncated disk loses the backup GPT and invalidates the
+    # primary one, so the kernel finds no partitions at all.
+    qemu-img create -q -f qcow2 -F qcow2 -b "$WORK/backing.qcow2" "$WORK/small.qcow2" 20G
+    is "a truncating overlay is smaller than its backing image" "21474836480" \
+      "$(image_virtual_bytes "$WORK/small.qcow2")"
+    is "nothing to read from a missing image" "" "$(image_virtual_bytes "$WORK/absent.qcow2")"
+  else
+    ok "skipped: no qemu-img on this host"
+  fi
+fi
+
 if test_case "list"; then
   STATE_DIR="$WORK/list-state"
   SERVICE_STATE="$WORK/list-service"
@@ -336,6 +362,19 @@ META
   contains "shows the disk"                    "$out" "60G"
   contains "shows the ssh port"                "$out" "2222"
   contains "marks ephemeral VMs"               "$out" "o/other*"
+  contains "reports a VM with no process as stopped" "$out" "runner-1         stopped"
+  # Both state directories are in play, so no single key path applies.
+  contains "names the state directories"       "$out" "$SERVICE_STATE"
+
+  # A VM whose process is alive, using this shell as a stand-in for QEMU.
+  echo $$ > "$SERVICE_STATE/vms/runner-1/qemu.pid"
+  out=$(cmd_list)
+  contains "reports a live VM as running" "$out" "runner-1         running"
+  lacks    "fills in the uptime"          "$(sed -n 's/^runner-1 *running *[^ ]* *[^ ]* *[^ ]* *[^ ]* *[^ ]* *\([^ ]*\).*/\1/p' <<<"$out")" "-"
+
+  # One state directory in play, so the key to use is unambiguous.
+  STATE_DIR=$SERVICE_STATE
+  contains "shows the key for the VMs it found" "$(cmd_list)" "${SERVICE_STATE}/ssh/id_ed25519"
 
   STATE_DIR="$WORK/empty-state"; SERVICE_STATE="$WORK/empty-service"; mkdir -p "$STATE_DIR"
   contains "says so when there is nothing" "$(cmd_list)" "no VMs and no services"

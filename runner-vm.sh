@@ -220,6 +220,36 @@ warn() { echo "[runner-vm] warning: $*" >&2; }
 die()  { echo "[runner-vm] error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# pid_alive reports whether a process is still running, without needing
+# permission to signal it.
+#
+# "kill -0" answers a different question: it fails with EPERM on a process
+# belonging to another user, which bash reports the same way as "no such
+# process". The service runs its VMs as ${SERVICE_USER}, so an unprivileged
+# "list" saw every one of them as stopped — with no uptime, since that is read
+# in the same branch — while systemd plainly said the service was active.
+pid_alive() {
+  local pid=${1:-}
+  [[ -n "$pid" ]] || return 1
+  if [[ -d /proc ]]; then
+    [[ -d "/proc/${pid}" ]]
+  else
+    kill -0 "$pid" 2>/dev/null
+  fi
+}
+
+# image_virtual_bytes prints the size the guest sees, in bytes.
+#
+# The human-readable line carries both a rounded figure and the exact one, and
+# the exact one is what a comparison needs. It is read rather than the JSON
+# output because only the top-level image has this line, whereas
+# "virtual-size" appears once per node in the JSON and picking the first match
+# depends on the field order of the qemu-img in use.
+image_virtual_bytes() {
+  qemu-img info "$1" 2>/dev/null \
+    | sed -n 's/^virtual size:.*(\([0-9]\{1,\}\) bytes).*/\1/p' | head -1
+}
+
 # --------------------------------------------------------------------------
 # Host capabilities
 # --------------------------------------------------------------------------
@@ -1262,7 +1292,7 @@ cmd_run() {
   # Several VMs can share a host, but not a name: they would share a directory,
   # a disk and a runner registration. Refuse rather than delete someone else's
   # machine out from under them.
-  if [[ -f "${VM_DIR}/qemu.pid" ]] && kill -0 "$(cat "${VM_DIR}/qemu.pid" 2>/dev/null)" 2>/dev/null; then
+  if [[ -f "${VM_DIR}/qemu.pid" ]] && pid_alive "$(cat "${VM_DIR}/qemu.pid" 2>/dev/null)"; then
     die "a VM named '${VM_NAME}' is already running on this host
   give this one a different name with --name, or stop that one first"
   fi
@@ -1282,9 +1312,10 @@ cmd_run() {
   make_seed "${VM_DIR}/user-data" "${VM_DIR}/meta-data" "${VM_DIR}/seed.iso"
 
   # An overlay cannot be smaller than the image it is backed by.
-  local golden_gb
-  golden_gb=$(qemu-img info --output=json "$golden" | sed -n 's/.*"virtual-size":[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
-  golden_gb=$(( (golden_gb + 1073741823) / 1073741824 ))
+  local golden_bytes golden_gb
+  golden_bytes=$(image_virtual_bytes "$golden")
+  [[ -n "$golden_bytes" ]] || die "cannot read the size of ${golden}; rebuild it with: $0 build --force"
+  golden_gb=$(( (golden_bytes + 1073741823) / 1073741824 ))
   if [[ "$VM_DISK_GB" -lt "$golden_gb" ]]; then
     warn "--disk ${VM_DISK_GB}G is smaller than the golden image (${golden_gb}G), using ${golden_gb}G"
     VM_DISK_GB=$golden_gb
@@ -1293,6 +1324,20 @@ cmd_run() {
   # A copy-on-write overlay: the golden image stays untouched, and this disk is
   # a few megabytes until the job fills it.
   qemu-img create -q -f qcow2 -F qcow2 -b "$golden" "${VM_DIR}/disk.qcow2" "${VM_DISK_GB}G"
+
+  # qemu-img creates an overlay smaller than its backing image without so much
+  # as a warning, and the guest then hangs in an initramfs shell: truncating the
+  # disk cuts off the backup GPT and leaves the primary one describing a device
+  # larger than the one present, so the kernel enumerates no partitions at all
+  # and the root filesystem never appears. Checked here because that failure is
+  # otherwise silent — the VM stays up, the runner never registers, and the
+  # only clue is 'LABEL=cloudimg-rootfs does not exist' in the console log.
+  local overlay_bytes
+  overlay_bytes=$(image_virtual_bytes "${VM_DIR}/disk.qcow2")
+  if [[ -z "$overlay_bytes" || "$overlay_bytes" -lt "$golden_bytes" ]]; then
+    die "the VM disk (${overlay_bytes:-unknown} bytes) is smaller than the golden image it is backed by (${golden_bytes} bytes), and a guest cannot boot from that
+  give it at least --disk ${golden_gb}"
+  fi
 
   # "-cpu host" is what exposes the CPU's virtualisation extensions; naming the
   # flag explicitly makes a host without nested virtualisation fail here rather
@@ -1423,15 +1468,23 @@ stop_stray_vms() {
     pid=""
     [[ -f "${dir}qemu.pid" ]] && pid=$(cat "${dir}qemu.pid" 2>/dev/null || true)
 
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    if pid_alive "$pid"; then
       log "stopping VM ${name} (pid ${pid})"
       kill "$pid" 2>/dev/null || true
       waited=0
-      while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 15 ]]; do
+      while pid_alive "$pid" && [[ $waited -lt 15 ]]; do
         sleep 1
         waited=$((waited + 1))
       done
       kill -9 "$pid" 2>/dev/null || true
+      sleep 1
+      # Signalling someone else's VM needs root, and deleting the disk out from
+      # under one still running would corrupt a job rather than clean up after
+      # it.
+      if pid_alive "$pid"; then
+        warn "the VM ${name} (pid ${pid}) is still running and was left alone; rerun this as root"
+        continue
+      fi
     fi
 
     rm -rf "$dir"
@@ -1589,7 +1642,7 @@ short_scope() {
 }
 
 cmd_list() {
-  local names="" name dir root unit
+  local names="" roots="" name dir root unit
   shopt -s nullglob
 
   # Every VM on disk, plus every service instance, since a service that has not
@@ -1625,6 +1678,7 @@ cmd_list() {
     cpus="-"; mem="-"; disk="-"; repo="-"
 
     if [[ -n "$dir" ]]; then
+      roots+="${dir%/vms/*}"$'\n'
       [[ -f "${dir}/qemu.pid" ]] && pid=$(cat "${dir}/qemu.pid" 2>/dev/null || true)
       [[ -f "${dir}/ssh_port" ]] && port=$(cat "${dir}/ssh_port" 2>/dev/null || true)
       cpus=$(meta_field "$dir" CPUS); cpus=${cpus:--}
@@ -1662,9 +1716,10 @@ cmd_list() {
     [[ "$mem"  == "-" ]] && mem="${VM_MEMORY_MB}M"
     [[ "$disk" == "-" ]] && disk="${VM_DISK_GB}G"
 
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    if pid_alive "$pid"; then
       state=running
-      uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || echo '-')
+      uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+      uptime=${uptime:--}
     elif [[ -n "$dir" ]]; then
       state=stopped
       pid="-"
@@ -1685,8 +1740,22 @@ cmd_list() {
 
   echo
   echo "* ephemeral: the VM stops after one job and the service starts a clean one"
-  echo "ssh into one with:  ssh -i ${SSH_KEY} -p <SSH> ubuntu@127.0.0.1"
-  echo "consoles are under: <state dir>/vms/<NAME>/console.log"
+
+  # The ssh key is per state directory, and the VMs a service owns live under
+  # its own: printing this script's key against those would hand out a key that
+  # cannot log into any of them.
+  local dirs count
+  dirs=$(sort -u <<<"$roots" | sed '/^$/d')
+  [[ -n "$dirs" ]] || dirs=$STATE_DIR
+  count=$(grep -c . <<<"$dirs")
+  if [[ "$count" -eq 1 ]]; then
+    echo "ssh into one with:  ssh -i ${dirs}/ssh/id_ed25519 -p <SSH> ubuntu@127.0.0.1"
+    echo "consoles are under: ${dirs}/vms/<NAME>/console.log"
+  else
+    echo "ssh into one with:  ssh -i <state dir>/ssh/id_ed25519 -p <SSH> ubuntu@127.0.0.1"
+    echo "consoles are under: <state dir>/vms/<NAME>/console.log"
+    echo "state dirs:         $(tr '\n' ' ' <<<"$dirs")"
+  fi
   if [[ "$SERVICE_STATE" != "$STATE_DIR" && -d "$SERVICE_STATE" && ! -r "$SERVICE_STATE/vms" ]]; then
     echo
     warn "cannot read ${SERVICE_STATE}; rerun with sudo to see the VMs the service owns"
