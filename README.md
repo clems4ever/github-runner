@@ -16,6 +16,8 @@ runners are systemd units and Docker containers of their own, and the daemon
 only creates, drains and deletes them. Restart it, upgrade it, or let it crash —
 the jobs on this host carry on.
 
+![The pools table](docs/img/pools.png)
+
 ## Install
 
 ```bash
@@ -72,6 +74,8 @@ jobs:
 Those follow the settings rather than the name, so a pool cannot claim to be
 something it is not.
 
+![The pool editor](docs/img/pool-editor.png)
+
 ### Virtual machines or containers
 
 A **virtual machine** gives a job its own kernel, its own Docker daemon and a
@@ -109,6 +113,11 @@ it stopped being true:
   only GitHub knows whether a job is on it, and the daemon asks — including for
   runners whose pool has just been deleted, which carry their own scope for
   exactly that reason.
+
+The fleet view shows both facts side by side, because they answer different
+questions:
+
+![The fleet view](docs/img/fleet.png)
 
 Each runner's configuration is hashed into a *generation*. A runner whose
 generation no longer matches its pool is running the wrong configuration and is
