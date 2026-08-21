@@ -368,6 +368,7 @@ EPHEMERAL=false
 CPUS=4
 MEMORY_MB=8192
 DISK_GB=60
+NESTED=true
 META
   echo 2222 > "$SERVICE_STATE/vms/runner-1/ssh_port"
   cat > "$STATE_DIR/vms/hand-1/meta" <<'META'
@@ -377,6 +378,7 @@ EPHEMERAL=true
 CPUS=2
 MEMORY_MB=4096
 DISK_GB=40
+NESTED=false
 META
 
   out=$(cmd_list)
@@ -388,6 +390,10 @@ META
   contains "shows the disk"                    "$out" "60G"
   contains "shows the ssh port"                "$out" "2222"
   contains "marks ephemeral VMs"               "$out" "o/other*"
+  # Which VMs can run VMs of their own is the difference between a runner that
+  # can build images and one that cannot, so it belongs in the table.
+  contains "says which VMs have nested virtualisation" "$out" "60G     yes"
+  contains "and which do not"                          "$out" "40G     no"
   contains "reports a VM with no process as stopped" "$out" "runner-1         stopped"
   # Both state directories are in play, so no single key path applies.
   contains "names the state directories"       "$out" "$SERVICE_STATE"
@@ -415,12 +421,14 @@ if test_case "list-per-runner"; then
   ETC_DIR="$WORK/multi-etc"; CRED_DIR="$ETC_DIR/creds"
   mkdir -p "$ETC_DIR" "$SERVICE_STATE/vms/web" "$SERVICE_STATE/vms/spare"
   printf 'GITHUB_URL=https://github.com/o/shared\nVM_CPUS=2\n'   > "$ETC_DIR/env"
-  printf 'GITHUB_URL=https://github.com/o/web\nVM_CPUS=8\n'      > "$ETC_DIR/env.web"
+  printf 'GITHUB_URL=https://github.com/o/web\nVM_CPUS=8\nVM_NESTED=true\n' > "$ETC_DIR/env.web"
 
   out=$(cmd_list)
   contains "shows each runner its own repository" "$out" "o/web"
   contains "and the shared one for the rest"      "$out" "o/shared"
   contains "with the size that runner will get"   "$out" "8"
+  contains "and whether it will get nested"      "$out" "yes"
+  contains "which the others will not"           "$out" "no"
 
   is "a runner's own setting wins"          "https://github.com/o/web"    "$(configured_field web GITHUB_URL)"
   is "and falls back to the shared file"    "2"                           "$(configured_field spare VM_CPUS)"

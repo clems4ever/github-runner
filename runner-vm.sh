@@ -1779,16 +1779,16 @@ cmd_list() {
     return 0
   fi
 
-  printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-10s %s\n' \
-    NAME STATE SERVICE CPU MEM DISK SSH UPTIME REPO
+  printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-6s %-10s %s\n' \
+    NAME STATE SERVICE CPU MEM DISK NESTED SSH UPTIME REPO
 
-  local pid port state uptime cpus mem disk repo service ephemeral
+  local pid port state uptime cpus mem disk nested repo service ephemeral
   while read -r name; do
     [[ -n "$name" ]] || continue
     dir=$(vm_dir_for "$name" || true)
 
     pid=""; port="-"; uptime="-"; ephemeral=""
-    cpus="-"; mem="-"; disk="-"; repo="-"
+    cpus="-"; mem="-"; disk="-"; repo="-"; nested="-"
 
     if [[ -n "$dir" ]]; then
       roots+="${dir%/vms/*}"$'\n'
@@ -1797,6 +1797,10 @@ cmd_list() {
       cpus=$(meta_field "$dir" CPUS); cpus=${cpus:--}
       mem=$(meta_field "$dir" MEMORY_MB); mem=${mem:+${mem}M}; mem=${mem:--}
       disk=$(meta_field "$dir" DISK_GB); disk=${disk:+${disk}G}; disk=${disk:--}
+      # From the VM rather than the configuration, so a runner told to change
+      # and not yet restarted reads as what it is running with, not what it
+      # will run with next time.
+      nested=$(meta_field "$dir" NESTED); nested=${nested:--}
       repo=$(short_scope "$(meta_field "$dir" URL)"); repo=${repo:--}
       [[ "$(meta_field "$dir" EPHEMERAL)" == "true" ]] && ephemeral="*"
     fi
@@ -1824,9 +1828,16 @@ cmd_list() {
       configured=$(configured_field "$name" VM_DISK_GB)
       [[ -n "$configured" ]] && disk="${configured}G"
     fi
+    if [[ "$nested" == "-" ]]; then
+      configured=$(configured_field "$name" VM_NESTED)
+      [[ -n "$configured" ]] && nested=$configured
+    fi
     [[ "$cpus" == "-" ]] && cpus=$VM_CPUS
     [[ "$mem"  == "-" ]] && mem="${VM_MEMORY_MB}M"
     [[ "$disk" == "-" ]] && disk="${VM_DISK_GB}G"
+    [[ "$nested" == "-" ]] && nested=$VM_NESTED
+    # Only "true" is true to the rest of the script, so anything else is off.
+    if [[ "$nested" == "true" ]]; then nested=yes; else nested=no; fi
 
     if pid_alive "$pid"; then
       state=running
@@ -1846,8 +1857,8 @@ cmd_list() {
       [[ -n "$service" ]] || service="-"
     fi
 
-    printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-10s %s\n' \
-      "$name" "$state" "$service" "$cpus" "$mem" "$disk" "$port" "$uptime" "${repo}${ephemeral}"
+    printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-6s %-10s %s\n' \
+      "$name" "$state" "$service" "$cpus" "$mem" "$disk" "$nested" "$port" "$uptime" "${repo}${ephemeral}"
   done <<<"$names"
 
   echo
