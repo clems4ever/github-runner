@@ -68,14 +68,59 @@ sudo runner-vm.sh install --service \
   --github-token github_pat_...
 ```
 
-That stores the credential at `/etc/runner-vm/pat` (root-only), installs a
+That stores the credential at `/etc/runner-vm/creds/pat` (root-only), installs a
 systemd unit, and starts `runner-vm@runner-1`. It comes back after a reboot.
 
 ```bash
 runner-vm.sh list                         # what is running
 sudo journalctl -u runner-vm@runner-1 -f  # what it is doing
-sudo systemctl enable --now runner-vm@runner-2   # another one
+sudo systemctl enable --now runner-vm@runner-2   # another one, same repository
 ```
+
+## Several repositories on one host
+
+Every runner is an instance of one unit template and reads its own
+configuration, so adding a repository is running `install --service` again with
+a different `--name`:
+
+```bash
+sudo runner-vm.sh install --service --name web \
+  --url https://github.com/OWNER/web --github-token github_pat_...
+
+sudo runner-vm.sh install --service --name api \
+  --url https://github.com/OWNER/api
+```
+
+The second one reuses the credential already on the host — pass a token of its
+own if that repository needs a different one — and leaves the first runner's
+configuration untouched. Sizes and labels are per runner too:
+
+```bash
+sudo runner-vm.sh install --service --name big \
+  --url https://github.com/OWNER/web --cpus 8 --memory 16384 --labels big
+```
+
+What ends up where:
+
+| | |
+| --- | --- |
+| `/etc/runner-vm/env` | defaults shared by every runner on the host |
+| `/etc/runner-vm/env.NAME` | one runner's settings, read after the shared file so it wins |
+| `/etc/runner-vm/creds/pat` | the credential runners use unless they have their own |
+| `/etc/runner-vm/creds/pat.NAME` | one runner's own credential (likewise `app.pem` and `app.NAME.pem`) |
+
+Editing a file takes effect on the next restart of that runner alone:
+
+```bash
+sudoedit /etc/runner-vm/env.api
+sudo systemctl restart runner-vm@api   # waits for the job in flight
+```
+
+If the repositories are all in one organisation, an organisation-level runner is
+simpler than one per repository: point `--url` at
+`https://github.com/ORGANISATION` and every repository in it can use the runner.
+GitHub has no equivalent for a personal account, so repositories under a user
+account need one runner each.
 
 ## Commands
 
@@ -111,14 +156,16 @@ Any of them can come from a file or stdin instead of the command line, where
 `ps` would show it to every user on the machine:
 
 ```bash
-sudo runner-vm.sh run --url ... --github-token-file /etc/runner-vm/pat
+sudo runner-vm.sh run --url ... --github-token-file /root/pat
 printf %s "$PAT" | sudo runner-vm.sh run --url ... --github-token-file -
 ```
 
-Whatever you pass to `install --service` is stored at `/etc/runner-vm/pat`,
+Whatever you pass to `install --service` is stored under `/etc/runner-vm/creds`,
 `0600` and root-owned, and handed to the service through systemd's credential
-mechanism — so it is never in the unit, never in a command line, and not
-readable by the service user.
+mechanism — so it is never in the unit, never in a command line, and never
+readable on disk by the service user. The first credential installed on a host
+is the one every runner uses; a runner that needs a different one gets it as
+`creds/pat.NAME`.
 
 ## What the VM has
 
