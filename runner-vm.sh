@@ -58,7 +58,10 @@ set -euo pipefail
 #   --env-file FILE                        default .env, when present
 #
 # Flags for install:
-#   --name NAME           the runner to enable (default runner-1)
+#   --name NAME           the runner to install and enable (default runner-1).
+#                         Its settings go to /etc/runner-vm/env.NAME, so
+#                         installing again under another name adds a runner
+#                         rather than repointing the ones already there
 #   --no-build            do not build the golden image
 #   --no-start            do not enable and start the service
 #
@@ -68,17 +71,37 @@ set -euo pipefail
 #                         the state directory
 #   -y, --yes             do not ask for confirmation
 #
+# Several repositories on one host:
+#   Every runner is an instance of one unit template, and each reads its own
+#   configuration, so run install once per repository with a different --name:
+#
+#     sudo ./runner-vm.sh install --service --name web \
+#       --url https://github.com/OWNER/web --github-token-file /root/pat
+#     sudo ./runner-vm.sh install --service --name api \
+#       --url https://github.com/OWNER/api
+#
+#   The second one reuses the credential already on the host; pass a token of
+#   its own if that repository needs a different one. What ends up where:
+#
+#     /etc/runner-vm/env             defaults shared by every runner
+#     /etc/runner-vm/env.NAME        one runner's settings, read after the above
+#     /etc/runner-vm/creds/pat       the credential runners use by default
+#     /etc/runner-vm/creds/pat.NAME  one runner's own credential, when it needs
+#                                    one (likewise app.pem and app.NAME.pem)
+#
 # Examples:
 #   ./runner-vm.sh --url https://github.com/runyard-ai --token AAA...
 #   GITHUB_TOKEN=ghp_... ./runner-vm.sh --url https://github.com/runyard-ai
-#   ./runner-vm.sh --url https://github.com/OWNER/REPO --github-token-file /etc/runner-vm/pat
+#   ./runner-vm.sh --url https://github.com/OWNER/REPO --github-token-file /root/pat
 #   ./runner-vm.sh --url https://github.com/runyard-ai --app-id 123456 \
-#     --app-key /etc/runner-vm/app.pem
+#     --app-key /root/app.pem
 #   ./runner-vm.sh build --force
 #   ./runner-vm.sh clean runner-2
 #   ./runner-vm.sh clean --all --yes
 #   sudo ./runner-vm.sh install --url https://github.com/OWNER/REPO \
 #     --github-token-file /root/pat
+#   sudo ./runner-vm.sh install --service --name api \
+#     --url https://github.com/OWNER/api
 #   ./runner-vm.sh list
 #   sudo ./runner-vm.sh uninstall
 
@@ -183,6 +206,19 @@ SCRIPT_URL=${SCRIPT_URL:-https://raw.githubusercontent.com/clems4ever/github-run
 INSTALL_BIN=${INSTALL_BIN:-/usr/local/bin/runner-vm.sh}
 SERVICE_USER=${SERVICE_USER:-runner-vm}
 SERVICE_STATE=${SERVICE_STATE:-/var/lib/runner-vm}
+
+# The configuration the service reads. One unit template serves every runner on
+# the host, so the per-runner settings cannot live in the unit: ETC_DIR/env
+# holds what they share and ETC_DIR/env.NAME what one of them overrides, which
+# is how a single host serves several repositories.
+#
+# Overridable so the tests can exercise the layout without writing to /etc.
+ETC_DIR=${RUNNER_VM_ETC:-/etc/runner-vm}
+# Credentials sit in a directory of their own, because the unit hands the whole
+# directory to systemd and every file in it becomes a credential.
+CRED_DIR="${ETC_DIR}/creds"
+# systemd names a credential loaded from a directory "<id>_<filename>".
+CRED_ID=runner-vm
 
 ENV_FILE=${ENV_FILE:-.env}
 FORCE=false
@@ -839,7 +875,7 @@ api_error() {
   The token itself is wrong, not its permissions. Check the value actually
   reaching the script — a truncated paste or a leftover placeholder looks
   exactly like this:
-    sudo grep -c . /etc/runner-vm/env   # confirm the file has the lines you expect
+    sudo grep -c . ${ETC_DIR}/env.${RUNNER_NAME:-<runner>}   # confirm the file has the lines you expect
   A fine-grained token starts with github_pat_ and a classic one with ghp_."
       ;;
     403)
@@ -976,7 +1012,38 @@ read_secret() {
   printf '%s' "$value"
 }
 
+# service_credential prints the file systemd loaded for this runner, or nothing
+# when there is none. KIND is "pat" or "app.pem".
+#
+# The unit loads ${CRED_DIR} whole rather than one named file, since a template
+# unit cannot say "this file if it exists": naming a missing file fails the unit
+# outright. Loading the directory instead lets the choice happen here, where a
+# runner takes the credential named after it — pat.NAME — and falls back to the
+# host-wide pat, so several runners share one PAT until one of them needs its
+# own.
+service_credential() {
+  local kind=$1 dir=${CREDENTIALS_DIRECTORY:-} name=${RUNNER_NAME:-}
+  [[ -n "$dir" ]] || return 0
+
+  # app.pem keeps its suffix, so the runner name goes before it rather than at
+  # the end: app.build1.pem, not app.pem.build1.
+  local stem=${kind%%.*} suffix=${kind#"${kind%%.*}"}
+  if [[ -n "$name" && -r "${dir}/${CRED_ID}_${stem}.${name}${suffix}" ]]; then
+    printf '%s' "${dir}/${CRED_ID}_${stem}.${name}${suffix}"
+  elif [[ -r "${dir}/${CRED_ID}_${kind}" ]]; then
+    printf '%s' "${dir}/${CRED_ID}_${kind}"
+  fi
+}
+
 resolve_token_files() {
+  # Only when nothing was configured by hand: a flag, the environment or an
+  # older unit that names the file itself all win over what systemd loaded.
+  if [[ -z "$GITHUB_TOKEN" && -z "$GITHUB_TOKEN_FILE" ]]; then
+    GITHUB_TOKEN_FILE=$(service_credential pat)
+  fi
+  if [[ -z "$GITHUB_APP_PRIVATE_KEY" ]]; then
+    GITHUB_APP_PRIVATE_KEY=$(service_credential app.pem)
+  fi
   if [[ -z "$GITHUB_TOKEN" && -n "$GITHUB_TOKEN_FILE" ]]; then
     GITHUB_TOKEN=$(read_secret "$GITHUB_TOKEN_FILE")
   fi
@@ -1635,6 +1702,20 @@ meta_field() {
   sed -n "s/^${field}=//p" "${dir}/meta"
 }
 
+# configured_field prints what the service configuration says a named runner
+# will use, in the order systemd reads the files: the runner's own overrides
+# the host-wide one.
+configured_field() {
+  local name=$1 field=$2 file value
+  for file in "${ETC_DIR}/env.${name}" "${ETC_DIR}/env"; do
+    [[ -r "$file" ]] || continue
+    # The last assignment wins, as it would in the file systemd reads.
+    value=$(sed -n "s/^${field}=//p" "$file" | tail -1)
+    [[ -n "$value" ]] && { printf '%s' "$value"; return 0; }
+  done
+  return 0
+}
+
 # short_scope turns a URL into owner/repo, which is what identifies a runner at
 # a glance; the scheme and host are the same for every row.
 short_scope() {
@@ -1692,25 +1773,24 @@ cmd_list() {
     # the row still says what it would run and how big it would be.
     # For a service whose VM has not booted, the configuration is what it will
     # use — which is not the same as this script's defaults once install has
-    # recorded a size.
-    if [[ -r /etc/runner-vm/env ]]; then
-      local configured
-      if [[ "$repo" == "-" ]]; then
-        repo=$(short_scope "$(sed -n 's/^GITHUB_URL=//p' /etc/runner-vm/env)")
-        repo=${repo:--}
-      fi
-      if [[ "$cpus" == "-" ]]; then
-        configured=$(sed -n 's/^VM_CPUS=//p' /etc/runner-vm/env)
-        [[ -n "$configured" ]] && cpus=$configured
-      fi
-      if [[ "$mem" == "-" ]]; then
-        configured=$(sed -n 's/^VM_MEMORY_MB=//p' /etc/runner-vm/env)
-        [[ -n "$configured" ]] && mem="${configured}M"
-      fi
-      if [[ "$disk" == "-" ]]; then
-        configured=$(sed -n 's/^VM_DISK_GB=//p' /etc/runner-vm/env)
-        [[ -n "$configured" ]] && disk="${configured}G"
-      fi
+    # recorded a size. Read per runner, or every row would claim the repository
+    # of whichever one happens to be the host-wide default.
+    local configured
+    if [[ "$repo" == "-" ]]; then
+      repo=$(short_scope "$(configured_field "$name" GITHUB_URL)")
+      repo=${repo:--}
+    fi
+    if [[ "$cpus" == "-" ]]; then
+      configured=$(configured_field "$name" VM_CPUS)
+      [[ -n "$configured" ]] && cpus=$configured
+    fi
+    if [[ "$mem" == "-" ]]; then
+      configured=$(configured_field "$name" VM_MEMORY_MB)
+      [[ -n "$configured" ]] && mem="${configured}M"
+    fi
+    if [[ "$disk" == "-" ]]; then
+      configured=$(configured_field "$name" VM_DISK_GB)
+      [[ -n "$configured" ]] && disk="${configured}G"
     fi
     [[ "$cpus" == "-" ]] && cpus=$VM_CPUS
     [[ "$mem"  == "-" ]] && mem="${VM_MEMORY_MB}M"
@@ -1766,22 +1846,16 @@ cmd_list() {
 # its own so that a single copied script can install itself, and so the two
 # cannot drift apart.
 systemd_unit() {
-  local credential=""
-  # Only reference the credential file if there is one: LoadCredential fails
-  # the unit when its source is missing.
-  if [[ -f /etc/runner-vm/pat ]]; then
-    credential="LoadCredential=pat:/etc/runner-vm/pat
-Environment=GITHUB_TOKEN_FILE=%d/pat"
-  elif [[ -f /etc/runner-vm/app.pem ]]; then
-    credential="LoadCredential=app.pem:/etc/runner-vm/app.pem
-Environment=GITHUB_APP_PRIVATE_KEY=%d/app.pem"
-  fi
-
   cat <<UNIT
 # Installed by runner-vm.sh install. Regenerate with: runner-vm.sh print-unit
 #
 # A template unit, so the instance name is the runner name:
 #   systemctl enable --now runner-vm@build1
+#
+# Nothing in here names a repository or a credential, so one unit serves every
+# runner on the host: %i picks the configuration and the credential out of
+# ${ETC_DIR}, and two runners on two repositories differ only by their
+# instance name.
 
 [Unit]
 Description=GitHub Actions runner in a QEMU VM (%i)
@@ -1812,17 +1886,32 @@ StateDirectory=runner-vm
 Environment=RUNNER_VM_HOME=${SERVICE_STATE}
 WorkingDirectory=${SERVICE_STATE}
 
-# systemd reads this as root before dropping to User=, so it can stay 0600
-# root-owned and the credential is never readable by the service user.
-EnvironmentFile=/etc/runner-vm/env
-${credential}
+# systemd reads these as root before dropping to User=, so they stay 0600
+# root-owned and are never readable by the service user.
+#
+# The host-wide file first, then this runner's own: systemd lets a later
+# EnvironmentFile override an earlier one, which is what makes per-repository
+# settings possible without a unit per repository. Both are optional so that a
+# host configured entirely one way or the other still starts.
+EnvironmentFile=-${ETC_DIR}/env
+EnvironmentFile=-${ETC_DIR}/env.%i
+
+# The whole directory, not a named file: a template unit cannot make one
+# LoadCredential= conditional, and naming a file that is not there fails the
+# unit. Every file in it becomes a credential named ${CRED_ID}_<filename>, and
+# the script picks this runner's out of them.
+LoadCredential=${CRED_ID}:${CRED_DIR}
 
 ExecStart=${INSTALL_BIN} run --name %i
 
 # Every start registers a new runner, because a VM keeps nothing, and that
 # needs a credential that can mint registration tokens. Fail loudly rather than
 # boot a VM that cannot register.
-ExecStartPre=/bin/sh -c '[ -n "\$GITHUB_TOKEN" ] || [ -n "\$GITHUB_TOKEN_FILE" ] || [ -n "\$GITHUB_APP_ID" ] || { echo "set GITHUB_TOKEN or GITHUB_TOKEN_FILE (a PAT), or GITHUB_APP_ID with GITHUB_APP_PRIVATE_KEY: a pasted registration token expires an hour after it is issued and will not survive a reboot" >&2; exit 1; }'
+# %d is the credentials directory, so this asks whether systemd loaded anything
+# at all — a literal path rather than \$CREDENTIALS_DIRECTORY, since systemd
+# expands variables in command lines itself and the result would depend on
+# whether it had that one set at expansion time.
+ExecStartPre=/bin/sh -c '[ -n "\$GITHUB_TOKEN" ] || [ -n "\$GITHUB_TOKEN_FILE" ] || [ -n "\$GITHUB_APP_ID" ] || [ -n "\$(ls -A %d 2>/dev/null)" ] || { echo "no credential for %i: put a PAT in ${CRED_DIR}/pat.%i, or in ${CRED_DIR}/pat to share one between runners, or set GITHUB_APP_ID with an app key beside it. A pasted registration token will not do: it expires an hour after it is issued and will not survive a reboot" >&2; exit 1; }'
 
 Restart=always
 RestartSec=15
@@ -1890,15 +1979,21 @@ install_source() {
   echo "$tmp"
 }
 
-# service_env_file renders the configuration the unit reads.
+# service_env_file renders the configuration the unit reads for one runner.
 #
 # The unit runs "run --name %i" and takes everything else from here, so a
 # setting that is not written is one that install accepted and then silently
 # ignored — which is what happened to --cpus. The sizing is written even at its
 # default value, so the file says what a VM will actually be and is the one
 # place to change it afterwards.
+#
+# An empty value is left out rather than written blank: this file is read after
+# the host-wide one, so a blank line here would not fall back to the shared
+# setting, it would override it with nothing.
 service_env_file() {
-  printf 'GITHUB_URL=%s\n' "$GITHUB_URL"
+  local name=${1:-}
+  [[ -n "$name" ]] && printf '# Configuration for runner-vm@%s. Overrides %s/env.\n' "$name" "$ETC_DIR"
+  [[ -n "$GITHUB_URL" ]] && printf 'GITHUB_URL=%s\n' "$GITHUB_URL"
   printf 'VM_CPUS=%s\n' "$VM_CPUS"
   printf 'VM_MEMORY_MB=%s\n' "$VM_MEMORY_MB"
   printf 'VM_DISK_GB=%s\n' "$VM_DISK_GB"
@@ -1909,6 +2004,102 @@ service_env_file() {
   # The app id is not secret, but the unit needs it alongside the key.
   [[ -n "$GITHUB_APP_ID" ]] && printf 'GITHUB_APP_ID=%s\n' "$GITHUB_APP_ID"
   true
+}
+
+# shared_env_file renders the host-wide file, which install creates once and
+# then never touches again — a runner that has no file of its own falls back to
+# it, so rewriting it would reach runners the current install was not about.
+shared_env_file() {
+  cat <<ENV
+# Host-wide defaults for every runner on this machine.
+#
+# runner-vm@NAME reads this file first and then ${ETC_DIR}/env.NAME, so
+# anything set here is a default that a runner can override. Per-repository
+# settings — GITHUB_URL above all — belong in the per-runner file, or every
+# runner on the host ends up pointed at the same repository.
+ENV
+}
+
+# stored_credential prints the PAT file a runner will use, preferring its own
+# over the host-wide one, the same order the service resolves them in. Empty
+# when the host has neither.
+#
+# The flat path comes last and is the older layout, which is still what an
+# upgrading host has at the point install looks for a credential: the move into
+# the credentials directory deliberately happens later, once install is
+# committed to writing, so a run that fails before then leaves the credential
+# where the unit already on the host expects it.
+stored_credential() {
+  local name=$1
+  if [[ -n "$name" && -r "${CRED_DIR}/pat.${name}" ]]; then
+    printf '%s' "${CRED_DIR}/pat.${name}"
+  elif [[ -r "${CRED_DIR}/pat" ]]; then
+    printf '%s' "${CRED_DIR}/pat"
+  elif [[ -r "${ETC_DIR}/pat" ]]; then
+    printf '%s' "${ETC_DIR}/pat"
+  fi
+}
+
+# migrate_flat_credentials moves an older layout — one credential sitting
+# directly in ETC_DIR — into the credentials directory, so upgrading a host by
+# rerunning install does not leave its runners without a token.
+migrate_flat_credentials() {
+  local name
+  for name in pat app.pem; do
+    if [[ -f "${ETC_DIR}/${name}" && ! -e "${CRED_DIR}/${name}" ]]; then
+      mv "${ETC_DIR}/${name}" "${CRED_DIR}/${name}"
+      log "moved ${ETC_DIR}/${name} to ${CRED_DIR}/${name}"
+    fi
+  done
+}
+
+# store_credentials files whatever credential this install brought with it.
+#
+# The first one on the host becomes the host-wide default, so a second
+# repository added later needs no token of its own; a different one is stored
+# under the runner's name and wins for that runner alone. A token identical to
+# the shared one is not copied — two files holding the same secret are two
+# files to rotate.
+store_credentials() {
+  local instance=$1 token=$2 dest
+
+  if [[ -n "$token" ]]; then
+    if [[ ! -e "${CRED_DIR}/pat" ]]; then
+      dest="${CRED_DIR}/pat"
+    elif [[ "$(read_secret "${CRED_DIR}/pat")" == "$token" ]]; then
+      dest=""
+      rm -f "${CRED_DIR}/pat.${instance}"
+    else
+      dest="${CRED_DIR}/pat.${instance}"
+    fi
+    if [[ -n "$dest" ]]; then
+      # Created empty at 0600 before anything is written to it: a plain
+      # redirect would make it world-readable for the instant between creation
+      # and chmod.
+      install -m 0600 /dev/null "$dest"
+      printf '%s' "$token" > "$dest"
+      log "stored the credential in ${dest} (0600, root)"
+    else
+      log "the credential is already in ${CRED_DIR}/pat, shared by every runner here"
+    fi
+  fi
+
+  # An app key that is already in place — a rerun naming the same file — is
+  # left where it is rather than copied onto itself.
+  if [[ -n "$GITHUB_APP_PRIVATE_KEY" && "$GITHUB_APP_PRIVATE_KEY" != "${CRED_DIR}"/* ]]; then
+    if [[ ! -e "${CRED_DIR}/app.pem" ]]; then
+      dest="${CRED_DIR}/app.pem"
+    elif cmp -s "$GITHUB_APP_PRIVATE_KEY" "${CRED_DIR}/app.pem"; then
+      dest=""
+      rm -f "${CRED_DIR}/app.${instance}.pem"
+    else
+      dest="${CRED_DIR}/app.${instance}.pem"
+    fi
+    if [[ -n "$dest" ]]; then
+      install -m 0600 "$GITHUB_APP_PRIVATE_KEY" "$dest"
+      log "stored the app key in ${dest} (0600, root)"
+    fi
+  fi
 }
 
 # cmd_install puts the script, the unit and the service user in place. It is
@@ -1946,9 +2137,23 @@ cmd_install() {
 
   require_host
 
+  local instance=${RUNNER_NAME:-runner-1}
+
   # Check the credential before anything slow. Discovering a bad token after
   # six minutes of building an image is the wrong order to find out.
   resolve_token_files
+  # Whether this run brought a credential of its own, which decides below
+  # whether one is written. Adding a second repository to a host with
+  # "install --service --url ..." and no token is meant to reuse the PAT that
+  # is already there, not to fail.
+  local supplied_token=$GITHUB_TOKEN
+  if [[ -z "$GITHUB_TOKEN" && -z "$GITHUB_APP_ID" && -z "$RUNNER_TOKEN" ]]; then
+    local existing; existing=$(stored_credential "$instance")
+    if [[ -n "$existing" ]]; then
+      GITHUB_TOKEN=$(read_secret "$existing")
+      log "no credential given; using the one already in ${existing}"
+    fi
+  fi
   if [[ -n "$GITHUB_URL" && -n "$GITHUB_TOKEN" ]]; then
     log "checking the credential against ${GITHUB_URL}"
     mint_token "$GITHUB_URL" >/dev/null
@@ -1956,12 +2161,10 @@ cmd_install() {
   elif [[ -z "$GITHUB_TOKEN" && -z "$GITHUB_APP_ID" && -z "$RUNNER_TOKEN" ]]; then
     # Refuse rather than warn. Without a credential the service cannot start,
     # so carrying on means several minutes building an image and then a unit
-    # that fails immediately. The unit would also be written without the
-    # LoadCredential lines, so adding the token afterwards would not be enough
-    # on its own — install has to run again to regenerate it.
+    # that fails immediately.
     die "no credential given, and the service cannot start without one.
 
-  Pass one and it is stored in /etc/runner-vm/pat, root-owned and 0600, and
+  Pass one and it is stored in ${CRED_DIR}, root-owned and 0600, and
   wired into the unit through systemd's credential mechanism. Any of:
 
     sudo ${INSTALL_BIN} install --service --url ${GITHUB_URL:-<repo>} --github-token github_pat_...
@@ -2005,35 +2208,39 @@ cmd_install() {
   fi
   install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SERVICE_STATE"
 
-  install -d -m 0755 /etc/runner-vm
-  install -m 0600 /dev/null /etc/runner-vm/env
-  service_env_file > /etc/runner-vm/env
-  log "wrote /etc/runner-vm/env (${VM_CPUS} vCPU, ${VM_MEMORY_MB} MiB, ${VM_DISK_GB} GiB)"
-  [[ -n "$GITHUB_URL" ]] || warn "no --url given; put GITHUB_URL in /etc/runner-vm/env before starting"
+  install -d -m 0755 "$ETC_DIR"
+  install -d -m 0700 "$CRED_DIR"
+  migrate_flat_credentials
 
-  # However the credential arrived — a flag, the environment, a file, stdin —
-  # it ends up in one root-owned file that the unit reads through systemd's
-  # credential mechanism, so it is never in the unit and never in a command
-  # line the service runs.
-  #
-  # Created empty at 0600 before anything is written to it: a plain redirect
-  # would make it world-readable for the instant between creation and chmod.
-  if [[ -n "$GITHUB_TOKEN" ]]; then
-    install -m 0600 /dev/null /etc/runner-vm/pat
-    printf '%s' "$GITHUB_TOKEN" > /etc/runner-vm/pat
-    log "stored the credential in /etc/runner-vm/pat (0600, root)"
+  # This runner's own file, never the shared one: installing a second
+  # repository must not repoint the runners already on the host, which is
+  # exactly what writing GITHUB_URL to the shared file used to do.
+  local instance_env="${ETC_DIR}/env.${instance}"
+  install -m 0600 /dev/null "$instance_env"
+  service_env_file "$instance" > "$instance_env"
+  log "wrote ${instance_env} (${VM_CPUS} vCPU, ${VM_MEMORY_MB} MiB, ${VM_DISK_GB} GiB)"
+  [[ -n "$GITHUB_URL" ]] || warn "no --url given; put GITHUB_URL in ${instance_env} before starting"
+
+  # The shared file is created once and then left alone: it is what runners
+  # without a file of their own fall back to, so rewriting it here would reach
+  # runners this install was not about.
+  if [[ ! -e "${ETC_DIR}/env" ]]; then
+    install -m 0600 /dev/null "${ETC_DIR}/env"
+    shared_env_file > "${ETC_DIR}/env"
+  else
+    local shared_url; shared_url=$(sed -n 's/^GITHUB_URL=//p' "${ETC_DIR}/env" | tail -1)
+    if [[ -n "$shared_url" && "$shared_url" != "$GITHUB_URL" ]]; then
+      warn "${ETC_DIR}/env still sets GITHUB_URL=${shared_url}; it is the host-wide
+  default now, used only by runners with no ${ETC_DIR}/env.NAME of their own"
+    fi
   fi
-  if [[ -n "$GITHUB_APP_PRIVATE_KEY" && "$GITHUB_APP_PRIVATE_KEY" != /etc/runner-vm/app.pem ]]; then
-    install -m 0600 "$GITHUB_APP_PRIVATE_KEY" /etc/runner-vm/app.pem
-    log "stored the app key in /etc/runner-vm/app.pem (0600, root)"
-  fi
+
+  store_credentials "$instance" "$supplied_token"
 
   systemd_unit > /etc/systemd/system/runner-vm@.service
   chmod 0644 /etc/systemd/system/runner-vm@.service
   log "wrote /etc/systemd/system/runner-vm@.service"
   systemctl daemon-reload
-
-  local instance=${RUNNER_NAME:-runner-1}
 
   if [[ "$INSTALL_BUILD" == "true" ]]; then
     log "building the golden image (a few minutes, once per host)"
@@ -2044,8 +2251,20 @@ cmd_install() {
   fi
 
   if [[ "$INSTALL_START" == "true" ]]; then
+    # A rerun for a runner that is already up has just rewritten its
+    # configuration, and "enable --now" would report success while the VM kept
+    # running with the old one. Restarting it here is not the answer either:
+    # stopping waits for the job in flight, which can be an hour.
+    local was_active=false
+    systemctl is-active --quiet "runner-vm@${instance}" && was_active=true
+
     systemctl enable --now "runner-vm@${instance}"
     log "started runner-vm@${instance}"
+    if [[ "$was_active" == "true" ]]; then
+      log "it was already running, so it is still on the previous configuration"
+      log "pick this one up when the runner is idle with:"
+      log "  sudo systemctl restart runner-vm@${instance}"
+    fi
     log ""
     log "the runner appears at ${GITHUB_URL:-<your repo>}/settings/actions/runners in about a minute"
     log "watch it come up with:"
@@ -2054,6 +2273,9 @@ cmd_install() {
     log "installed. Start a runner with:"
     log "  sudo systemctl enable --now runner-vm@${instance}"
   fi
+  log ""
+  log "another runner on this host, for another repository:"
+  log "  sudo ${INSTALL_BIN} install --service --name <name> --url https://github.com/OWNER/OTHER"
 }
 
 # cmd_uninstall removes the whole installation: the services, the unit, the
@@ -2075,7 +2297,7 @@ cmd_uninstall() {
     sed 's/^/      /' <<<"$services"
   fi
   [[ -f "$unit" ]] && echo "  - ${unit}"
-  [[ -d /etc/runner-vm ]] && echo "  - /etc/runner-vm, including any credentials in it"
+  [[ -d "$ETC_DIR" ]] && echo "  - ${ETC_DIR}, including every runner's configuration and credentials"
   [[ -d "$STATE_DIR" ]] && echo "  - ${STATE_DIR} (VMs, images, ssh key)"
   [[ -d "$service_state" && "$service_state" != "$STATE_DIR" ]] && echo "  - ${service_state}"
   [[ -f "$script" ]] && echo "  - ${script}"
@@ -2104,7 +2326,7 @@ cmd_uninstall() {
   stop_stray_vms
 
   rm -f "$unit"
-  rm -rf /etc/runner-vm "$STATE_DIR"
+  rm -rf "$ETC_DIR" "$STATE_DIR"
   [[ "$service_state" != "$STATE_DIR" ]] && rm -rf "$service_state"
   have systemctl && systemctl daemon-reload 2>/dev/null || true
 

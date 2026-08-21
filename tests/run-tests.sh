@@ -285,6 +285,14 @@ if test_case "systemd-unit"; then
   contains "refuses to start with no credential"    "$unit" "ExecStartPre="
   contains "runs as the service user"               "$unit" "User=${SERVICE_USER}"
 
+  # One unit serves every runner on the host, so nothing in it may name a
+  # repository or a credential file: %i has to be what picks them.
+  contains "reads the shared configuration"         "$unit" "EnvironmentFile=-${ETC_DIR}/env"
+  contains "then the runner's own, which wins"      "$unit" "EnvironmentFile=-${ETC_DIR}/env.%i"
+  contains "loads the credentials directory"        "$unit" "LoadCredential=${CRED_ID}:${CRED_DIR}"
+  lacks    "names no repository"                    "$unit" "GITHUB_URL="
+  lacks    "names no credential file"               "$unit" "GITHUB_TOKEN_FILE="
+
   if command -v systemd-analyze >/dev/null; then
     printf '%s' "$unit" > "$WORK/runner-vm@.service"
     out=$(systemd-analyze verify "$WORK/runner-vm@.service" 2>&1)
@@ -334,6 +342,9 @@ fi
 if test_case "list"; then
   STATE_DIR="$WORK/list-state"
   SERVICE_STATE="$WORK/list-service"
+  # Never the host's own: a developer machine with runners installed on it
+  # would otherwise feed its real configuration into these rows.
+  ETC_DIR="$WORK/list-etc"; CRED_DIR="$ETC_DIR/creds"; mkdir -p "$ETC_DIR"
   mkdir -p "$STATE_DIR/vms/hand-1" "$SERVICE_STATE/vms/runner-1"
   cat > "$SERVICE_STATE/vms/runner-1/meta" <<'META'
 NAME=runner-1
@@ -378,6 +389,28 @@ META
 
   STATE_DIR="$WORK/empty-state"; SERVICE_STATE="$WORK/empty-service"; mkdir -p "$STATE_DIR"
   contains "says so when there is nothing" "$(cmd_list)" "no VMs and no services"
+fi
+
+# A runner whose VM has never booted has no meta file to read, so its row comes
+# from the service configuration. With several repositories on one host that
+# has to be read per runner: reading the shared file alone showed every row as
+# whichever repository was installed first.
+if test_case "list-per-runner"; then
+  STATE_DIR="$WORK/multi-state"; SERVICE_STATE="$WORK/multi-service"
+  ETC_DIR="$WORK/multi-etc"; CRED_DIR="$ETC_DIR/creds"
+  mkdir -p "$ETC_DIR" "$SERVICE_STATE/vms/web" "$SERVICE_STATE/vms/spare"
+  printf 'GITHUB_URL=https://github.com/o/shared\nVM_CPUS=2\n'   > "$ETC_DIR/env"
+  printf 'GITHUB_URL=https://github.com/o/web\nVM_CPUS=8\n'      > "$ETC_DIR/env.web"
+
+  out=$(cmd_list)
+  contains "shows each runner its own repository" "$out" "o/web"
+  contains "and the shared one for the rest"      "$out" "o/shared"
+  contains "with the size that runner will get"   "$out" "8"
+
+  is "a runner's own setting wins"          "https://github.com/o/web"    "$(configured_field web GITHUB_URL)"
+  is "and falls back to the shared file"    "2"                           "$(configured_field spare VM_CPUS)"
+  is "as does a runner with no file at all" "https://github.com/o/shared" "$(configured_field spare GITHUB_URL)"
+  is "nothing for a key nobody sets"        ""                            "$(configured_field web RUNNER_LABELS)"
 fi
 
 if test_case "clean"; then
@@ -461,7 +494,96 @@ if test_case "service-config"; then
   RUNNER_LABELS="" GITHUB_APP_ID=""
   lacks "omits labels when there are none" "$(service_env_file)" "RUNNER_LABELS="
 
+  # This file is read after the shared one, so a blank value would not fall
+  # back to the shared setting: it would override it with nothing.
+  GITHUB_URL=""
+  lacks "omits the repository when there is none" "$(service_env_file)" "GITHUB_URL="
+  contains "says which runner it belongs to" "$(service_env_file web)" "runner-vm@web"
+  GITHUB_URL=https://github.com/o/r
+
   VM_CPUS=2 VM_MEMORY_MB=4096 VM_DISK_GB=40 VM_NESTED=true RUNNER_GROUP=Default EPHEMERAL=false
+fi
+
+# The unit hands systemd the whole credentials directory, because a template
+# unit cannot name a file that might not be there. Which of them a runner uses
+# is decided here instead.
+if test_case "service-credential"; then
+  creds="$WORK/creds"; mkdir -p "$creds"
+  printf 'shared'     > "${creds}/${CRED_ID}_pat"
+  printf 'web-only'   > "${creds}/${CRED_ID}_pat.web"
+  printf 'shared-key' > "${creds}/${CRED_ID}_app.pem"
+  printf 'web-key'    > "${creds}/${CRED_ID}_app.web.pem"
+
+  CREDENTIALS_DIRECTORY=$creds RUNNER_NAME=web
+  is "prefers the runner's own PAT"     "${creds}/${CRED_ID}_pat.web"     "$(service_credential pat)"
+  # The name goes before the suffix, not after it: app.web.pem, not app.pem.web.
+  is "prefers the runner's own app key" "${creds}/${CRED_ID}_app.web.pem" "$(service_credential app.pem)"
+
+  RUNNER_NAME=api
+  is "falls back to the shared PAT"     "${creds}/${CRED_ID}_pat"         "$(service_credential pat)"
+  is "falls back to the shared app key" "${creds}/${CRED_ID}_app.pem"     "$(service_credential app.pem)"
+
+  # Run by hand there is no credentials directory, and nothing may be invented.
+  CREDENTIALS_DIRECTORY=""
+  is "nothing outside the service"      ""                                "$(service_credential pat)"
+
+  CREDENTIALS_DIRECTORY=$creds RUNNER_NAME=web
+  GITHUB_TOKEN="" GITHUB_TOKEN_FILE="" RUNNER_TOKEN="" RUNNER_TOKEN_FILE="" GITHUB_APP_PRIVATE_KEY=""
+  resolve_token_files
+  is "the runner's credential is read"  "web-only"                        "$GITHUB_TOKEN"
+  is "so is its app key"                "${creds}/${CRED_ID}_app.web.pem" "$GITHUB_APP_PRIVATE_KEY"
+
+  # An older unit names the file itself, and a flag or the environment must
+  # keep working, so neither may be overwritten by what systemd loaded.
+  GITHUB_TOKEN="" GITHUB_TOKEN_FILE="$WORK/pat" GITHUB_APP_PRIVATE_KEY=""
+  resolve_token_files
+  is "a named file still wins"          "from_file"                       "$GITHUB_TOKEN"
+
+  CREDENTIALS_DIRECTORY="" RUNNER_NAME=""
+  GITHUB_TOKEN="" GITHUB_TOKEN_FILE="" RUNNER_TOKEN="" RUNNER_TOKEN_FILE="" GITHUB_APP_PRIVATE_KEY=""
+fi
+
+# What install files where. A second repository must not disturb the first, and
+# one PAT that covers both should not end up copied into two files to rotate.
+if test_case "credential-store"; then
+  ETC_DIR="$WORK/store"; CRED_DIR="${ETC_DIR}/creds"
+  mkdir -p "$CRED_DIR"
+  GITHUB_APP_PRIVATE_KEY=""
+
+  # The layout before per-runner credentials existed: one file in ETC_DIR.
+  # Install has to find it before it moves it, or upgrading a host would ask
+  # for a credential it already has.
+  printf 'legacy' > "${ETC_DIR}/pat"
+  is "an older flat credential is found" "${ETC_DIR}/pat" "$(stored_credential runner-1)"
+  migrate_flat_credentials >/dev/null
+  is "moves an older flat credential"  "legacy" "$(cat "${CRED_DIR}/pat")"
+  succeeds "and leaves nothing behind" test ! -e "${ETC_DIR}/pat"
+  is "then it is found in its new home" "${CRED_DIR}/pat" "$(stored_credential runner-1)"
+
+  rm -f "${CRED_DIR}/pat"
+  store_credentials web tok1 >/dev/null
+  is "the first credential is the shared one" "tok1" "$(cat "${CRED_DIR}/pat")"
+  is "root-only"                              "600"  "$(stat -c %a "${CRED_DIR}/pat")"
+  succeeds "with no per-runner copy"          test ! -e "${CRED_DIR}/pat.web"
+
+  store_credentials api tok1 >/dev/null
+  succeeds "the same token is not copied again" test ! -e "${CRED_DIR}/pat.api"
+  is "stored_credential falls back to it"     "${CRED_DIR}/pat" "$(stored_credential api)"
+
+  store_credentials api tok2 >/dev/null
+  is "a different token goes under the runner" "tok2" "$(cat "${CRED_DIR}/pat.api")"
+  is "and the shared one is untouched"         "tok1" "$(cat "${CRED_DIR}/pat")"
+  is "which is what that runner then uses"     "${CRED_DIR}/pat.api" "$(stored_credential api)"
+  is "while the other still shares"            "${CRED_DIR}/pat"     "$(stored_credential web)"
+
+  # Going back to the shared token removes the copy rather than leaving a
+  # second file holding the same secret.
+  store_credentials api tok1 >/dev/null
+  succeeds "a token back in step is dropped"   test ! -e "${CRED_DIR}/pat.api"
+
+  is "nothing to find on a bare host" "" "$(CRED_DIR=$WORK/none stored_credential web)"
+
+  ETC_DIR=${RUNNER_VM_ETC:-/etc/runner-vm}; CRED_DIR="${ETC_DIR}/creds"
 fi
 
 if test_case "install-guards"; then
