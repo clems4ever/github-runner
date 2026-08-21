@@ -1,1 +1,13 @@
-.env
+bin/
+tmp/
+node_modules/
+*.db
+*.db-wal
+*.db-shm
+
+# The built UI is embedded into the binary at build time. The directory has to
+# exist for the embed to compile, so the placeholder is kept and its contents
+# are not: a fresh clone builds, and a binary without the UI says so instead of
+# failing to compile.
+internal/ui/dist/*
+!internal/ui/dist/.gitkeep

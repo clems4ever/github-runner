@@ -1,0 +1,194 @@
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import {
+  ActionIcon,
+  AppShell,
+  Badge,
+  Burger,
+  Group,
+  NavLink,
+  ScrollArea,
+  Text,
+  Title,
+  Tooltip,
+  useMantineColorScheme,
+} from '@mantine/core'
+import { useDisclosure } from '@mantine/hooks'
+import { notifications } from '@mantine/notifications'
+import {
+  IconMoon,
+  IconRefresh,
+  IconServer2,
+  IconSettings,
+  IconStack2,
+  IconSun,
+  IconKey,
+} from '@tabler/icons-react'
+import { api, type Credential, type Health, type Pool, type Runner } from './api'
+import { FleetPage } from './pages/FleetPage'
+import { PoolsPage } from './pages/PoolsPage'
+import { CredentialsPage } from './pages/CredentialsPage'
+import { SettingsPage } from './pages/SettingsPage'
+
+type Page = 'fleet' | 'pools' | 'credentials' | 'settings'
+
+const pages: { key: Page; label: string; icon: typeof IconServer2 }[] = [
+  { key: 'fleet', label: 'Fleet', icon: IconServer2 },
+  { key: 'pools', label: 'Pools', icon: IconStack2 },
+  { key: 'credentials', label: 'Credentials', icon: IconKey },
+  { key: 'settings', label: 'Settings', icon: IconSettings },
+]
+
+export function App() {
+  const [opened, { toggle }] = useDisclosure()
+  const [page, setPage] = useState<Page>('fleet')
+  const [pools, setPools] = useState<Pool[]>([])
+  const [runners, setRunners] = useState<Runner[]>([])
+  const [warnings, setWarnings] = useState<string[]>([])
+  const [credentials, setCredentials] = useState<Credential[]>([])
+  const [health, setHealth] = useState<Health | null>(null)
+  const [loading, setLoading] = useState(true)
+
+  const refresh = useCallback(async () => {
+    try {
+      const [poolList, runnerList, credentialList, healthInfo] = await Promise.all([
+        api.pools(),
+        api.runners(),
+        api.credentials(),
+        api.health(),
+      ])
+      setPools(poolList)
+      setRunners(runnerList.runners ?? [])
+      setWarnings(runnerList.warnings ?? [])
+      setCredentials(credentialList)
+      setHealth(healthInfo)
+    } catch (error) {
+      notifications.show({
+        color: 'red',
+        title: 'Cannot reach the daemon',
+        message: error instanceof Error ? error.message : String(error),
+      })
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refresh()
+    // The fleet changes without anyone touching this page — a job starts, a
+    // runner is replaced — so it polls rather than pretending it is static.
+    const timer = setInterval(() => void refresh(), 5000)
+    return () => clearInterval(timer)
+  }, [refresh])
+
+  const busy = useMemo(() => runners.filter((r) => r.job === 'busy').length, [runners])
+
+  return (
+    <AppShell
+      header={{ height: 56 }}
+      navbar={{ width: 220, breakpoint: 'sm', collapsed: { mobile: !opened } }}
+      padding="lg"
+    >
+      <AppShell.Header>
+        <Group h="100%" px="md" justify="space-between">
+          <Group gap="sm">
+            <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
+            <Title order={4}>runner-fleet</Title>
+            {runners.length > 0 && (
+              <Badge variant="light" color={busy > 0 ? 'blue' : 'gray'}>
+                {busy} of {runners.length} busy
+              </Badge>
+            )}
+          </Group>
+          <Group gap="xs">
+            <ReconcileButton onDone={refresh} />
+            <ColorSchemeToggle />
+          </Group>
+        </Group>
+      </AppShell.Header>
+
+      <AppShell.Navbar p="xs">
+        <AppShell.Section grow component={ScrollArea}>
+          {pages.map(({ key, label, icon: Icon }) => (
+            <NavLink
+              key={key}
+              active={page === key}
+              label={label}
+              leftSection={<Icon size={18} stroke={1.5} />}
+              onClick={() => {
+                setPage(key)
+                if (opened) toggle()
+              }}
+            />
+          ))}
+        </AppShell.Section>
+        <AppShell.Section>
+          <Text size="xs" c="dimmed" p="xs">
+            {health?.version ?? ''}
+          </Text>
+        </AppShell.Section>
+      </AppShell.Navbar>
+
+      <AppShell.Main>
+        {page === 'fleet' && (
+          <FleetPage runners={runners} pools={pools} warnings={warnings} loading={loading} />
+        )}
+        {page === 'pools' && (
+          <PoolsPage pools={pools} credentials={credentials} runners={runners} onChange={refresh} />
+        )}
+        {page === 'credentials' && (
+          <CredentialsPage credentials={credentials} pools={pools} onChange={refresh} />
+        )}
+        {page === 'settings' && <SettingsPage health={health} />}
+      </AppShell.Main>
+    </AppShell>
+  )
+}
+
+function ReconcileButton({ onDone }: { onDone: () => Promise<void> }) {
+  const [running, setRunning] = useState(false)
+
+  return (
+    <Tooltip label="Reconcile now">
+      <ActionIcon
+        variant="default"
+        size="lg"
+        loading={running}
+        aria-label="Reconcile now"
+        onClick={async () => {
+          setRunning(true)
+          try {
+            const result = await api.reconcile()
+            const count = result.actions?.length ?? 0
+            notifications.show({
+              color: result.errors?.length ? 'yellow' : 'green',
+              title: count === 0 ? 'Nothing to do' : `${count} action${count === 1 ? '' : 's'}`,
+              message: result.errors?.length ? result.errors.join('\n') : 'The fleet matches its configuration.',
+            })
+            await onDone()
+          } catch (error) {
+            notifications.show({
+              color: 'red',
+              title: 'Reconcile failed',
+              message: error instanceof Error ? error.message : String(error),
+            })
+          } finally {
+            setRunning(false)
+          }
+        }}
+      >
+        <IconRefresh size={18} stroke={1.5} />
+      </ActionIcon>
+    </Tooltip>
+  )
+}
+
+function ColorSchemeToggle() {
+  const { colorScheme, toggleColorScheme } = useMantineColorScheme()
+  return (
+    <Tooltip label={colorScheme === 'dark' ? 'Light theme' : 'Dark theme'}>
+      <ActionIcon variant="default" size="lg" onClick={toggleColorScheme} aria-label="Toggle theme">
+        {colorScheme === 'dark' ? <IconSun size={18} stroke={1.5} /> : <IconMoon size={18} stroke={1.5} />}
+      </ActionIcon>
+    </Tooltip>
+  )
+}

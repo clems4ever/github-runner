@@ -1,0 +1,384 @@
+package reconcile
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sort"
+	"sync"
+
+	"github.com/clems4ever/github-runner/internal/github"
+	"github.com/clems4ever/github-runner/internal/model"
+)
+
+// Executor is one way of running a runner. There is one per runtime, and
+// nothing above this interface knows whether a runner is a virtual machine or
+// a container.
+//
+// Every method is expected to return promptly. Drain in particular starts a
+// graceful stop and returns; the stop itself can take an hour, because it
+// waits for the job in flight, and a reconcile loop that blocked on it would
+// stall every other pool on the host.
+type Executor interface {
+	Runtime() model.Runtime
+	List(ctx context.Context) ([]Runner, error)
+	Create(ctx context.Context, spec Spec) error
+	Start(ctx context.Context, name string) error
+	Drain(ctx context.Context, name string) error
+	Remove(ctx context.Context, name string) error
+}
+
+// Fleet is the part of the store the reconciler needs.
+type Fleet interface {
+	ListPools(ctx context.Context) ([]model.Pool, error)
+	CredentialFingerprint(ctx context.Context, id int64) (string, error)
+	Token(ctx context.Context, id int64) (string, error)
+}
+
+// GitHubClient is the part of GitHub the reconciler needs.
+type GitHubClient interface {
+	States(ctx context.Context, scope github.Scope) (map[string]github.State, error)
+	Deregister(ctx context.Context, scope github.Scope, name string) error
+}
+
+// ClientFactory builds a GitHub client for one credential.
+type ClientFactory func(token string) GitHubClient
+
+// CredentialWriter puts a decrypted token where a runner can read it without
+// the daemon's help — on tmpfs, so it never reaches a disk.
+type CredentialWriter func(id int64, token string) error
+
+// Reconciler drives the fleet towards what the store asks for.
+type Reconciler struct {
+	store       Fleet
+	executors   map[model.Runtime]Executor
+	newClient   ClientFactory
+	writeSecret CredentialWriter
+	log         *slog.Logger
+
+	mu     sync.Mutex
+	last   Result
+	poolOf map[string]string // runner name -> pool, for reporting
+}
+
+// New builds a reconciler.
+func New(store Fleet, executors []Executor, newClient ClientFactory, writeSecret CredentialWriter, log *slog.Logger) *Reconciler {
+	byRuntime := make(map[model.Runtime]Executor, len(executors))
+	for _, e := range executors {
+		byRuntime[e.Runtime()] = e
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &Reconciler{
+		store:       store,
+		executors:   byRuntime,
+		newClient:   newClient,
+		writeSecret: writeSecret,
+		log:         log,
+		poolOf:      map[string]string{},
+	}
+}
+
+// Result is what one pass did.
+type Result struct {
+	Actions []Action `json:"actions"`
+	Errors  []string `json:"errors"`
+}
+
+// Once runs a single reconcile pass.
+//
+// A failure on one pool is collected rather than returned: a repository whose
+// token has expired must not stop the other pools on the host from being
+// maintained. The error is surfaced in the result, which the UI shows.
+func (r *Reconciler) Once(ctx context.Context) Result {
+	var result Result
+
+	pools, err := r.store.ListPools(ctx)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("read the pools: %v", err))
+		return result
+	}
+
+	var desired []Spec
+	states := map[string]github.State{}
+	poolByName := map[string]model.Pool{}
+	scopeSeen := map[string]bool{}
+
+	for _, pool := range pools {
+		poolByName[pool.Name] = pool
+
+		fingerprint, err := r.store.CredentialFingerprint(ctx, pool.CredentialID)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("pool %s: %v", pool.Name, err))
+			continue
+		}
+
+		// The runners need the credential without the daemon: they restart on
+		// their own, after a reboot or a crash, and mint a registration token
+		// each time.
+		token, err := r.store.Token(ctx, pool.CredentialID)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("pool %s: %v", pool.Name, err))
+			continue
+		}
+		if r.writeSecret != nil {
+			if err := r.writeSecret(pool.CredentialID, token); err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("pool %s: %v", pool.Name, err))
+				continue
+			}
+		}
+
+		desired = append(desired, SpecsFor(pool, fingerprint)...)
+
+		// One question per scope, not per runner: three replicas on one
+		// repository are one call.
+		scope := github.ScopeOf(pool)
+		key := string(scope.Kind) + ":" + scope.Path
+		if scopeSeen[key] || r.newClient == nil {
+			continue
+		}
+		scopeSeen[key] = true
+		poolStates, err := r.newClient(token).States(ctx, scope)
+		if err != nil {
+			// Not fatal, but it does change what the plan is allowed to do:
+			// without an answer, nothing is known to be busy. The plan still
+			// only removes runners the host says have stopped, so the worst
+			// case is a slower drain, not a failed job.
+			result.Errors = append(result.Errors, fmt.Sprintf("pool %s: ask GitHub what its runners are doing: %v", pool.Name, err))
+			continue
+		}
+		for name, state := range poolStates {
+			states[name] = state
+		}
+	}
+
+	actual, listErrs := r.listAll(ctx)
+	result.Errors = append(result.Errors, listErrs...)
+
+	// Runners whose pool is gone are the ones most at risk of being removed
+	// mid-job, and the loop above could not have asked about them: their pool
+	// is no longer in the database to say where they are registered. They
+	// carry that themselves, so they can still be asked about.
+	r.statesForOrphans(ctx, actual, states, scopeSeen, &result)
+
+	actions := Plan(desired, actual, states)
+	result.Actions = actions
+
+	r.mu.Lock()
+	for _, runner := range actual {
+		r.poolOf[runner.Name] = runner.Pool
+	}
+	r.mu.Unlock()
+
+	for _, action := range actions {
+		if err := r.apply(ctx, action, poolByName); err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("%s %s: %v", action.Op, action.Runner, err))
+			continue
+		}
+		r.log.Info("reconciled",
+			"op", action.Op, "runner", action.Runner, "pool", action.Pool, "reason", action.Reason)
+	}
+
+	r.mu.Lock()
+	r.last = result
+	r.mu.Unlock()
+	return result
+}
+
+// statesForOrphans asks GitHub about runners that no pool claims.
+func (r *Reconciler) statesForOrphans(ctx context.Context, actual []Runner, states map[string]github.State, scopeSeen map[string]bool, result *Result) {
+	if r.newClient == nil {
+		return
+	}
+	for _, runner := range actual {
+		if runner.Scope == "" || runner.CredentialID == 0 {
+			continue
+		}
+		if _, known := states[runner.Name]; known {
+			continue
+		}
+		scope := github.Scope{Kind: runner.ScopeKind, Path: runner.Scope}
+		key := string(scope.Kind) + ":" + scope.Path
+		if scopeSeen[key] {
+			continue
+		}
+		scopeSeen[key] = true
+
+		token, err := r.store.Token(ctx, runner.CredentialID)
+		if err != nil {
+			// The credential is gone too. Nothing can be learned, so the plan
+			// falls back to what the host says — and the host only reports a
+			// drained runner as stopped once it really has stopped.
+			continue
+		}
+		orphanStates, err := r.newClient(token).States(ctx, scope)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("ask GitHub about %s: %v", runner.Name, err))
+			continue
+		}
+		for name, state := range orphanStates {
+			if _, known := states[name]; !known {
+				states[name] = state
+			}
+		}
+	}
+}
+
+// Last is the most recent pass, for the UI.
+func (r *Reconciler) Last() Result {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.last
+}
+
+func (r *Reconciler) apply(ctx context.Context, action Action, pools map[string]model.Pool) error {
+	executor, ok := r.executors[action.Runtime]
+	if !ok {
+		return fmt.Errorf("no executor for runtime %q", action.Runtime)
+	}
+
+	switch action.Op {
+	case OpCreate:
+		if action.Spec == nil {
+			return errors.New("a create action without a spec")
+		}
+		return executor.Create(ctx, *action.Spec)
+	case OpStart:
+		return executor.Start(ctx, action.Runner)
+	case OpDrain:
+		return executor.Drain(ctx, action.Runner)
+	case OpRemove:
+		if err := executor.Remove(ctx, action.Runner); err != nil {
+			return err
+		}
+		// Deregistering is best effort and deliberately after the removal: a
+		// fleet that has scaled down should not leave a list of offline
+		// runners behind on the repository, but failing to tidy up is not a
+		// reason to keep the runner.
+		r.deregister(ctx, action, pools)
+		return nil
+	default:
+		return fmt.Errorf("unknown operation %q", action.Op)
+	}
+}
+
+func (r *Reconciler) deregister(ctx context.Context, action Action, pools map[string]model.Pool) {
+	if r.newClient == nil {
+		return
+	}
+	pool, ok := pools[action.Pool]
+	if !ok {
+		// The pool is gone, so there is nothing left that says which
+		// credential could deregister it. GitHub drops offline runners on its
+		// own eventually.
+		return
+	}
+	token, err := r.store.Token(ctx, pool.CredentialID)
+	if err != nil {
+		return
+	}
+	if err := r.newClient(token).Deregister(ctx, github.ScopeOf(pool), action.Runner); err != nil {
+		r.log.Warn("could not deregister", "runner", action.Runner, "error", err)
+	}
+}
+
+func (r *Reconciler) listAll(ctx context.Context) ([]Runner, []string) {
+	var (
+		all  []Runner
+		errs []string
+	)
+	for _, runtime := range sortedRuntimes(r.executors) {
+		runners, err := r.executors[runtime].List(ctx)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("list %s runners: %v", runtime, err))
+			continue
+		}
+		all = append(all, runners...)
+	}
+	return all, errs
+}
+
+func sortedRuntimes(executors map[model.Runtime]Executor) []model.Runtime {
+	out := make([]model.Runtime, 0, len(executors))
+	for runtime := range executors {
+		out = append(out, runtime)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// RunnerStatus is one runner as the UI sees it: what the host says, and what
+// GitHub says, side by side. They answer different questions — the host knows
+// whether a machine is up, only GitHub knows whether a job is on it.
+type RunnerStatus struct {
+	Name       string      `json:"name"`
+	Pool       string      `json:"pool"`
+	Runtime    string      `json:"runtime"`
+	State      RunnerState `json:"state"`
+	Job        string      `json:"job"`
+	Generation string      `json:"generation"`
+	UpToDate   bool        `json:"upToDate"`
+}
+
+// Status reports the fleet for the UI.
+func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
+	actual, errs := r.listAll(ctx)
+
+	pools, err := r.store.ListPools(ctx)
+	if err != nil {
+		return nil, append(errs, err.Error())
+	}
+
+	generations := map[string]string{}
+	states := map[string]github.State{}
+	scopeSeen := map[string]bool{}
+	for _, pool := range pools {
+		fingerprint, err := r.store.CredentialFingerprint(ctx, pool.CredentialID)
+		if err != nil {
+			continue
+		}
+		generations[pool.Name] = pool.Generation(fingerprint)
+
+		scope := github.ScopeOf(pool)
+		key := string(scope.Kind) + ":" + scope.Path
+		if scopeSeen[key] || r.newClient == nil {
+			continue
+		}
+		scopeSeen[key] = true
+		token, err := r.store.Token(ctx, pool.CredentialID)
+		if err != nil {
+			continue
+		}
+		poolStates, err := r.newClient(token).States(ctx, scope)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("pool %s: %v", pool.Name, err))
+			continue
+		}
+		for name, state := range poolStates {
+			states[name] = state
+		}
+	}
+
+	r.statesForOrphans(ctx, actual, states, scopeSeen, &Result{})
+
+	out := make([]RunnerStatus, 0, len(actual))
+	for _, runner := range sortedRunners(actual) {
+		job := string(states[runner.Name])
+		if job == "" {
+			job = "unknown"
+		}
+		want, known := generations[runner.Pool]
+		out = append(out, RunnerStatus{
+			Name:       runner.Name,
+			Pool:       runner.Pool,
+			Runtime:    string(runner.Runtime),
+			State:      runner.State,
+			Job:        job,
+			Generation: runner.Generation,
+			UpToDate:   known && want == runner.Generation,
+		})
+	}
+	return out, errs
+}

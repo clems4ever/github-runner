@@ -1,0 +1,29 @@
+# The daemon. Restarting it is safe at any time: it supervises nothing, so
+# every runner on this host carries on through it, jobs included.
+[Unit]
+Description=runner-fleet: self-hosted GitHub Actions runners
+Documentation=https://github.com/clems4ever/github-runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Root, because it writes systemd units and creates virtual machines. The
+# runners themselves drop to the runner-fleet user.
+User=root
+ExecStart=/usr/local/bin/runner-fleet serve --addr 127.0.0.1:8080
+Restart=always
+RestartSec=5
+
+# The daemon is replaceable; nothing it holds needs to survive it.
+KillMode=control-group
+TimeoutStopSec=30
+
+# What it needs and nothing else. It cannot write outside its own directories.
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/etc/runner-fleet /var/lib/runner-fleet /run/runner-fleet /etc/systemd/system
+
+[Install]
+WantedBy=multi-user.target
