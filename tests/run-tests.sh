@@ -561,16 +561,16 @@ if test_case "credential-store"; then
   is "then it is found in its new home" "${CRED_DIR}/pat" "$(stored_credential runner-1)"
 
   rm -f "${CRED_DIR}/pat"
-  store_credentials web tok1 >/dev/null
+  store_credentials tok1 web >/dev/null
   is "the first credential is the shared one" "tok1" "$(cat "${CRED_DIR}/pat")"
   is "root-only"                              "600"  "$(stat -c %a "${CRED_DIR}/pat")"
   succeeds "with no per-runner copy"          test ! -e "${CRED_DIR}/pat.web"
 
-  store_credentials api tok1 >/dev/null
+  store_credentials tok1 api >/dev/null
   succeeds "the same token is not copied again" test ! -e "${CRED_DIR}/pat.api"
   is "stored_credential falls back to it"     "${CRED_DIR}/pat" "$(stored_credential api)"
 
-  store_credentials api tok2 >/dev/null
+  store_credentials tok2 api >/dev/null
   is "a different token goes under the runner" "tok2" "$(cat "${CRED_DIR}/pat.api")"
   is "and the shared one is untouched"         "tok1" "$(cat "${CRED_DIR}/pat")"
   is "which is what that runner then uses"     "${CRED_DIR}/pat.api" "$(stored_credential api)"
@@ -578,10 +578,45 @@ if test_case "credential-store"; then
 
   # Going back to the shared token removes the copy rather than leaving a
   # second file holding the same secret.
-  store_credentials api tok1 >/dev/null
+  store_credentials tok1 api >/dev/null
   succeeds "a token back in step is dropped"   test ! -e "${CRED_DIR}/pat.api"
 
   is "nothing to find on a bare host" "" "$(CRED_DIR=$WORK/none stored_credential web)"
+
+  # Replicas share a repository, so a credential of their own has to reach
+  # every one of them: a file for the first alone would leave the rest falling
+  # back to the host-wide PAT, which belongs to a different repository.
+  store_credentials tok3 web-1 web-2 web-3 >/dev/null
+  is "each replica gets the repository's own token" "tok3" "$(cat "${CRED_DIR}/pat.web-2")"
+  is "and they all agree"                           "tok3" "$(cat "${CRED_DIR}/pat.web-3")"
+  is "which is what each of them resolves to"       "${CRED_DIR}/pat.web-3" "$(stored_credential web-3)"
+
+  # Rotating is the same command with the new token, so every replica has to be
+  # rewritten, not just the first.
+  store_credentials tok4 web-1 web-2 web-3 >/dev/null
+  is "rotating reaches every replica"               "tok4" "$(cat "${CRED_DIR}/pat.web-3")"
+
+  ETC_DIR=${RUNNER_VM_ETC:-/etc/runner-vm}; CRED_DIR="${ETC_DIR}/creds"
+fi
+
+# How many runners install sets up for one repository, and what they are named.
+if test_case "replicas"; then
+  is "one runner keeps the plain name" "web"             "$(replica_names web 1)"
+  is "several are numbered"            "web-1 web-2 web-3" "$(replica_names web 3 | tr '\n' ' ' | sed 's/ $//')"
+  is "zero is treated as one"          "web"             "$(replica_names web 0)"
+
+  ETC_DIR="$WORK/replicas"; mkdir -p "$ETC_DIR"
+  : > "$ETC_DIR/env.web-1"; : > "$ETC_DIR/env.web-2"; : > "$ETC_DIR/env.web-3"
+  : > "$ETC_DIR/env.web-other"   # not a replica: the suffix is not a number
+  : > "$ETC_DIR/env.api-1"       # another repository's replicas
+
+  is "nothing stale when the count is unchanged" "" "$(stale_replicas web 3)"
+  is "scaling down names what is left over"      "web-3" "$(stale_replicas web 2)"
+  is "and all of them when going back to one"    "web-1 web-2 web-3" \
+     "$(stale_replicas web 1 | tr '\n' ' ' | sed 's/ $//')"
+  is "a name that is not a replica is left out"  "" "$(stale_replicas web 3 | grep web-other)"
+  is "and so is another repository's"            "" "$(stale_replicas web 3 | grep api)"
+  is "nothing for a runner that has none"        "" "$(stale_replicas lonely 1)"
 
   ETC_DIR=${RUNNER_VM_ETC:-/etc/runner-vm}; CRED_DIR="${ETC_DIR}/creds"
 fi
