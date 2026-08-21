@@ -16,7 +16,9 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,13 @@ const (
 	LabelRunner     = "io.runner-fleet.runner"
 	LabelPool       = "io.runner-fleet.pool"
 	LabelGeneration = "io.runner-fleet.generation"
+	// The scope and credential travel with the container so that a runner
+	// whose pool has been deleted can still be asked about: it is registered
+	// somewhere, and the daemon has to be able to find out whether a job is on
+	// it before removing it.
+	LabelScopeKind  = "io.runner-fleet.scope-kind"
+	LabelScope      = "io.runner-fleet.scope"
+	LabelCredential = "io.runner-fleet.credential"
 )
 
 // DefaultSocket is where dockerd listens.
@@ -53,6 +62,7 @@ type Executor struct {
 	layout paths.Layout
 	http   *http.Client
 	host   string // base URL; for a unix socket this is a placeholder host
+	socket string // empty when not talking to a socket, which is how the tests run
 	binary string
 
 	// draining is the set of runners that have been asked to stop.
@@ -72,7 +82,7 @@ type Option func(*Executor)
 // WithHTTPClient replaces the transport, which is how the tests point this at
 // an httptest server instead of a socket.
 func WithHTTPClient(c *http.Client, host string) Option {
-	return func(e *Executor) { e.http, e.host = c, host }
+	return func(e *Executor) { e.http, e.host, e.socket = c, host, "" }
 }
 
 // New builds an executor talking to the local Docker daemon.
@@ -81,6 +91,7 @@ func New(layout paths.Layout, binary string, opts ...Option) *Executor {
 		layout:   layout,
 		binary:   binary,
 		host:     "http://docker",
+		socket:   DefaultSocket,
 		draining: map[string]bool{},
 		http: &http.Client{
 			Transport: &http.Transport{
@@ -117,6 +128,9 @@ func (e *Executor) Create(ctx context.Context, spec reconcile.Spec) error {
 			LabelRunner:     spec.Name,
 			LabelPool:       spec.Pool,
 			LabelGeneration: spec.Generation,
+			LabelScopeKind:  string(spec.ScopeKind),
+			LabelScope:      spec.Scope,
+			LabelCredential: strconv.FormatInt(spec.CredentialID, 10),
 		},
 		// The agent is the entrypoint: it registers the runner with a token it
 		// mints itself, then runs it. Bind-mounting one binary is what keeps
@@ -237,7 +251,14 @@ type container struct {
 }
 
 // List reports every container runner on this host, found by label.
+//
+// A host without Docker has no container runners, which is a true answer
+// rather than an error: reporting one would put a stack trace about a missing
+// socket in front of an operator who only ever wanted virtual machines.
 func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
+	if !e.available() {
+		return nil, nil
+	}
 	filters := url.QueryEscape(`{"label":["` + LabelRunner + `"]}`)
 	var containers []container
 	if err := e.do(ctx, http.MethodGet, "/containers/json?all=1&filters="+filters, nil, &containers); err != nil {
@@ -261,12 +282,16 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 		if state == reconcile.StateRunning && draining[name] {
 			state = reconcile.StateStopping
 		}
+		credentialID, _ := strconv.ParseInt(c.Labels[LabelCredential], 10, 64)
 		runners = append(runners, reconcile.Runner{
-			Name:       name,
-			Pool:       c.Labels[LabelPool],
-			Generation: c.Labels[LabelGeneration],
-			Runtime:    model.RuntimeContainer,
-			State:      state,
+			Name:         name,
+			Pool:         c.Labels[LabelPool],
+			Generation:   c.Labels[LabelGeneration],
+			Runtime:      model.RuntimeContainer,
+			State:        state,
+			ScopeKind:    model.ScopeKind(c.Labels[LabelScopeKind]),
+			Scope:        c.Labels[LabelScope],
+			CredentialID: credentialID,
 		})
 	}
 	sort.Slice(runners, func(i, j int) bool { return runners[i].Name < runners[j].Name })
@@ -306,6 +331,17 @@ func (e *Executor) ensureImage(ctx context.Context, image string) error {
 // pool will not work on this host rather than failing later.
 func (e *Executor) Ping(ctx context.Context) error {
 	return e.do(ctx, http.MethodGet, "/_ping", nil, nil)
+}
+
+// available reports whether there is a Docker to talk to at all. Creating a
+// container still fails loudly when there is not — a pool asking for one has
+// to hear about it — but listing stays quiet.
+func (e *Executor) available() bool {
+	if e.socket == "" {
+		return true // a test server, or a Docker reached some other way
+	}
+	_, err := os.Stat(e.socket)
+	return err == nil
 }
 
 type apiError struct {

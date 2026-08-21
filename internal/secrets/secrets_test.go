@@ -188,6 +188,25 @@ func TestFingerprintIsStableAndDistinct(t *testing.T) {
 	if strings.Contains(a, "token-one") {
 		t.Fatalf("fingerprint leaks the token: %q", a)
 	}
+
+	// Every GitHub token starts the same way. A fingerprint that only reflects
+	// the first few characters would report a rotated credential as unchanged,
+	// and the runners would keep using the one that was just revoked.
+	first := ring.Fingerprint("github_pat_11ABCDEFGHIJKLMNOP_first")
+	second := ring.Fingerprint("github_pat_11ABCDEFGHIJKLMNOP_second")
+	if first == second {
+		t.Fatal("two tokens sharing a long prefix have the same fingerprint")
+	}
+}
+
+// A fingerprint is bound to the key: two hosts must not be able to compare
+// theirs and learn they hold the same credential.
+func TestFingerprintDependsOnTheKey(t *testing.T) {
+	one := testKeyring(t)
+	two := testKeyring(t)
+	if one.Fingerprint("same-token") == two.Fingerprint("same-token") {
+		t.Fatal("the fingerprint does not depend on the key")
+	}
 }
 
 func testKeyring(t *testing.T) *Keyring {

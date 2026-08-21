@@ -51,12 +51,21 @@ type Spec struct {
 }
 
 // Runner is what an executor found on the host.
+//
+// It carries its own scope and credential, not just its pool. A runner outlives
+// the pool that created it — deleting a pool drains its runners rather than
+// killing them — and during that window the pool is no longer in the database
+// to say where the runner is registered. Without this the daemon could not ask
+// GitHub whether a job was on it, which is exactly when it most needs to know.
 type Runner struct {
-	Name       string
-	Pool       string
-	Generation string
-	Runtime    model.Runtime
-	State      RunnerState
+	Name         string
+	Pool         string
+	Generation   string
+	Runtime      model.Runtime
+	State        RunnerState
+	ScopeKind    model.ScopeKind
+	Scope        string
+	CredentialID int64
 }
 
 // Op is a single thing to do.

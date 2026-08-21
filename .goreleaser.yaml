@@ -1,0 +1,52 @@
+version: 2
+
+project_name: runner-fleet
+
+before:
+  hooks:
+    # The UI is embedded in the binary, so it has to exist before the build.
+    - npm --prefix web ci
+    - npm --prefix web run build
+
+builds:
+  - id: runner-fleet
+    main: ./cmd/runner-fleet
+    binary: runner-fleet
+    env:
+      # Pure Go throughout — including SQLite — so these cross-compile without
+      # a toolchain per target.
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - packaging/runner-fleetd.service
+      - install.sh
+
+checksum:
+  # The installer verifies against this file, so its name is part of the
+  # contract with install.sh.
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:", "^chore:"]
+
+release:
+  footer: |
+    ## Install
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/clems4ever/github-runner/main/install.sh | sudo bash
+    ```
+
+    Upgrading is the same command. It replaces the binary and restarts the
+    daemon; the runners already on the host keep going, jobs included.

@@ -157,6 +157,12 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	actual, listErrs := r.listAll(ctx)
 	result.Errors = append(result.Errors, listErrs...)
 
+	// Runners whose pool is gone are the ones most at risk of being removed
+	// mid-job, and the loop above could not have asked about them: their pool
+	// is no longer in the database to say where they are registered. They
+	// carry that themselves, so they can still be asked about.
+	r.statesForOrphans(ctx, actual, states, scopeSeen, &result)
+
 	actions := Plan(desired, actual, states)
 	result.Actions = actions
 
@@ -179,6 +185,45 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	r.last = result
 	r.mu.Unlock()
 	return result
+}
+
+// statesForOrphans asks GitHub about runners that no pool claims.
+func (r *Reconciler) statesForOrphans(ctx context.Context, actual []Runner, states map[string]github.State, scopeSeen map[string]bool, result *Result) {
+	if r.newClient == nil {
+		return
+	}
+	for _, runner := range actual {
+		if runner.Scope == "" || runner.CredentialID == 0 {
+			continue
+		}
+		if _, known := states[runner.Name]; known {
+			continue
+		}
+		scope := github.Scope{Kind: runner.ScopeKind, Path: runner.Scope}
+		key := string(scope.Kind) + ":" + scope.Path
+		if scopeSeen[key] {
+			continue
+		}
+		scopeSeen[key] = true
+
+		token, err := r.store.Token(ctx, runner.CredentialID)
+		if err != nil {
+			// The credential is gone too. Nothing can be learned, so the plan
+			// falls back to what the host says — and the host only reports a
+			// drained runner as stopped once it really has stopped.
+			continue
+		}
+		orphanStates, err := r.newClient(token).States(ctx, scope)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("ask GitHub about %s: %v", runner.Name, err))
+			continue
+		}
+		for name, state := range orphanStates {
+			if _, known := states[name]; !known {
+				states[name] = state
+			}
+		}
+	}
 }
 
 // Last is the most recent pass, for the UI.
@@ -315,6 +360,8 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 			states[name] = state
 		}
 	}
+
+	r.statesForOrphans(ctx, actual, states, scopeSeen, &Result{})
 
 	out := make([]RunnerStatus, 0, len(actual))
 	for _, runner := range sortedRunners(actual) {

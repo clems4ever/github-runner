@@ -1,346 +1,175 @@
-# github-runner
+# runner-fleet
 
-[![test](https://github.com/clems4ever/github-runner/actions/workflows/test.yml/badge.svg)](https://github.com/clems4ever/github-runner/actions/workflows/test.yml)
+[![ci](https://github.com/clems4ever/github-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/clems4ever/github-runner/actions/workflows/ci.yml)
 
-Run [self-hosted GitHub Actions runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners)
-in throwaway QEMU virtual machines. One VM per runner, deleted when it stops.
+A daemon that maintains a fleet of [self-hosted GitHub Actions
+runners](https://docs.github.com/en/actions/hosting-your-own-runners) on one
+host, with a web UI to configure it.
 
-A job gets a machine of its own: its own Docker daemon, a kernel it is free to
-break, and `/dev/kvm` too if you install the runner with `--nested`. Nothing it
-does survives into the next job.
+Each runner is a throwaway QEMU virtual machine or a Docker container. Per pool
+you choose the repository or organisation, the runtime, whether jobs get
+`/dev/kvm`, whether runners are ephemeral, how many replicas, what labels they
+register with, and how big they are.
 
-It is one bash script with no dependencies beyond QEMU.
+**Upgrading the daemon does not touch the runners.** It supervises nothing: the
+runners are systemd units and Docker containers of their own, and the daemon
+only creates, drains and deletes them. Restart it, upgrade it, or let it crash —
+the jobs on this host carry on.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/clems4ever/github-runner/main/install.sh | sudo bash
+```
+
+It fetches the latest release, verifies its checksum, installs the systemd
+unit, and asks for the user name and password the web UI will use. Then open
+<http://127.0.0.1:8080>.
+
+Rerunning it is how you upgrade, and it is deliberately uneventful.
+
+The UI binds to the loopback address. If the host is remote, tunnel to it rather
+than opening the port — the daemon holds a credential that administers your
+repositories:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 your-host
+```
 
 ## Getting started
 
-**1. Install**
+1. **Add a credential.** A fine-grained PAT with **Administration: Read and
+   write** on a repository, or **Self-hosted runners: Read and write** on an
+   organisation. It is encrypted at rest and never shown again.
+2. **Create a pool.** Pick the scope, the runtime, and the number of replicas.
+3. Runners appear within a few seconds, and again after a reboot.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/clems4ever/github-runner/main/runner-vm.sh \
-  | sudo bash -s -- install
-```
+A pool named `web` with three replicas gives you `web-1`, `web-2` and `web-3`.
+Scaling is changing one number.
 
-**2. Check the host**
-
-```bash
-sudo runner-vm.sh doctor
-```
-
-It prints the fix for anything missing — usually installing QEMU:
-
-```bash
-sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
-```
-
-Only if you want jobs to boot VMs of their own, the host needs nested
-virtualisation on as well:
-
-```bash
-echo 'options kvm_amd nested=1' | sudo tee /etc/modprobe.d/kvm_amd.conf   # kvm_intel on Intel
-sudo modprobe -r kvm_amd && sudo modprobe kvm_amd nested=1
-```
-
-**3. Build the image**
-
-Once per host, a few minutes. Every VM afterwards boots from a copy-on-write
-overlay on it, in seconds.
-
-```bash
-sudo runner-vm.sh build
-```
-
-**4. Run a runner**
-
-Take a registration token from *Settings → Actions → Runners → New self-hosted
-runner* and:
-
-```bash
-sudo runner-vm.sh run --url https://github.com/OWNER/REPO --token AAAA...
-```
-
-The runner appears in that page within a minute, and jobs reach it with
-`runs-on: self-hosted`. Ctrl-C stops it and deletes the VM.
-
-**5. Keep it running across reboots**
-
-A registration token is good for an hour, and a VM registers afresh on every
-boot, so anything long-lived needs a credential that can mint tokens — a PAT or
-a GitHub App. Then:
-
-```bash
-sudo runner-vm.sh install --service \
-  --url https://github.com/OWNER/REPO \
-  --github-token github_pat_...
-```
-
-That stores the credential at `/etc/runner-vm/creds/pat` (root-only), installs a
-systemd unit, and starts `runner-vm@runner-1`. It comes back after a reboot.
-
-```bash
-runner-vm.sh list                         # what is running
-sudo journalctl -u runner-vm@runner-1 -f  # what it is doing
-```
-
-## More runners for the same repository
-
-One runner takes one job at a time. `--replicas` sets up several, each with a VM
-of its own, so the repository can run that many jobs at once:
-
-```bash
-sudo runner-vm.sh install --service --name web \
-  --url https://github.com/OWNER/REPO --replicas 3
-```
-
-They are named `web-1`, `web-2`, `web-3` and get a configuration file each, so
-raising the count later leaves the runners already going untouched, and one of
-them can be given a different size or labels by editing its own file. Lowering
-it does not stop anything — install names the runners left over and prints the
-command to remove them, because stopping one is stopping a machine that may be
-halfway through a job.
-
-Size the total against the host: three runners at the default 4 GiB want 12 GiB
-of RAM and three cores' worth of contention, plus a 40 GiB disk each.
-
-## Several repositories on one host
-
-Every runner is an instance of one unit template and reads its own
-configuration, so adding a repository is running `install --service` again with
-a different `--name`:
-
-```bash
-sudo runner-vm.sh install --service --name web \
-  --url https://github.com/OWNER/web --github-token github_pat_...
-
-sudo runner-vm.sh install --service --name api \
-  --url https://github.com/OWNER/api
-```
-
-The second one reuses the credential already on the host — pass a token of its
-own if that repository needs a different one — and leaves the first runner's
-configuration untouched. Sizes and labels are per runner too:
-
-```bash
-sudo runner-vm.sh install --service --name big \
-  --url https://github.com/OWNER/web --cpus 8 --memory 16384 --labels big
-```
-
-What ends up where:
+## What a pool decides
 
 | | |
 | --- | --- |
-| `/etc/runner-vm/env` | defaults shared by every runner on the host |
-| `/etc/runner-vm/env.NAME` | one runner's settings, read after the shared file so it wins |
-| `/etc/runner-vm/creds/pat` | the credential runners use unless they have their own |
-| `/etc/runner-vm/creds/pat.NAME` | one runner's own credential (likewise `app.pem` and `app.NAME.pem`) |
+| **Scope** | one repository, or an organisation whose repositories all share the runners |
+| **Runtime** | a virtual machine per job, or a container |
+| **Nested virtualisation** | whether jobs get `/dev/kvm` and can boot machines of their own |
+| **Ephemeral** | take one job, then be replaced by a clean runner |
+| **Replicas** | how many jobs the pool can run at once |
+| **Labels** | what a workflow targets with `runs-on` |
+| **Size** | vCPUs, memory, and disk for VM pools |
 
-Editing a file takes effect on the next restart of that runner alone:
-
-```bash
-sudoedit /etc/runner-vm/env.api
-sudo systemctl restart runner-vm@api   # waits for the job in flight
-```
-
-If the repositories are all in one organisation, an organisation-level runner is
-simpler than one per repository: point `--url` at
-`https://github.com/ORGANISATION` and every repository in it can use the runner.
-GitHub has no equivalent for a personal account, so repositories under a user
-account need one runner each.
-
-## Commands
-
-| | |
-| --- | --- |
-| `doctor` | Check KVM, nested virtualisation and QEMU, and say how to fix what is missing |
-| `build` | Build the golden image the VMs boot from |
-| `run` | Boot a VM and run a runner in it until stopped |
-| `list` | The VMs on this host: state, repository, size, nested virtualisation, ssh port, uptime. `--jobs` adds what GitHub says each runner is doing |
-| `install` | Install this script; `--service` also sets up systemd |
-| `clean` | Stop the services and VMs and delete their disks, keeping the image cache |
-| `uninstall` | Remove everything: services, unit, configuration, state, the script |
-| `print-unit` | Print the systemd unit `install --service` writes |
-
-`runner-vm.sh --help` lists every flag.
-
-## Credentials
-
-Three ways in, in increasing order of how long they last:
-
-| | Lasts | Good for |
-| --- | --- | --- |
-| `--token` | one hour | trying it out |
-| `--github-token` (a PAT) | until the PAT expires | a machine you revisit |
-| `--app-id` + `--app-key` | indefinitely | a machine that must stay up |
-
-A fine-grained PAT needs **Administration: Read and write** on the repository,
-or the organisation's **Self-hosted runners: Read and write**. A GitHub App
-needs the same, and belongs to the organisation rather than to a person, so it
-does not expire or leave when someone does.
-
-Any of them can come from a file or stdin instead of the command line, where
-`ps` would show it to every user on the machine:
-
-```bash
-sudo runner-vm.sh run --url ... --github-token-file /root/pat
-printf %s "$PAT" | sudo runner-vm.sh run --url ... --github-token-file -
-```
-
-Whatever you pass to `install --service` is stored under `/etc/runner-vm/creds`,
-`0600` and root-owned, and handed to the service through systemd's credential
-mechanism — so it is never in the unit, never in a command line, and never
-readable on disk by the service user. The first credential installed on a host
-is the one every runner uses; a runner that needs a different one gets it as
-`creds/pat.NAME`.
-
-## What the VM has
-
-Ubuntu 24.04 with the runner, Docker, QEMU, and the toolchain workflows written
-against GitHub-hosted runners tend to assume: compilers and autotools, python3,
-node and npm, the GitHub CLI, git-lfs, the common `-dev` libraries, and the
-usual utilities. Language versions are left to `setup-node`, `setup-python` and
-friends, which work exactly as they do on a hosted runner.
-
-Anything else, without editing the script:
-
-```bash
-EXTRA_PACKAGES="ffmpeg imagemagick" sudo runner-vm.sh build
-```
-
-The package list is hashed into the image name, so changing it builds a new
-image rather than reusing one without the new tools.
-
-Verify it from a workflow:
+Every runner also registers with labels describing what it is — `vm` or
+`container`, plus `nested` and `ephemeral` when they apply — so a workflow can
+ask for what it needs:
 
 ```yaml
 jobs:
   build:
-    runs-on: self-hosted
-    steps:
-      - run: docker run --rm hello-world   # the VM's own daemon
-      - run: kvm-ok                        # only with --nested
+    runs-on: [self-hosted, nested]
 ```
 
-## How it works
+Those follow the settings rather than the name, so a pool cannot claim to be
+something it is not.
 
-- `build` boots the Ubuntu cloud image once with a cloud-init seed that
-  installs everything, then powers off. That is the golden image.
-- `run` creates a qcow2 overlay on it and a second seed carrying the
-  registration details and the guest runner script, and boots it with
-  `-cpu host,+svm` (or `+vmx`) so the guest can run VMs of its own.
-- Inside, a systemd unit registers the runner and runs it as an unprivileged
-  user, with its output on the serial console — which is what the script
-  streams to your terminal.
-- When the runner stops, the VM powers off; when the VM is gone, its disk is
-  deleted. Interrupting the script does the same from the other end.
+### Virtual machines or containers
 
-Images and VM disks live in `~/.local/share/runner-vm`, or
-`/var/lib/runner-vm` for the service. `RUNNER_VM_HOME` moves them.
+A **virtual machine** gives a job its own kernel, its own Docker daemon and a
+disk that is thrown away afterwards. It boots in seconds from a golden image
+built once per host.
 
-## Options
+A **container** starts faster and costs less, and is a weaker boundary: a job
+shares the host kernel. Nested virtualisation in a container means handing the
+job the host's `/dev/kvm`, which is a real hole in an already weaker boundary.
+Both are offered; the UI says which is which.
 
-Every flag has an environment variable equivalent.
+## How the daemon works
 
-| Flag | Variable | Default | |
-| --- | --- | --- | --- |
-| `--url` | `GITHUB_URL` | — | Repository or organisation |
-| `--token` | `RUNNER_TOKEN` | — | Registration token |
-| `--github-token` | `GITHUB_TOKEN` | — | PAT, to mint tokens per boot |
-| `--github-token-file` | `GITHUB_TOKEN_FILE` | — | Read the PAT from a file, or `-` for stdin |
-| `--app-id` | `GITHUB_APP_ID` | — | GitHub App id |
-| `--app-key` | `GITHUB_APP_PRIVATE_KEY` | — | The app's PEM private key |
-| `--name` | `RUNNER_NAME` | `vm-<host>-<pid>` | Runner name |
-| `--labels` | `RUNNER_LABELS` | — | Extra labels |
-| `--group` | `RUNNER_GROUP` | `Default` | Runner group |
-| `--cpus` | `VM_CPUS` | `2` | vCPUs |
-| `--memory` | `VM_MEMORY_MB` | `4096` | Memory, MiB |
-| `--disk` | `VM_DISK_GB` | `40` | Disk, GiB |
-| `--ephemeral` | `EPHEMERAL` | `false` | One job per VM |
-| `--nested` | `VM_NESTED` | off | Expose `vmx`/`svm`, so jobs can boot VMs of their own |
-| `--replicas` | `REPLICAS` | `1` | How many runners `install --service` sets up on the repository |
-
-With `--ephemeral` the runner takes one job, the VM powers off, and under
-systemd `Restart=always` starts a clean one — a genuinely fresh machine per job.
-
-## When a job fails before it runs a step
-
-Every job starts by downloading the actions it uses from
-`codeload.github.com`, and those requests are **anonymous**, so they are
-rate-limited per source IP:
+It is a reconciler. The database holds what you asked for; systemd and Docker
+hold what exists; every pass compares the two and acts.
 
 ```
-Failed to download action 'https://codeload.github.com/actions/checkout/tar.gz/...'
-Error: Response status code does not indicate success: 429 (Too Many Requests).
+pools in SQLite  ──►  Plan(desired, actual, GitHub)  ──►  create / start / drain / remove
+                            ▲              ▲
+                   systemd + Docker    is a job running?
 ```
 
-The job dies in *Set up job*, with nothing of its own having run, which reads as
-though the runner is broken. It is not, and it is not specific to self-hosted
-runners either — the same 429 turns up on GitHub-hosted ones when the service is
-busy. A host with a fixed egress address makes it likelier than a hosted runner
-getting a fresh address per job, but that is the whole of the difference.
+Three properties fall out of that, and each has tests that would fail loudly if
+it stopped being true:
 
-Retrying is usually enough. If it is persistent, the durable answers are to use
-fewer network-fetched actions, or to bake the ones you rely on into the image.
-## Stopping without failing a job
+- **A restarted daemon adopts the fleet.** It has no memory. It reads the
+  runners back from the host's environment files and container labels, and if
+  they match what the pools ask for it does nothing at all.
+- **No change ever fails a job.** Scaling down, editing a pool, rotating a
+  token or deleting a pool all *drain*: the runner is asked to stop, finishes
+  the job it is on, and only then is removed. Draining a machine is an ACPI
+  shutdown, which the guest turns into a clean stop of the runner; the unit
+  waits up to an hour for it.
+- **A busy runner is never removed.** The host says whether a machine is up;
+  only GitHub knows whether a job is on it, and the daemon asks — including for
+  runners whose pool has just been deleted, which carry their own scope for
+  exactly that reason.
 
-Stopping a service is already safe: `systemctl stop` reaches the script, which
-asks the guest to power off, which lets the guest's runner finish the job it is
-on before the VM goes away. It waits up to an hour (`TimeoutStopSec=3660`), so a
-`clean` or a `restart` on a busy runner is slow rather than destructive. The same
-is true of `uninstall`, which stops the services first.
-
-The exception is a VM started by hand rather than by a service. Those are killed
-after 15 seconds and then `kill -9`'d, which is a power cut — whatever the job was
-doing is lost.
-
-To see what is going on before touching anything, ask GitHub rather than the host:
-a running VM tells you nothing about whether a job is inside it.
-
-```bash
-sudo runner-vm.sh list --jobs
-```
-
-```
-NAME             STATE     SERVICE   JOB      CPU   MEM   DISK    NESTED SSH    UPTIME     REPO
-claude-control-1 running   active    busy     2     4096M 40G     no     2225   00:13      clems4ever/claude-control*
-claude-control-2 running   active    idle     2     4096M 40G     no     2226   01:37      clems4ever/claude-control*
-claude-control-3 running   active    offline  2     4096M 40G     no     2227   01:37      clems4ever/claude-control*
-```
-
-`busy` is a job right now, `idle` is registered and waiting, `offline` is
-registered but not connected — a VM that has not booted or has died. A dash means
-GitHub has no runner by that name at all. It needs the credential, so run it with
-`sudo`, and it needs `jq`.
-
-It is a snapshot, not a lock: a job can be handed to an idle runner a second after
-you look. For a runner you are about to remove, stopping its service first is what
-actually guarantees the job finishes.
-
-## Tests
-
-```bash
-tests/run-tests.sh
-```
-
-Covers what does not need a hypervisor: the generated cloud-init and systemd
-files, credential handling, image naming, port allocation, `list` and `clean`.
-CI runs those on every push, and separately installs the script the documented
-way to check it touches nothing else and that `uninstall` reverses it. Booting
-a guest needs `/dev/kvm`, which hosted runners do not have, so that part is
-checked by hand.
+Each runner's configuration is hashed into a *generation*. A runner whose
+generation no longer matches its pool is running the wrong configuration and is
+replaced, gracefully. Replicas deliberately are not part of that hash, so
+scaling does not disturb the runners that are already correct.
 
 ## Security
 
-GitHub recommends self-hosted runners only for **private** repositories: on a
-public one, a pull request from a fork can run arbitrary code on the runner.
+- The web UI is HTTP Basic over a loopback bind, with bcrypt and attempt
+  throttling. Until a password is set, the daemon serves nothing.
+- GitHub tokens are encrypted with AES-256-GCM under a key in
+  `/etc/runner-fleet/master.key` (0600, root, generated on first start). The
+  daemon has to decrypt to use them, so this is not protection against root: it
+  protects backups, snapshots and disks that travel where the key does not.
+- The decrypted copy a runner needs lives in `/run/runner-fleet`, which is a
+  tmpfs. It never reaches a disk, and a runner can still register itself after
+  a reboot with the daemon still starting.
+- GitHub recommends self-hosted runners only for **private** repositories: on a
+  public one, a pull request from a fork can run arbitrary code on the runner.
+  A VM is a much harder boundary than a container, and ephemeral runners give
+  each job a clean machine.
 
-A VM is a much harder boundary than a container, and the only way to give a job
-Docker — or `/dev/kvm` — without handing over the host. It is not a promise,
-though: a job can still exhaust the host's memory and CPU, and a VM only gets a
-clean disk when it is replaced — use `--ephemeral` if you want that per job.
+## Layout on the host
 
-Nested virtualisation is off unless a runner is installed with `--nested`, and
-that is deliberate: it is the largest piece of the host's CPU a job gets to
-touch. Turning it on is per runner, so a repository that needs it does not
-hand it to every other repository on the host.
+| | |
+| --- | --- |
+| `/usr/local/bin/runner-fleet` | the daemon, the agent and the CLI, in one binary |
+| `/etc/runner-fleet/fleet.db` | pools and credentials |
+| `/etc/runner-fleet/master.key` | the encryption key |
+| `/etc/runner-fleet/runners/` | one environment file per VM runner |
+| `/run/runner-fleet/credentials/` | decrypted tokens, on tmpfs |
+| `/var/lib/runner-fleet/` | golden images and VM disks |
+| `gh-runner@NAME.service` | one runner |
+| `runner-fleetd.service` | the daemon |
+
+## Development
+
+```bash
+make ui        # build the web interface into the Go module
+make build     # build the binary
+make test      # go vet + go test
+make ui-test   # vitest
+make dev       # run against ./tmp, no root, nothing on the real host
+```
+
+The UI runs on its own with `npm --prefix web run dev`, proxying to the daemon
+on 8080.
+
+Tests cover everything that does not need a hypervisor: the reconciler's rules
+as table tests against fake executors, the rendered units and container specs,
+the API including every authentication path, encryption, and end-to-end runs
+that drive the daemon over HTTP against a real database. Booting a guest needs
+`/dev/kvm`, which hosted CI runners do not have, so that stays a manual check.
+
+## Roadmap
+
+**Per-repository images.** A repository's toolchain baked into its own image, so
+a job does not pay for the install every time. The pieces are already in place:
+a pool carries an image field, image names are content-addressed by their
+package list, and container pools can already name any image. What is missing is
+letting a pool carry a package list and building the variant on demand.
 
 ## Licence
 

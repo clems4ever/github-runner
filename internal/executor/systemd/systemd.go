@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/clems4ever/github-runner/internal/model"
@@ -195,6 +196,10 @@ func RenderEnv(spec reconcile.Spec, layout paths.Layout) string {
 	// the daemon rewrites, so the credential never reaches a disk and a runner
 	// can still mint a registration token on its own after a reboot.
 	fmt.Fprintf(&b, "FLEET_CREDENTIAL_FILE=%s\n", layout.Credential(spec.CredentialID))
+	// The id as well as the path: a runner whose pool has been deleted is still
+	// registered somewhere, and this is what lets the daemon find the
+	// credential that can ask GitHub about it.
+	fmt.Fprintf(&b, "FLEET_CREDENTIAL_ID=%d\n", spec.CredentialID)
 	fmt.Fprintf(&b, "FLEET_STATE_DIR=%s\n", layout.State)
 	return b.String()
 }
@@ -260,12 +265,16 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 		if err != nil {
 			continue
 		}
+		credentialID, _ := strconv.ParseInt(env["FLEET_CREDENTIAL_ID"], 10, 64)
 		runners = append(runners, reconcile.Runner{
-			Name:       name,
-			Pool:       env["FLEET_POOL"],
-			Generation: env["FLEET_GENERATION"],
-			Runtime:    model.RuntimeVM,
-			State:      reconcile.StateStopped,
+			Name:         name,
+			Pool:         env["FLEET_POOL"],
+			Generation:   env["FLEET_GENERATION"],
+			Runtime:      model.RuntimeVM,
+			State:        reconcile.StateStopped,
+			ScopeKind:    model.ScopeKind(env["FLEET_SCOPE_KIND"]),
+			Scope:        env["FLEET_SCOPE"],
+			CredentialID: credentialID,
 		})
 		units = append(units, unitName(name))
 	}

@@ -10,7 +10,9 @@ package secrets
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -35,6 +37,7 @@ var ErrKeyPermissions = errors.New("key file is readable by more than its owner"
 
 // Keyring seals and opens secrets with one key.
 type Keyring struct {
+	key  []byte
 	aead cipher.AEAD
 }
 
@@ -51,7 +54,7 @@ func NewKeyring(key []byte) (*Keyring, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Keyring{aead: aead}, nil
+	return &Keyring{key: append([]byte(nil), key...), aead: aead}, nil
 }
 
 // LoadOrCreateKey reads the master key, generating one the first time.
@@ -158,11 +161,14 @@ func (k *Keyring) Open(sealed string) (string, error) {
 // without revealing it: the reconciler needs to notice that a token changed,
 // and comparing sealed values cannot tell it anything, since sealing the same
 // token twice gives two different strings.
+//
+// HMAC rather than a truncated ciphertext. An earlier version encrypted with a
+// fixed nonce and kept the first few characters, which made two tokens sharing
+// a prefix share a fingerprint — and every GitHub token starts with
+// github_pat_ or ghp_, so rotating one silently changed nothing and the
+// runners kept the credential that had just been revoked.
 func (k *Keyring) Fingerprint(plaintext string) string {
-	// Deterministic by construction: a fixed nonce over a value that is never
-	// stored, only compared. The output is truncated so it cannot be attacked
-	// as a ciphertext.
-	nonce := make([]byte, k.aead.NonceSize())
-	sealed := k.aead.Seal(nil, nonce, []byte(plaintext), nil)
-	return base64.RawURLEncoding.EncodeToString(sealed)[:16]
+	mac := hmac.New(sha256.New, k.key)
+	mac.Write([]byte(plaintext))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))[:16]
 }

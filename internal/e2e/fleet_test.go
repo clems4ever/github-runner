@@ -1,0 +1,518 @@
+// Package e2e drives the whole daemon the way an operator does — over HTTP,
+// against a real database — with only the host and GitHub replaced by fakes.
+//
+// The point is to catch what the unit tests cannot: that the API, the store,
+// the reconciler and the executors agree with each other. Every test here is a
+// promise about behaviour someone would notice if it broke.
+package e2e
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/clems4ever/github-runner/internal/api"
+	"github.com/clems4ever/github-runner/internal/github"
+	"github.com/clems4ever/github-runner/internal/model"
+	"github.com/clems4ever/github-runner/internal/reconcile"
+	"github.com/clems4ever/github-runner/internal/secrets"
+	"github.com/clems4ever/github-runner/internal/store"
+)
+
+// host stands in for systemd and Docker: it keeps runners, and only changes
+// their state when something asks it to, or when a test says a job finished.
+type host struct {
+	mu      sync.Mutex
+	runtime model.Runtime
+	runners map[string]*reconcile.Runner
+	created []string
+}
+
+func newHost(runtime model.Runtime) *host {
+	return &host{runtime: runtime, runners: map[string]*reconcile.Runner{}}
+}
+
+func (h *host) Runtime() model.Runtime { return h.runtime }
+
+func (h *host) List(context.Context) ([]reconcile.Runner, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]reconcile.Runner, 0, len(h.runners))
+	for _, r := range h.runners {
+		out = append(out, *r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (h *host) Create(_ context.Context, spec reconcile.Spec) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.created = append(h.created, spec.Name)
+	// A real executor writes the scope and credential alongside the runner —
+	// in an environment file, or in container labels — so that a runner whose
+	// pool is later deleted can still be asked about. The fake has to keep the
+	// same promise, or these tests would pass on a daemon that cannot.
+	h.runners[spec.Name] = &reconcile.Runner{
+		Name: spec.Name, Pool: spec.Pool, Generation: spec.Generation,
+		Runtime: h.runtime, State: reconcile.StateRunning,
+		ScopeKind: spec.ScopeKind, Scope: spec.Scope, CredentialID: spec.CredentialID,
+	}
+	return nil
+}
+
+func (h *host) Start(_ context.Context, name string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if r, ok := h.runners[name]; ok {
+		r.State = reconcile.StateRunning
+	}
+	return nil
+}
+
+func (h *host) Drain(_ context.Context, name string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if r, ok := h.runners[name]; ok {
+		r.State = reconcile.StateStopping
+	}
+	return nil
+}
+
+func (h *host) Remove(_ context.Context, name string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.runners, name)
+	return nil
+}
+
+// jobsFinish is the host doing what a host does: the runners that were asked
+// to stop have finished their jobs and stopped.
+func (h *host) jobsFinish() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.runners {
+		if r.State == reconcile.StateStopping {
+			r.State = reconcile.StateStopped
+		}
+	}
+}
+
+func (h *host) names() []string {
+	runners, _ := h.List(context.Background())
+	var names []string
+	for _, r := range runners {
+		names = append(names, r.Name)
+	}
+	return names
+}
+
+type fakeGitHub struct {
+	mu     sync.Mutex
+	states map[string]github.State
+}
+
+func (f *fakeGitHub) States(context.Context, github.Scope) (map[string]github.State, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]github.State{}
+	for name, state := range f.states {
+		out[name] = state
+	}
+	return out, nil
+}
+
+func (f *fakeGitHub) Deregister(context.Context, github.Scope, string) error { return nil }
+
+func (f *fakeGitHub) setBusy(name string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.states[name] = github.StateBusy
+}
+
+type fleet struct {
+	t          *testing.T
+	server     *httptest.Server
+	store      *store.Store
+	vm         *host
+	containers *host
+	gh         *fakeGitHub
+	reconciler *reconcile.Reconciler
+	dir        string
+}
+
+func newFleet(t *testing.T) *fleet {
+	t.Helper()
+	dir := t.TempDir()
+	f := &fleet{t: t, vm: newHost(model.RuntimeVM), containers: newHost(model.RuntimeContainer),
+		gh: &fakeGitHub{states: map[string]github.State{}}, dir: dir}
+	f.start()
+	return f
+}
+
+// start builds a daemon over whatever is already on the host and in the
+// database. Calling it twice is a daemon restart, which is the case the whole
+// architecture is built around.
+func (f *fleet) start() {
+	f.t.Helper()
+	if f.store != nil {
+		f.store.Close()
+		f.server.Close()
+	}
+
+	ring, err := secrets.LoadOrCreateKey(filepath.Join(f.dir, "master.key"))
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	db, err := store.Open(filepath.Join(f.dir, "fleet.db"), ring)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	f.store = db
+
+	f.reconciler = reconcile.New(db,
+		[]reconcile.Executor{f.vm, f.containers},
+		func(string) reconcile.GitHubClient { return f.gh },
+		func(int64, string) error { return nil },
+		slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	server := api.New(api.Options{Store: db, Fleet: f.reconciler, Version: "test"})
+	if err := server.Auth().SetPassword(context.Background(), "admin", "correct-horse-battery"); err != nil {
+		f.t.Fatal(err)
+	}
+	f.server = httptest.NewServer(server.Handler())
+}
+
+func (f *fleet) close() {
+	f.server.Close()
+	f.store.Close()
+}
+
+// reconcileNow runs a pass and fails the test if the daemon complained.
+func (f *fleet) reconcileNow() {
+	f.t.Helper()
+	result := f.reconciler.Once(context.Background())
+	if len(result.Errors) > 0 {
+		f.t.Fatalf("reconcile reported %v", result.Errors)
+	}
+}
+
+func (f *fleet) request(method, path string, body any) (*http.Response, string) {
+	f.t.Helper()
+	var reader io.Reader = bytes.NewReader(nil)
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			f.t.Fatal(err)
+		}
+		reader = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequest(method, f.server.URL+path, reader)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth("admin", "correct-horse-battery")
+	resp, err := f.server.Client().Do(req)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	payload, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	return resp, string(payload)
+}
+
+func (f *fleet) mustRequest(method, path string, body any, wantStatus int) string {
+	f.t.Helper()
+	resp, payload := f.request(method, path, body)
+	if resp.StatusCode != wantStatus {
+		f.t.Fatalf("%s %s answered %d, want %d: %s", method, path, resp.StatusCode, wantStatus, payload)
+	}
+	return payload
+}
+
+func (f *fleet) addCredential() int64 {
+	f.t.Helper()
+	payload := f.mustRequest("POST", "/api/credentials", map[string]string{
+		"name": "pat", "token": "github_pat_11TESTVALUE",
+	}, http.StatusCreated)
+	var credential model.Credential
+	if err := json.Unmarshal([]byte(payload), &credential); err != nil {
+		f.t.Fatal(err)
+	}
+	return credential.ID
+}
+
+func (f *fleet) addPool(pool map[string]any) model.Pool {
+	f.t.Helper()
+	payload := f.mustRequest("POST", "/api/pools", pool, http.StatusCreated)
+	var created model.Pool
+	if err := json.Unmarshal([]byte(payload), &created); err != nil {
+		f.t.Fatal(err)
+	}
+	return created
+}
+
+func vmPool(credentialID int64, replicas int) map[string]any {
+	return map[string]any{
+		"name": "web", "scopeKind": "repository", "scope": "clems4ever/runyard",
+		"runtime": "vm", "replicas": replicas, "ephemeral": true,
+		"credentialId": credentialID, "enabled": true,
+	}
+}
+
+// The ordinary path: a credential, a pool, and runners appear.
+func TestCreatingAPoolBringsUpRunners(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 3))
+	f.reconcileNow()
+
+	if got := strings.Join(f.vm.names(), ","); got != "web-1,web-2,web-3" {
+		t.Fatalf("got %q", got)
+	}
+
+	// And the API reports them, with what the host and GitHub each say.
+	payload := f.mustRequest("GET", "/api/runners", nil, http.StatusOK)
+	var body struct {
+		Runners []reconcile.RunnerStatus `json:"runners"`
+	}
+	json.Unmarshal([]byte(payload), &body)
+	if len(body.Runners) != 3 || body.Runners[0].State != reconcile.StateRunning {
+		t.Fatalf("got %+v", body.Runners)
+	}
+	if !body.Runners[0].UpToDate {
+		t.Fatal("a runner created a moment ago is not up to date")
+	}
+}
+
+func TestScalingAPool(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	pool := f.addPool(vmPool(credential, 1))
+	f.reconcileNow()
+
+	up := vmPool(credential, 4)
+	f.mustRequest("PUT", fmt.Sprintf("/api/pools/%d", pool.ID), up, http.StatusOK)
+	f.reconcileNow()
+	if got := len(f.vm.names()); got != 4 {
+		t.Fatalf("scaling up left %d runners", got)
+	}
+
+	down := vmPool(credential, 2)
+	f.mustRequest("PUT", fmt.Sprintf("/api/pools/%d", pool.ID), down, http.StatusOK)
+	f.reconcileNow()
+	// Still four: the extra two are draining, not gone. Removing them now
+	// would fail whatever they are running.
+	if got := len(f.vm.names()); got != 4 {
+		t.Fatalf("scaling down removed runners immediately: %v", f.vm.names())
+	}
+
+	f.vm.jobsFinish()
+	f.reconcileNow()
+	if got := strings.Join(f.vm.names(), ","); got != "web-1,web-2" {
+		t.Fatalf("after draining: %q", got)
+	}
+}
+
+// Changing anything but the replica count replaces the runners, and it does it
+// without failing a job.
+func TestChangingLabelsReplacesRunnersGracefully(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	pool := f.addPool(vmPool(credential, 2))
+	f.reconcileNow()
+	f.vm.created = nil
+
+	relabelled := vmPool(credential, 2)
+	relabelled["labels"] = []string{"gpu"}
+	f.mustRequest("PUT", fmt.Sprintf("/api/pools/%d", pool.ID), relabelled, http.StatusOK)
+
+	f.reconcileNow()
+	if len(f.vm.created) != 0 {
+		t.Fatalf("runners were rebuilt before the old ones stopped: %v", f.vm.created)
+	}
+
+	// The UI shows them as superseded while they finish.
+	payload := f.mustRequest("GET", "/api/runners", nil, http.StatusOK)
+	if !strings.Contains(payload, `"upToDate":false`) {
+		t.Fatalf("the runners are not flagged as out of date: %s", payload)
+	}
+
+	f.vm.jobsFinish()
+	f.reconcileNow()
+	if got := strings.Join(f.vm.created, ","); got != "web-1,web-2" {
+		t.Fatalf("the replacements were %q", got)
+	}
+}
+
+// The reason the daemon is a reconciler rather than a supervisor.
+func TestRestartingTheDaemonLeavesTheFleetAlone(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 3))
+	f.reconcileNow()
+	before := strings.Join(f.vm.names(), ",")
+	f.vm.created = nil
+
+	// An upgrade: the process goes away and a new one takes over the same
+	// database and the same host.
+	f.start()
+	f.reconcileNow()
+
+	if len(f.vm.created) != 0 {
+		t.Fatalf("the new daemon rebuilt runners that were already running: %v", f.vm.created)
+	}
+	if after := strings.Join(f.vm.names(), ","); after != before {
+		t.Fatalf("the fleet changed across a restart: %q then %q", before, after)
+	}
+}
+
+// Nothing the operator can do through the UI may kill a job.
+func TestABusyRunnerSurvivesEverything(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	pool := f.addPool(vmPool(credential, 2))
+	f.reconcileNow()
+	f.gh.setBusy("web-1")
+
+	// Delete the whole pool while a job is running on web-1.
+	f.mustRequest("DELETE", fmt.Sprintf("/api/pools/%d", pool.ID), nil, http.StatusNoContent)
+	f.reconcileNow()
+	f.vm.jobsFinish() // the host reports both units stopped
+	f.reconcileNow()
+
+	names := f.vm.names()
+	if len(names) != 1 || names[0] != "web-1" {
+		t.Fatalf("got %v, want the busy runner still there and the idle one gone", names)
+	}
+}
+
+func TestDisablingAPoolDrainsItAndKeepsTheConfiguration(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	pool := f.addPool(vmPool(credential, 2))
+	f.reconcileNow()
+
+	disabled := vmPool(credential, 2)
+	disabled["enabled"] = false
+	f.mustRequest("PUT", fmt.Sprintf("/api/pools/%d", pool.ID), disabled, http.StatusOK)
+	f.reconcileNow()
+	f.vm.jobsFinish()
+	f.reconcileNow()
+
+	if len(f.vm.names()) != 0 {
+		t.Fatalf("a disabled pool still has %v", f.vm.names())
+	}
+	// The pool itself is still there, with its settings.
+	payload := f.mustRequest("GET", fmt.Sprintf("/api/pools/%d", pool.ID), nil, http.StatusOK)
+	if !strings.Contains(payload, `"replicas":2`) {
+		t.Fatalf("the configuration was lost: %s", payload)
+	}
+}
+
+func TestPoolsOfDifferentRuntimesCoexist(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 1))
+	f.addPool(map[string]any{
+		"name": "api", "scopeKind": "organization", "scope": "runyard-ai",
+		"runtime": "container", "replicas": 2, "nested": true,
+		"credentialId": credential, "enabled": true,
+	})
+	f.reconcileNow()
+
+	if got := strings.Join(f.vm.names(), ","); got != "web-1" {
+		t.Fatalf("machines: %q", got)
+	}
+	if got := strings.Join(f.containers.names(), ","); got != "api-1,api-2" {
+		t.Fatalf("containers: %q", got)
+	}
+}
+
+// Rotating a token must reach the runners, which means replacing them.
+func TestRotatingACredentialSupersedesTheRunners(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 1))
+	f.reconcileNow()
+	f.vm.created = nil
+
+	f.mustRequest("PUT", fmt.Sprintf("/api/credentials/%d/token", credential),
+		map[string]string{"token": "github_pat_11ROTATED"}, http.StatusNoContent)
+
+	f.reconcileNow()
+	f.vm.jobsFinish()
+	f.reconcileNow()
+
+	if got := strings.Join(f.vm.created, ","); got != "web-1" {
+		t.Fatalf("the runner was not rebuilt with the new credential: %v", f.vm.created)
+	}
+}
+
+// The database is the desired state and has to survive a restart intact.
+func TestConfigurationSurvivesARestart(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 2))
+
+	f.start()
+
+	payload := f.mustRequest("GET", "/api/pools", nil, http.StatusOK)
+	if !strings.Contains(payload, `"name":"web"`) {
+		t.Fatalf("the pool did not survive: %s", payload)
+	}
+	// And the credential is still usable, which means the key was reloaded and
+	// still decrypts what the last process wrote.
+	token, err := f.store.Token(context.Background(), credential)
+	if err != nil || token != "github_pat_11TESTVALUE" {
+		t.Fatalf("got %q, %v", token, err)
+	}
+}
+
+// A fleet the operator never touches must not drift: a reconciler that acted
+// on a settled fleet would restart runners for ever.
+func TestASettledFleetIsLeftAlone(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 2))
+	f.reconcileNow()
+
+	for i := 0; i < 5; i++ {
+		f.vm.created = nil
+		result := f.reconciler.Once(context.Background())
+		if len(result.Actions) != 0 {
+			t.Fatalf("pass %d wanted to do %+v", i, result.Actions)
+		}
+	}
+}
