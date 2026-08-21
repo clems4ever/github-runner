@@ -105,7 +105,22 @@ if test_case "cpu-vendor"; then
   cpu_vendor() { echo amd; }
   is "amd module"   "kvm_amd"   "$(kvm_module)"
   is "amd flag"     "svm"       "$(nested_flag)"
+  # What a VM is actually given. "-cpu host" alone would leak the host's
+  # virtualisation extensions into every guest on a host that has nested
+  # enabled, so the off case masks the flag rather than saying nothing.
+  cpu_vendor() { echo intel; }
+  VM_NESTED=true;  is "nested exposes the flag"  "host,+vmx" "$(cpu_model)"
+  VM_NESTED=false; is "off masks it"             "host,-vmx" "$(cpu_model)"
+  cpu_vendor() { echo amd; }
+  VM_NESTED=true;  is "the amd flag likewise"    "host,+svm" "$(cpu_model)"
+  VM_NESTED=false; is "and is masked likewise"   "host,-svm" "$(cpu_model)"
+
   cpu_vendor() { echo unknown; }
+  is "no flag to name, so none is named" "host" "$(cpu_model)"
+  VM_NESTED=true
+  is "even when asked for"               "host" "$(cpu_model)"
+  VM_NESTED=false
+
   is "unknown module" ""        "$(kvm_module)"
   is "unknown flag"   ""        "$(nested_flag)"
   unset -f cpu_vendor
@@ -501,7 +516,7 @@ if test_case "service-config"; then
   contains "says which runner it belongs to" "$(service_env_file web)" "runner-vm@web"
   GITHUB_URL=https://github.com/o/r
 
-  VM_CPUS=2 VM_MEMORY_MB=4096 VM_DISK_GB=40 VM_NESTED=true RUNNER_GROUP=Default EPHEMERAL=false
+  VM_CPUS=2 VM_MEMORY_MB=4096 VM_DISK_GB=40 VM_NESTED=false RUNNER_GROUP=Default EPHEMERAL=false
 fi
 
 # The unit hands systemd the whole credentials directory, because a template
