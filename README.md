@@ -5,9 +5,9 @@
 Run [self-hosted GitHub Actions runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/about-self-hosted-runners)
 in throwaway QEMU virtual machines. One VM per runner, deleted when it stops.
 
-A job gets a machine of its own: its own Docker daemon, its own `/dev/kvm` so
-it can boot VMs, and a kernel it is free to break. Nothing it does survives
-into the next job.
+A job gets a machine of its own: its own Docker daemon, a kernel it is free to
+break, and `/dev/kvm` too if you install the runner with `--nested`. Nothing it
+does survives into the next job.
 
 It is one bash script with no dependencies beyond QEMU.
 
@@ -26,11 +26,16 @@ curl -fsSL https://raw.githubusercontent.com/clems4ever/github-runner/main/runne
 sudo runner-vm.sh doctor
 ```
 
-It prints the fix for anything missing — usually installing QEMU, or turning on
-nested virtualisation:
+It prints the fix for anything missing — usually installing QEMU:
 
 ```bash
 sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
+```
+
+Only if you want jobs to boot VMs of their own, the host needs nested
+virtualisation on as well:
+
+```bash
 echo 'options kvm_amd nested=1' | sudo tee /etc/modprobe.d/kvm_amd.conf   # kvm_intel on Intel
 sudo modprobe -r kvm_amd && sudo modprobe kvm_amd nested=1
 ```
@@ -211,7 +216,7 @@ jobs:
     runs-on: self-hosted
     steps:
       - run: docker run --rm hello-world   # the VM's own daemon
-      - run: kvm-ok                        # nested virtualisation
+      - run: kvm-ok                        # only with --nested
 ```
 
 ## How it works
@@ -249,7 +254,7 @@ Every flag has an environment variable equivalent.
 | `--memory` | `VM_MEMORY_MB` | `4096` | Memory, MiB |
 | `--disk` | `VM_DISK_GB` | `40` | Disk, GiB |
 | `--ephemeral` | `EPHEMERAL` | `false` | One job per VM |
-| `--no-nested` | `VM_NESTED` | nested on | Do not expose `vmx`/`svm` |
+| `--nested` | `VM_NESTED` | off | Expose `vmx`/`svm`, so jobs can boot VMs of their own |
 | `--replicas` | `REPLICAS` | `1` | How many runners `install --service` sets up on the repository |
 
 With `--ephemeral` the runner takes one job, the VM powers off, and under
@@ -274,9 +279,14 @@ GitHub recommends self-hosted runners only for **private** repositories: on a
 public one, a pull request from a fork can run arbitrary code on the runner.
 
 A VM is a much harder boundary than a container, and the only way to give a job
-Docker and `/dev/kvm` without handing over the host. It is not a promise,
+Docker — or `/dev/kvm` — without handing over the host. It is not a promise,
 though: a job can still exhaust the host's memory and CPU, and a VM only gets a
 clean disk when it is replaced — use `--ephemeral` if you want that per job.
+
+Nested virtualisation is off unless a runner is installed with `--nested`, and
+that is deliberate: it is the largest piece of the host's CPU a job gets to
+touch. Turning it on is per runner, so a repository that needs it does not
+hand it to every other repository on the host.
 
 ## Licence
 
