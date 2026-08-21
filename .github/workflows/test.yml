@@ -18,7 +18,7 @@ jobs:
       - name: Install what the tests need
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck python3-yaml
+          sudo apt-get install -y --no-install-recommends shellcheck python3-yaml jq
 
       - name: Shellcheck
         run: shellcheck -S warning runner-vm.sh tests/run-tests.sh

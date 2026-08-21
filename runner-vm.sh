@@ -72,6 +72,11 @@ set -euo pipefail
 #   --no-build            do not build the golden image
 #   --no-start            do not enable and start the service
 #
+# Flags for list:
+#   --jobs                ask GitHub what each runner is doing — busy, idle or
+#                         offline — rather than only what its VM is doing.
+#                         Needs the credential, so run it with sudo, and jq
+#
 # Flags for clean:
 #   [NAME...]             remove only these VMs, leaving the others alone
 #   --all                 also delete the images and the ssh key, i.e. all of
@@ -207,6 +212,9 @@ DISABLE_UPDATE=${DISABLE_UPDATE:-false}
 # instance with a VM of its own, so this is how many jobs that repository can
 # run at once on this host.
 REPLICAS=${REPLICAS:-1}
+# Whether "list" asks GitHub what each runner is doing. Off by default: it is
+# the one thing in that command that needs the network and a credential.
+SHOW_JOBS=false
 
 # Where the script fetches itself from when it was piped into bash and so has
 # no file of its own to install. Override when installing from a branch, or
@@ -1748,6 +1756,31 @@ configured_field() {
   return 0
 }
 
+# runner_states asks GitHub what the runners registered for one scope are
+# doing, printing "name<TAB>state" lines — busy, idle, or offline.
+#
+# Whether a job is on a runner is only knowable from GitHub: the host can see
+# that a VM is running, not that anything is happening inside it. One call per
+# scope rather than per runner, so three replicas on one repository ask once.
+runner_states() {
+  local url=$1 prefix
+  prefix=$(github_api_prefix "$url")
+  api_call GET "${prefix}/actions/runners?per_page=100" 2>/dev/null \
+    | jq -r '.runners[]? | .name + "\t" +
+        (if .status != "online" then "offline" elif .busy then "busy" else "idle" end)' \
+    2>/dev/null || true
+}
+
+# list_token finds a credential for a runner without the service's help, since
+# "list" is run by hand. Root-only, like the files it reads.
+list_token() {
+  local name=$1 file
+  [[ -z "$GITHUB_TOKEN" ]] || { printf '%s' "$GITHUB_TOKEN"; return 0; }
+  file=$(stored_credential "$name")
+  [[ -n "$file" && -r "$file" ]] || return 0
+  read_secret "$file" 2>/dev/null || true
+}
+
 # short_scope turns a URL into owner/repo, which is what identifies a runner at
 # a glance; the scheme and host are the same for every row.
 short_scope() {
@@ -1779,15 +1812,31 @@ cmd_list() {
     return 0
   fi
 
-  printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-6s %-10s %s\n' \
-    NAME STATE SERVICE CPU MEM DISK NESTED SSH UPTIME REPO
+  # The extra column is only there when it was asked for: it costs a network
+  # call per repository, and a row of dashes would cost width on every other
+  # run of this command.
+  if [[ "$SHOW_JOBS" == "true" ]]; then
+    printf '%-16s %-9s %-9s %-8s %-5s %-5s %-7s %-6s %-6s %-10s %s\n' \
+      NAME STATE SERVICE JOB CPU MEM DISK NESTED SSH UPTIME REPO
+  else
+    printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-6s %-10s %s\n' \
+      NAME STATE SERVICE CPU MEM DISK NESTED SSH UPTIME REPO
+  fi
 
+  # What GitHub says each runner is doing, filled in once per scope. Say why
+  # the column will be empty rather than printing dashes and leaving the reason
+  # to be guessed.
+  if [[ "$SHOW_JOBS" == "true" ]] && ! have jq; then
+    warn "jq is not installed, so --jobs cannot read GitHub's answer"
+  fi
+  local -A job_state=() scope_asked=()
+  local job url token rname rstate
   local pid port state uptime cpus mem disk nested repo service ephemeral
   while read -r name; do
     [[ -n "$name" ]] || continue
     dir=$(vm_dir_for "$name" || true)
 
-    pid=""; port="-"; uptime="-"; ephemeral=""
+    pid=""; port="-"; uptime="-"; ephemeral=""; url=""; job="-"
     cpus="-"; mem="-"; disk="-"; repo="-"; nested="-"
 
     if [[ -n "$dir" ]]; then
@@ -1801,7 +1850,7 @@ cmd_list() {
       # and not yet restarted reads as what it is running with, not what it
       # will run with next time.
       nested=$(meta_field "$dir" NESTED); nested=${nested:--}
-      repo=$(short_scope "$(meta_field "$dir" URL)"); repo=${repo:--}
+      url=$(meta_field "$dir" URL)
       [[ "$(meta_field "$dir" EPHEMERAL)" == "true" ]] && ephemeral="*"
     fi
 
@@ -1812,10 +1861,8 @@ cmd_list() {
     # recorded a size. Read per runner, or every row would claim the repository
     # of whichever one happens to be the host-wide default.
     local configured
-    if [[ "$repo" == "-" ]]; then
-      repo=$(short_scope "$(configured_field "$name" GITHUB_URL)")
-      repo=${repo:--}
-    fi
+    [[ -n "$url" ]] || url=$(configured_field "$name" GITHUB_URL)
+    repo=$(short_scope "$url"); repo=${repo:--}
     if [[ "$cpus" == "-" ]]; then
       configured=$(configured_field "$name" VM_CPUS)
       [[ -n "$configured" ]] && cpus=$configured
@@ -1839,6 +1886,23 @@ cmd_list() {
     # Only "true" is true to the rest of the script, so anything else is off.
     if [[ "$nested" == "true" ]]; then nested=yes; else nested=no; fi
 
+    if [[ "$SHOW_JOBS" == "true" && -n "$url" ]]; then
+      if [[ -z "${scope_asked[$url]:-}" ]]; then
+        scope_asked[$url]=1
+        token=$(list_token "$name")
+        if [[ -z "$token" ]]; then
+          warn "no credential readable for ${repo}; --jobs needs the one in ${CRED_DIR}, so run this with sudo"
+        else
+          while IFS=$'\t' read -r rname rstate; do
+            [[ -n "$rname" ]] && job_state[$rname]=$rstate
+          done < <(GITHUB_TOKEN=$token runner_states "$url")
+        fi
+      fi
+      # A runner GitHub has never heard of is not the same as an idle one, so
+      # it stays a dash rather than being called idle.
+      job=${job_state[$name]:--}
+    fi
+
     if pid_alive "$pid"; then
       state=running
       uptime=$(ps -o etime= -p "$pid" 2>/dev/null | tr -d ' ' || true)
@@ -1857,8 +1921,13 @@ cmd_list() {
       [[ -n "$service" ]] || service="-"
     fi
 
-    printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-6s %-10s %s\n' \
-      "$name" "$state" "$service" "$cpus" "$mem" "$disk" "$nested" "$port" "$uptime" "${repo}${ephemeral}"
+    if [[ "$SHOW_JOBS" == "true" ]]; then
+      printf '%-16s %-9s %-9s %-8s %-5s %-5s %-7s %-6s %-6s %-10s %s\n' \
+        "$name" "$state" "$service" "$job" "$cpus" "$mem" "$disk" "$nested" "$port" "$uptime" "${repo}${ephemeral}"
+    else
+      printf '%-16s %-9s %-9s %-5s %-5s %-7s %-6s %-6s %-10s %s\n' \
+        "$name" "$state" "$service" "$cpus" "$mem" "$disk" "$nested" "$port" "$uptime" "${repo}${ephemeral}"
+    fi
   done <<<"$names"
 
   echo
@@ -2499,6 +2568,7 @@ main() {
       --name=*)         RUNNER_NAME=${1#*=}; shift ;;
       --replicas)       REPLICAS=$2; shift 2 ;;
       --replicas=*)     REPLICAS=${1#*=}; shift ;;
+      --jobs)           SHOW_JOBS=true; shift ;;
       --labels)         RUNNER_LABELS=$2; shift 2 ;;
       --labels=*)       RUNNER_LABELS=${1#*=}; shift ;;
       --group)          RUNNER_GROUP=$2; shift 2 ;;

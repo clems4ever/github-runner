@@ -153,7 +153,7 @@ account need one runner each.
 | `doctor` | Check KVM, nested virtualisation and QEMU, and say how to fix what is missing |
 | `build` | Build the golden image the VMs boot from |
 | `run` | Boot a VM and run a runner in it until stopped |
-| `list` | The VMs on this host: state, repository, size, nested virtualisation, ssh port, uptime |
+| `list` | The VMs on this host: state, repository, size, nested virtualisation, ssh port, uptime. `--jobs` adds what GitHub says each runner is doing |
 | `install` | Install this script; `--service` also sets up systemd |
 | `clean` | Stop the services and VMs and delete their disks, keeping the image cache |
 | `uninstall` | Remove everything: services, unit, configuration, state, the script |
@@ -259,6 +259,41 @@ Every flag has an environment variable equivalent.
 
 With `--ephemeral` the runner takes one job, the VM powers off, and under
 systemd `Restart=always` starts a clean one — a genuinely fresh machine per job.
+
+## Stopping without failing a job
+
+Stopping a service is already safe: `systemctl stop` reaches the script, which
+asks the guest to power off, which lets the guest's runner finish the job it is
+on before the VM goes away. It waits up to an hour (`TimeoutStopSec=3660`), so a
+`clean` or a `restart` on a busy runner is slow rather than destructive. The same
+is true of `uninstall`, which stops the services first.
+
+The exception is a VM started by hand rather than by a service. Those are killed
+after 15 seconds and then `kill -9`'d, which is a power cut — whatever the job was
+doing is lost.
+
+To see what is going on before touching anything, ask GitHub rather than the host:
+a running VM tells you nothing about whether a job is inside it.
+
+```bash
+sudo runner-vm.sh list --jobs
+```
+
+```
+NAME             STATE     SERVICE   JOB      CPU   MEM   DISK    NESTED SSH    UPTIME     REPO
+claude-control-1 running   active    busy     2     4096M 40G     no     2225   00:13      clems4ever/claude-control*
+claude-control-2 running   active    idle     2     4096M 40G     no     2226   01:37      clems4ever/claude-control*
+claude-control-3 running   active    offline  2     4096M 40G     no     2227   01:37      clems4ever/claude-control*
+```
+
+`busy` is a job right now, `idle` is registered and waiting, `offline` is
+registered but not connected — a VM that has not booted or has died. A dash means
+GitHub has no runner by that name at all. It needs the credential, so run it with
+`sudo`, and it needs `jq`.
+
+It is a snapshot, not a lock: a job can be handed to an idle runner a second after
+you look. For a runner you are about to remove, stopping its service first is what
+actually guarantees the job finishes.
 
 ## Tests
 
