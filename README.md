@@ -260,6 +260,26 @@ Every flag has an environment variable equivalent.
 With `--ephemeral` the runner takes one job, the VM powers off, and under
 systemd `Restart=always` starts a clean one — a genuinely fresh machine per job.
 
+## When a job fails before it runs a step
+
+Every job starts by downloading the actions it uses from
+`codeload.github.com`, and those requests are **anonymous**, so they are
+rate-limited per source IP:
+
+```
+Failed to download action 'https://codeload.github.com/actions/checkout/tar.gz/...'
+Error: Response status code does not indicate success: 429 (Too Many Requests).
+```
+
+The job dies in *Set up job*, with nothing of its own having run, which reads as
+though the runner is broken. It is not, and it is not specific to self-hosted
+runners either — the same 429 turns up on GitHub-hosted ones when the service is
+busy. A host with a fixed egress address makes it likelier than a hosted runner
+getting a fresh address per job, but that is the whole of the difference.
+
+Retrying is usually enough. If it is persistent, the durable answers are to use
+fewer network-fetched actions, or to bake the ones you rely on into the image.
+
 ## Tests
 
 ```bash
