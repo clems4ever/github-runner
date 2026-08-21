@@ -436,6 +436,60 @@ if test_case "list-per-runner"; then
   is "nothing for a key nobody sets"        ""                            "$(configured_field web RUNNER_LABELS)"
 fi
 
+# Whether a job is on a runner is only knowable from GitHub: the host can see
+# that a VM is running, not that anything is happening inside it.
+if test_case "runner-jobs"; then
+  if have jq; then
+    # Counted in a file, not a variable: cmd_list is read through a command
+    # substitution, and a subshell cannot hand a counter back.
+    api_call() {
+      echo call >> "$WORK/api-calls"
+      cat <<'J'
+{"total_count":3,"runners":[
+ {"id":1,"name":"web-1","status":"online","busy":true},
+ {"id":2,"name":"web-2","status":"online","busy":false},
+ {"id":3,"name":"web-3","status":"offline","busy":false}]}
+J
+    }
+    : > "$WORK/api-calls"
+    states=$(runner_states https://github.com/o/web)
+    contains "a runner on a job is busy"        "$states" "web-1	busy"
+    contains "one waiting for work is idle"     "$states" "web-2	idle"
+    # Offline is not idle: the VM is gone or has not registered, and calling
+    # that idle would read as "safe to remove" for the one case it is not.
+    contains "one GitHub cannot see is offline" "$states" "web-3	offline"
+
+    STATE_DIR="$WORK/jobs-state"; SERVICE_STATE="$WORK/jobs-service"
+    ETC_DIR="$WORK/jobs-etc"; CRED_DIR="$ETC_DIR/creds"
+    mkdir -p "$CRED_DIR" "$STATE_DIR"
+    printf 'tok' > "$CRED_DIR/pat"
+    for n in web-1 web-2 web-3; do
+      mkdir -p "$SERVICE_STATE/vms/$n"
+      printf 'NAME=%s\nURL=https://github.com/o/web\nCPUS=2\nMEMORY_MB=4096\nDISK_GB=40\nNESTED=false\n' \
+        "$n" > "$SERVICE_STATE/vms/$n/meta"
+    done
+
+    : > "$WORK/api-calls"
+    SHOW_JOBS=true
+    out=$(cmd_list)
+    SHOW_JOBS=false
+    contains "the column is only there when asked for" "$out" "JOB"
+    # By field rather than by the whole row: what the SERVICE column says
+    # depends on whether the machine running these tests has systemd.
+    job_of() { awk -v n="$1" '$1 == n { print $4 }' <<<"$out"; }
+    is "a runner on a job reads busy"    "busy"    "$(job_of web-1)"
+    is "one waiting for work reads idle" "idle"    "$(job_of web-2)"
+    is "and a missing one reads offline" "offline" "$(job_of web-3)"
+    # Three replicas on one repository are one question, not three.
+    is "one call serves every runner in a scope" "1" "$(grep -c . "$WORK/api-calls")"
+
+    lacks "no column without the flag" "$(cmd_list)" "JOB"
+
+    unset -f api_call
+    ETC_DIR=${RUNNER_VM_ETC:-/etc/runner-vm}; CRED_DIR="${ETC_DIR}/creds"
+  fi
+fi
+
 if test_case "clean"; then
   STATE_DIR="$WORK/clean-state"
   mkdir -p "$STATE_DIR/vms/gone" "$STATE_DIR/images"
