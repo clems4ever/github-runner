@@ -74,8 +74,27 @@ systemd unit, and starts `runner-vm@runner-1`. It comes back after a reboot.
 ```bash
 runner-vm.sh list                         # what is running
 sudo journalctl -u runner-vm@runner-1 -f  # what it is doing
-sudo systemctl enable --now runner-vm@runner-2   # another one, same repository
 ```
+
+## More runners for the same repository
+
+One runner takes one job at a time. `--replicas` sets up several, each with a VM
+of its own, so the repository can run that many jobs at once:
+
+```bash
+sudo runner-vm.sh install --service --name web \
+  --url https://github.com/OWNER/REPO --replicas 3
+```
+
+They are named `web-1`, `web-2`, `web-3` and get a configuration file each, so
+raising the count later leaves the runners already going untouched, and one of
+them can be given a different size or labels by editing its own file. Lowering
+it does not stop anything — install names the runners left over and prints the
+command to remove them, because stopping one is stopping a machine that may be
+halfway through a job.
+
+Size the total against the host: three runners at the default 4 GiB want 12 GiB
+of RAM and three cores' worth of contention, plus a 40 GiB disk each.
 
 ## Several repositories on one host
 
@@ -231,6 +250,7 @@ Every flag has an environment variable equivalent.
 | `--disk` | `VM_DISK_GB` | `40` | Disk, GiB |
 | `--ephemeral` | `EPHEMERAL` | `false` | One job per VM |
 | `--no-nested` | `VM_NESTED` | nested on | Do not expose `vmx`/`svm` |
+| `--replicas` | `REPLICAS` | `1` | How many runners `install --service` sets up on the repository |
 
 With `--ephemeral` the runner takes one job, the VM powers off, and under
 systemd `Restart=always` starts a clean one — a genuinely fresh machine per job.

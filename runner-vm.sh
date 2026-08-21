@@ -62,6 +62,8 @@ set -euo pipefail
 #                         Its settings go to /etc/runner-vm/env.NAME, so
 #                         installing again under another name adds a runner
 #                         rather than repointing the ones already there
+#   --replicas N          set up N runners on this repository rather than one,
+#                         named NAME-1 to NAME-N, so it can take N jobs at once
 #   --no-build            do not build the golden image
 #   --no-start            do not enable and start the service
 #
@@ -196,6 +198,10 @@ RUNNER_LABELS=${RUNNER_LABELS:-}
 RUNNER_GROUP=${RUNNER_GROUP:-Default}
 EPHEMERAL=${EPHEMERAL:-false}
 DISABLE_UPDATE=${DISABLE_UPDATE:-false}
+# How many runners install sets up for one repository. Each is a service
+# instance with a VM of its own, so this is how many jobs that repository can
+# run at once on this host.
+REPLICAS=${REPLICAS:-1}
 
 # Where the script fetches itself from when it was piped into bash and so has
 # no file of its own to install. Override when installing from a branch, or
@@ -2053,34 +2059,58 @@ migrate_flat_credentials() {
   done
 }
 
-# store_credentials files whatever credential this install brought with it.
+# replica_names prints the service instances install will set up: the name
+# itself for a single runner, and NAME-1 to NAME-N for several.
+#
+# One runner keeps its plain name so that the usual case reads the way it did
+# before replicas existed, and so a host that has always had one runner does
+# not get a second under a new name on the next install.
+replica_names() {
+  local base=$1 count=$2 i
+  if [[ "$count" -le 1 ]]; then
+    echo "$base"
+    return 0
+  fi
+  for ((i = 1; i <= count; i++)); do
+    echo "${base}-${i}"
+  done
+}
+
+# write_credential puts a secret in a file only root can read.
+#
+# Created empty at 0600 before anything is written to it: a plain redirect
+# would make it world-readable for the instant between creation and chmod.
+write_credential() {
+  local path=$1 value=$2
+  install -m 0600 /dev/null "$path"
+  printf '%s' "$value" > "$path"
+}
+
+# store_credentials files whatever credential this install brought with it, for
+# every runner it is setting up.
 #
 # The first one on the host becomes the host-wide default, so a second
 # repository added later needs no token of its own; a different one is stored
-# under the runner's name and wins for that runner alone. A token identical to
-# the shared one is not copied — two files holding the same secret are two
+# under each runner's name and wins for those runners alone. A token identical
+# to the shared one is not copied — two files holding the same secret are two
 # files to rotate.
 store_credentials() {
-  local instance=$1 token=$2 dest
+  local token=$1; shift
+  local -a instances=("$@")
+  local instance
 
   if [[ -n "$token" ]]; then
     if [[ ! -e "${CRED_DIR}/pat" ]]; then
-      dest="${CRED_DIR}/pat"
+      write_credential "${CRED_DIR}/pat" "$token"
+      log "stored the credential in ${CRED_DIR}/pat (0600, root), the default for every runner here"
     elif [[ "$(read_secret "${CRED_DIR}/pat")" == "$token" ]]; then
-      dest=""
-      rm -f "${CRED_DIR}/pat.${instance}"
-    else
-      dest="${CRED_DIR}/pat.${instance}"
-    fi
-    if [[ -n "$dest" ]]; then
-      # Created empty at 0600 before anything is written to it: a plain
-      # redirect would make it world-readable for the instant between creation
-      # and chmod.
-      install -m 0600 /dev/null "$dest"
-      printf '%s' "$token" > "$dest"
-      log "stored the credential in ${dest} (0600, root)"
-    else
+      for instance in "${instances[@]}"; do rm -f "${CRED_DIR}/pat.${instance}"; done
       log "the credential is already in ${CRED_DIR}/pat, shared by every runner here"
+    else
+      for instance in "${instances[@]}"; do
+        write_credential "${CRED_DIR}/pat.${instance}" "$token"
+        log "stored the credential in ${CRED_DIR}/pat.${instance} (0600, root)"
+      done
     fi
   fi
 
@@ -2088,18 +2118,33 @@ store_credentials() {
   # left where it is rather than copied onto itself.
   if [[ -n "$GITHUB_APP_PRIVATE_KEY" && "$GITHUB_APP_PRIVATE_KEY" != "${CRED_DIR}"/* ]]; then
     if [[ ! -e "${CRED_DIR}/app.pem" ]]; then
-      dest="${CRED_DIR}/app.pem"
+      install -m 0600 "$GITHUB_APP_PRIVATE_KEY" "${CRED_DIR}/app.pem"
+      log "stored the app key in ${CRED_DIR}/app.pem (0600, root), the default for every runner here"
     elif cmp -s "$GITHUB_APP_PRIVATE_KEY" "${CRED_DIR}/app.pem"; then
-      dest=""
-      rm -f "${CRED_DIR}/app.${instance}.pem"
+      for instance in "${instances[@]}"; do rm -f "${CRED_DIR}/app.${instance}.pem"; done
     else
-      dest="${CRED_DIR}/app.${instance}.pem"
-    fi
-    if [[ -n "$dest" ]]; then
-      install -m 0600 "$GITHUB_APP_PRIVATE_KEY" "$dest"
-      log "stored the app key in ${dest} (0600, root)"
+      for instance in "${instances[@]}"; do
+        install -m 0600 "$GITHUB_APP_PRIVATE_KEY" "${CRED_DIR}/app.${instance}.pem"
+        log "stored the app key in ${CRED_DIR}/app.${instance}.pem (0600, root)"
+      done
     fi
   fi
+}
+
+# stale_replicas prints the runners a previous, larger --replicas left behind,
+# so install can name them rather than quietly leaving them running on the old
+# configuration — or silently deleting a machine that may be mid-job.
+stale_replicas() {
+  local base=$1 count=$2 file name index
+  shopt -s nullglob
+  for file in "${ETC_DIR}/env.${base}-"*; do
+    name=$(basename "$file"); name=${name#env.}
+    index=${name##*-}
+    [[ "$index" =~ ^[0-9]+$ ]] || continue
+    [[ "$count" -gt 1 && "$index" -le "$count" ]] && continue
+    echo "$name"
+  done
+  shopt -u nullglob
 }
 
 # cmd_install puts the script, the unit and the service user in place. It is
@@ -2137,7 +2182,12 @@ cmd_install() {
 
   require_host
 
-  local instance=${RUNNER_NAME:-runner-1}
+  [[ "$REPLICAS" =~ ^[0-9]+$ && "$REPLICAS" -ge 1 ]] \
+    || die "--replicas takes a whole number of runners, not '${REPLICAS}'"
+
+  local base=${RUNNER_NAME:-runner-1}
+  local -a instances=()
+  mapfile -t instances < <(replica_names "$base" "$REPLICAS")
 
   # Check the credential before anything slow. Discovering a bad token after
   # six minutes of building an image is the wrong order to find out.
@@ -2148,7 +2198,7 @@ cmd_install() {
   # is already there, not to fail.
   local supplied_token=$GITHUB_TOKEN
   if [[ -z "$GITHUB_TOKEN" && -z "$GITHUB_APP_ID" && -z "$RUNNER_TOKEN" ]]; then
-    local existing; existing=$(stored_credential "$instance")
+    local existing; existing=$(stored_credential "${instances[0]}")
     if [[ -n "$existing" ]]; then
       GITHUB_TOKEN=$(read_secret "$existing")
       log "no credential given; using the one already in ${existing}"
@@ -2212,14 +2262,21 @@ cmd_install() {
   install -d -m 0700 "$CRED_DIR"
   migrate_flat_credentials
 
-  # This runner's own file, never the shared one: installing a second
+  # Each runner's own file, never the shared one: installing a second
   # repository must not repoint the runners already on the host, which is
-  # exactly what writing GITHUB_URL to the shared file used to do.
-  local instance_env="${ETC_DIR}/env.${instance}"
-  install -m 0600 /dev/null "$instance_env"
-  service_env_file "$instance" > "$instance_env"
-  log "wrote ${instance_env} (${VM_CPUS} vCPU, ${VM_MEMORY_MB} MiB, ${VM_DISK_GB} GiB)"
-  [[ -n "$GITHUB_URL" ]] || warn "no --url given; put GITHUB_URL in ${instance_env} before starting"
+  # exactly what writing GITHUB_URL to the shared file used to do. Replicas get
+  # a file each rather than sharing one, so raising --replicas later leaves the
+  # runners already going untouched, and one of them can be given a different
+  # size or label by editing its file alone.
+  local instance instance_env
+  for instance in "${instances[@]}"; do
+    instance_env="${ETC_DIR}/env.${instance}"
+    install -m 0600 /dev/null "$instance_env"
+    service_env_file "$instance" > "$instance_env"
+    log "wrote ${instance_env} (${VM_CPUS} vCPU, ${VM_MEMORY_MB} MiB, ${VM_DISK_GB} GiB)"
+  done
+  [[ -n "$GITHUB_URL" ]] \
+    || warn "no --url given; put GITHUB_URL in ${ETC_DIR}/env.${instances[0]} before starting"
 
   # The shared file is created once and then left alone: it is what runners
   # without a file of their own fall back to, so rewriting it here would reach
@@ -2235,7 +2292,7 @@ cmd_install() {
     fi
   fi
 
-  store_credentials "$instance" "$supplied_token"
+  store_credentials "$supplied_token" "${instances[@]}"
 
   systemd_unit > /etc/systemd/system/runner-vm@.service
   chmod 0644 /etc/systemd/system/runner-vm@.service
@@ -2255,27 +2312,45 @@ cmd_install() {
     # configuration, and "enable --now" would report success while the VM kept
     # running with the old one. Restarting it here is not the answer either:
     # stopping waits for the job in flight, which can be an hour.
-    local was_active=false
-    systemctl is-active --quiet "runner-vm@${instance}" && was_active=true
-
-    systemctl enable --now "runner-vm@${instance}"
-    log "started runner-vm@${instance}"
-    if [[ "$was_active" == "true" ]]; then
-      log "it was already running, so it is still on the previous configuration"
-      log "pick this one up when the runner is idle with:"
-      log "  sudo systemctl restart runner-vm@${instance}"
+    local restart=""
+    for instance in "${instances[@]}"; do
+      systemctl is-active --quiet "runner-vm@${instance}" \
+        && restart+=" runner-vm@${instance}"
+      systemctl enable --now "runner-vm@${instance}"
+      log "started runner-vm@${instance}"
+    done
+    if [[ -n "$restart" ]]; then
+      log "these were already running, so they are still on the previous configuration"
+      log "pick this one up when they are idle with:"
+      log "  sudo systemctl restart${restart}"
     fi
     log ""
-    log "the runner appears at ${GITHUB_URL:-<your repo>}/settings/actions/runners in about a minute"
-    log "watch it come up with:"
-    log "  sudo journalctl -u runner-vm@${instance} -f"
+    log "the runners appear at ${GITHUB_URL:-<your repo>}/settings/actions/runners in about a minute"
+    log "watch them come up with:"
+    log "  sudo journalctl -u 'runner-vm@*' -f"
   else
-    log "installed. Start a runner with:"
-    log "  sudo systemctl enable --now runner-vm@${instance}"
+    log "installed. Start them with:"
+    for instance in "${instances[@]}"; do
+      log "  sudo systemctl enable --now runner-vm@${instance}"
+    done
   fi
+
+  # Runners a bigger --replicas left behind are named, not removed: stopping
+  # one is stopping a machine that may be halfway through a job, and that is
+  # the operator's call rather than install's.
+  local stale; stale=$(stale_replicas "$base" "$REPLICAS")
+  if [[ -n "$stale" ]]; then
+    log ""
+    warn "these runners are left over from a larger --replicas and are still going:"
+    while read -r instance; do
+      [[ -n "$instance" ]] || continue
+      log "  sudo systemctl disable --now runner-vm@${instance} && sudo rm ${ETC_DIR}/env.${instance}"
+    done <<<"$stale"
+  fi
+
   log ""
-  log "another runner on this host, for another repository:"
-  log "  sudo ${INSTALL_BIN} install --service --name <name> --url https://github.com/OWNER/OTHER"
+  log "more runners on this repository:  ${INSTALL_BIN} install --service --name ${base} --url ${GITHUB_URL:-<repo>} --replicas N"
+  log "another repository on this host:  ${INSTALL_BIN} install --service --name <other> --url https://github.com/OWNER/OTHER"
 }
 
 # cmd_uninstall removes the whole installation: the services, the unit, the
@@ -2385,6 +2460,8 @@ main() {
       --app-installation-id=*) GITHUB_APP_INSTALLATION_ID=${1#*=}; shift ;;
       --name)           RUNNER_NAME=$2; shift 2 ;;
       --name=*)         RUNNER_NAME=${1#*=}; shift ;;
+      --replicas)       REPLICAS=$2; shift 2 ;;
+      --replicas=*)     REPLICAS=${1#*=}; shift ;;
       --labels)         RUNNER_LABELS=$2; shift 2 ;;
       --labels=*)       RUNNER_LABELS=${1#*=}; shift ;;
       --group)          RUNNER_GROUP=$2; shift 2 ;;
