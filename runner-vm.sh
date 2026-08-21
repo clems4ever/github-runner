@@ -17,8 +17,8 @@ set -euo pipefail
 # A job gets:
 #   - a Docker daemon of its own, inside the VM, rather than a socket to the
 #     host's, which is equivalent to root on the host
-#   - /dev/kvm, so jobs can boot VMs of their own (nested virtualisation)
 #   - a kernel of its own to break
+#   - /dev/kvm with --nested, so jobs can boot VMs of their own
 #
 # Usage:
 #   ./runner-vm.sh [command] [flags]
@@ -54,7 +54,12 @@ set -euo pipefail
 #   --memory MB           VM_MEMORY_MB     memory in MiB   (default 4096)
 #   --disk GB             VM_DISK_GB       disk in GiB     (default 40)
 #   --ephemeral           EPHEMERAL        take one job, then stop
-#   --no-nested           VM_NESTED=false  do not expose vmx/svm to the VM
+#   --nested              VM_NESTED=true   expose vmx/svm to the VM, so jobs
+#                                          can boot VMs of their own. Off by
+#                                          default, and it needs a host with
+#                                          nested virtualisation enabled
+#   --no-nested                            the default; masks vmx/svm even on a
+#                                          host that has it enabled
 #   --env-file FILE                        default .env, when present
 #
 # Flags for install:
@@ -178,7 +183,7 @@ RUNNER_PACKAGES=${RUNNER_PACKAGES:-$RUNNER_PACKAGES_DEFAULT}
 VM_CPUS=${VM_CPUS:-2}
 VM_MEMORY_MB=${VM_MEMORY_MB:-4096}
 VM_DISK_GB=${VM_DISK_GB:-40}
-VM_NESTED=${VM_NESTED:-true}
+VM_NESTED=${VM_NESTED:-false}
 
 GITHUB_URL=${GITHUB_URL:-}
 RUNNER_TOKEN=${RUNNER_TOKEN:-}
@@ -322,6 +327,25 @@ nested_flag() {
   esac
 }
 
+# cpu_model prints the -cpu argument for a VM.
+#
+# "-cpu host" copies the host CPU, virtualisation extensions included, so on a
+# host with nested virtualisation enabled a guest sees vmx/svm whether or not
+# anyone asked for it. Both cases are therefore spelled out rather than left to
+# the default: +flag with --nested, which also makes a host that cannot do it
+# fail at boot rather than surface as a mysteriously broken job later, and
+# -flag without, so that the default means what it says.
+cpu_model() {
+  local flag; flag=$(nested_flag)
+  # An unknown vendor has no flag to name, and naming none is the only option.
+  [[ -n "$flag" ]] || { echo host; return 0; }
+  if [[ "$VM_NESTED" == "true" ]]; then
+    echo "host,+${flag}"
+  else
+    echo "host,-${flag}"
+  fi
+}
+
 # Nested virtualisation needs the host's KVM module loaded with nested=1. Guests
 # then see vmx/svm through "-cpu host" and can run VMs of their own.
 nested_enabled() {
@@ -390,14 +414,20 @@ cmd_doctor() {
   fi
 
   if nested_enabled; then
-    echo "  [ ok ] nested     enabled, VMs get $(nested_flag)"
+    if [[ "$VM_NESTED" == "true" ]]; then
+      echo "  [ ok ] nested     enabled, VMs get $(nested_flag)"
+    else
+      # Enabled on the host is not the same as given to a VM: without --nested
+      # the flag is masked, so say what a job will actually see.
+      echo "  [ ok ] nested     enabled on this host; VMs get it with --nested"
+    fi
   else
     local mark="warn"
     [[ "$VM_NESTED" == "true" ]] && { mark="FAIL"; failed=$((failed + 1)); }
     echo "  [$mark] nested     disabled: jobs will not be able to run VMs"
     echo "         sudo modprobe -r ${mod} && sudo modprobe ${mod} nested=1"
     echo "         echo 'options ${mod} nested=1' | sudo tee /etc/modprobe.d/${mod}.conf"
-    echo "         or run with --no-nested"
+    echo "         it is only needed for runners installed with --nested"
   fi
 
   local qemu; qemu=$(qemu_binary)
@@ -454,7 +484,7 @@ require_host() {
   have ssh-keygen || { install_hint >&2; die "ssh-keygen not found (install openssh-client)"; }
   [[ -r /dev/kvm && -w /dev/kvm ]] || die "/dev/kvm is not usable by $(id -un); run '$0 doctor'"
   if [[ "$VM_NESTED" == "true" ]] && ! nested_enabled; then
-    die "nested virtualisation is not enabled on this host; run '$0 doctor', or pass --no-nested"
+    die "--nested needs nested virtualisation enabled on this host; run '$0 doctor', or drop --nested"
   fi
 }
 
@@ -1412,11 +1442,7 @@ cmd_run() {
   give it at least --disk ${golden_gb}"
   fi
 
-  # "-cpu host" is what exposes the CPU's virtualisation extensions; naming the
-  # flag explicitly makes a host without nested virtualisation fail here rather
-  # than surface as a mysteriously broken job later.
-  local cpu=host
-  [[ "$VM_NESTED" == "true" ]] && cpu="host,+$(nested_flag)"
+  local cpu; cpu=$(cpu_model)
 
   local console="${VM_DIR}/console.log"
   : > "$console"
