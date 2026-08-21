@@ -153,7 +153,7 @@ account need one runner each.
 | `doctor` | Check KVM, nested virtualisation and QEMU, and say how to fix what is missing |
 | `build` | Build the golden image the VMs boot from |
 | `run` | Boot a VM and run a runner in it until stopped |
-| `list` | The VMs on this host: state, repository, size, ssh port, uptime |
+| `list` | The VMs on this host: state, repository, size, nested virtualisation, ssh port, uptime |
 | `install` | Install this script; `--service` also sets up systemd |
 | `clean` | Stop the services and VMs and delete their disks, keeping the image cache |
 | `uninstall` | Remove everything: services, unit, configuration, state, the script |
