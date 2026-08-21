@@ -474,7 +474,12 @@ J
     out=$(cmd_list)
     SHOW_JOBS=false
     contains "the column is only there when asked for" "$out" "JOB"
-    contains "and carries what each runner is doing"   "$out" "web-1            stopped   -         busy"
+    # By field rather than by the whole row: what the SERVICE column says
+    # depends on whether the machine running these tests has systemd.
+    job_of() { awk -v n="$1" '$1 == n { print $4 }' <<<"$out"; }
+    is "a runner on a job reads busy"    "busy"    "$(job_of web-1)"
+    is "one waiting for work reads idle" "idle"    "$(job_of web-2)"
+    is "and a missing one reads offline" "offline" "$(job_of web-3)"
     # Three replicas on one repository are one question, not three.
     is "one call serves every runner in a scope" "1" "$(grep -c . "$WORK/api-calls")"
 
