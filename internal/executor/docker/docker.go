@@ -111,12 +111,25 @@ func New(layout paths.Layout, binary string, opts ...Option) *Executor {
 // Runtime is what this executor runs.
 func (e *Executor) Runtime() model.Runtime { return model.RuntimeContainer }
 
+// Recipe is the container image a runner in this pool would run.
+//
+// A pool that names no image gets the default, so changing that default here
+// replaces the containers built from the old one rather than leaving them until
+// somebody notices.
+func (e *Executor) Recipe(pool model.Pool) string { return imageFor(pool.Image) }
+
+// imageFor resolves what a pool's image field means, so the executor and the
+// recipe cannot disagree about what a runner would run.
+func imageFor(image string) string {
+	if image == "" || image == "default" {
+		return DefaultImage
+	}
+	return image
+}
+
 // Create builds and starts a container runner.
 func (e *Executor) Create(ctx context.Context, spec reconcile.Spec) error {
-	image := spec.Image
-	if image == "" || image == "default" {
-		image = DefaultImage
-	}
+	image := imageFor(spec.Image)
 	if err := e.ensureImage(ctx, image); err != nil {
 		return err
 	}

@@ -20,6 +20,7 @@ import (
 // passes and watch a fleet converge.
 type fakeExecutor struct {
 	runtime model.Runtime
+	recipe  string
 	runners map[string]*Runner
 	calls   []string
 	started []Spec
@@ -32,6 +33,16 @@ func newFakeExecutor(runtime model.Runtime) *fakeExecutor {
 }
 
 func (f *fakeExecutor) Runtime() model.Runtime { return f.runtime }
+
+// Recipe is how this executor would build a runner. The fake carries one so a
+// test can change it, which is how "the daemon builds runners differently now"
+// is expressed.
+func (f *fakeExecutor) Recipe(model.Pool) string {
+	if f.recipe == "" {
+		return "image"
+	}
+	return f.recipe
+}
 
 func (f *fakeExecutor) List(ctx context.Context) ([]Runner, error) {
 	if err := f.failOn["list"]; err != nil {
@@ -293,7 +304,7 @@ func TestReconfiguringAPoolReplacesRunnersGracefully(t *testing.T) {
 
 	// And the rebuilt runners carry the new configuration.
 	for _, r := range h.vm.runners {
-		if r.Generation != pool.Generation("fp") {
+		if r.Generation != pool.Generation("fp", "image") {
 			t.Fatalf("%s came back on the old generation", r.Name)
 		}
 	}

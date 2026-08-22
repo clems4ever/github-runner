@@ -40,6 +40,7 @@ import (
 type host struct {
 	mu      sync.Mutex
 	runtime model.Runtime
+	recipe  string
 	runners map[string]*reconcile.Runner
 	created []string
 	specs   []reconcile.Spec
@@ -51,6 +52,16 @@ func newHost(runtime model.Runtime) *host {
 }
 
 func (h *host) Runtime() model.Runtime { return h.runtime }
+
+// Recipe is what this host would build a runner from — a golden image, a
+// container image. A test changes it to stand for a daemon that has changed how
+// it builds them, which is a release, not a configuration change.
+func (h *host) Recipe(model.Pool) string {
+	if h.recipe == "" {
+		return "image"
+	}
+	return h.recipe
+}
 
 func (h *host) List(context.Context) ([]reconcile.Runner, error) {
 	h.mu.Lock()
@@ -1113,4 +1124,60 @@ func (f *fleet) importTemplate(t *testing.T, name string, options map[string]any
 		body[key] = value
 	}
 	f.mustRequest("POST", "/api/pools/import", body, http.StatusOK)
+}
+
+// A release that changes how a runner is built replaces the runners built the
+// old way — without anybody remembering to bump a constant.
+//
+// This is the failure that cost two upgrades in one afternoon. A release gave
+// jobs passwordless sudo; the golden image's name did not depend on the script
+// that installs it, so hosts reused the image they already had. The next
+// release fixed the name, and the machines still running the old image looked
+// current to the reconciler, because a generation covered what an operator had
+// configured and not what the daemon does with it.
+func TestARecipeChangeReplacesTheRunnersItWasBuiltFor(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 2))
+	f.reconcileNow()
+	if got := strings.Join(f.vm.names(), ","); got != "web-1,web-2" {
+		t.Fatalf("got %q", got)
+	}
+	f.vm.created = nil
+
+	// The daemon is upgraded and now builds machines from a different image —
+	// a new runner version, a package added, a change to the provisioning. The
+	// pool's configuration has not changed at all.
+	f.vm.recipe = "runner-noble-default-1886661f732b.qcow2"
+	f.reconcileNow()
+
+	// Drained, not killed: a machine mid-job finishes it first.
+	if len(f.vm.created) != 0 {
+		t.Fatalf("runners were rebuilt before the old ones stopped: %v", f.vm.created)
+	}
+	f.vm.jobsFinish()
+	f.reconcileNow()
+
+	if got := strings.Join(f.vm.created, ","); got != "web-1,web-2" {
+		t.Fatalf("the machines were left on the image the daemon no longer builds: %v", f.vm.created)
+	}
+}
+
+// And a fleet the daemon has not changed is left alone, which is the other half
+// of the promise: a recipe in the generation must not mean churn on every pass.
+func TestTheSameRecipeChangesNothing(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	f.addPool(vmPool(f.addCredential(), 2))
+	f.reconcileNow()
+	f.vm.created = nil
+
+	f.reconcileNow()
+	f.reconcileNow()
+	if len(f.vm.created) != 0 {
+		t.Fatalf("a settled fleet rebuilt %v", f.vm.created)
+	}
 }
