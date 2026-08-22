@@ -193,12 +193,12 @@ type watchOptions struct {
 // its console means: a machine that went by itself may have gone for a bad
 // reason worth reading, and one that was stopped went because it was told to.
 func waitForMachine(ctx context.Context, exited <-chan error, o watchOptions) (stopped bool, err error) {
-	check, linger := o.check, o.linger
+	check, quiet := o.check, o.linger
 	if check == 0 {
 		check = consoleCheck
 	}
-	if linger == 0 {
-		linger = lingerGrace
+	if quiet == 0 {
+		quiet = patience
 	}
 	stop := func() (bool, error) {
 		return true, drain(exited, drainOptions{
@@ -223,17 +223,25 @@ func waitForMachine(ctx context.Context, exited <-chan error, o watchOptions) (s
 			// notices: the runner has deregistered itself so GitHub cannot give
 			// it work, this agent is alive so systemd will not replace it, and
 			// the fleet shows a healthy runner doing nothing at all.
+			if !runnerFinished(o.console) {
+				continue
+			}
 			if finishedAt.IsZero() {
-				if !runnerFinished(o.console) {
-					continue
-				}
 				finishedAt = time.Now()
-				o.log.Info("the runner has finished; the machine should be powering off", "runner", o.runner)
+				o.log.Info("the runner has finished; asking the machine to power off", "runner", o.runner)
+				// Asked at once. Its own unit is asking for the same thing from
+				// the inside, and whichever arrives first is the one that works.
+				if err := o.press(); err != nil {
+					o.log.Warn("could not reach the monitor", "runner", o.runner, "error", err)
+				}
 				continue
 			}
-			if time.Since(finishedAt) < linger {
+			if time.Since(finishedAt) < quiet {
 				continue
 			}
+			// It was asked and did not go. Now it is worth saying so, and worth
+			// keeping on at it: drain presses again on a timer and gives up at
+			// the end of the grace.
 			o.log.Warn("the runner finished but the machine is still running; stopping it",
 				"runner", o.runner, "waited", time.Since(finishedAt).Round(time.Second).String())
 			return stop()
@@ -247,16 +255,28 @@ func waitForMachine(ctx context.Context, exited <-chan error, o watchOptions) (s
 }
 
 // consoleCheck is how often the machine's console is read while it runs.
-const consoleCheck = 10 * time.Second
-
-// lingerGrace is how long a machine may take to power itself off after its
-// runner has finished.
 //
-// Generous, because the guest is stopping docker and unmounting filesystems in
-// that window and none of that should be cut short. But bounded: a machine
-// whose runner has gone is a slot with nothing in it, and eighteen minutes of
-// that took a whole pool out of service.
-const lingerGrace = 90 * time.Second
+// Short, because it decides how quickly a machine whose runner has finished is
+// asked to go, and reading a file that QEMU is appending to costs nothing.
+const consoleCheck = 3 * time.Second
+
+// patience is how long the machine is given after being asked before anyone
+// says anything about it.
+//
+// There is no waiting before the asking. The button press is the same request
+// the guest's own unit makes when the runner stops — systemctl poweroff, from
+// outside instead of inside — so pressing it while the machine is already
+// shutting down changes nothing: there is no logind left to hear it, and it is
+// a button, not a power cut. Nothing is cut short by asking early, so the
+// earlier version's ninety-second wait bought nothing and cost ninety seconds
+// of a machine that had nothing left to do.
+//
+// What this is for is the log. A machine takes a few seconds to stop docker
+// and unmount, and saying "it has not gone" before that is finished would be
+// noise on every job. The only thing that does cut a machine off — the kill at
+// the end of the drain — stays behind its own long grace, because that one is
+// a power cut and a job may still be running.
+const patience = 20 * time.Second
 
 // finished are the runner's last words, from the guest's console.
 //
