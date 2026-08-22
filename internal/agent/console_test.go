@@ -242,3 +242,42 @@ func TestTheImageDoesNotBootThingsARunnerWillNeverUse(t *testing.T) {
 		}
 	}
 }
+
+// The runner's last words, which are the point at which its machine has nothing
+// left to do. Taken from the console of a machine that then sat for eighteen
+// minutes with no runner on it, holding a slot in a pool with twelve jobs
+// queued.
+func TestARunnerThatHasFinishedIsRecognised(t *testing.T) {
+	done := writeConsole(t, strings.Join([]string{
+		"[   54.7] run-runner.sh[1431]: 2026-08-22 15:04:38Z: Job installer completed with result: Succeeded",
+		"[   55.1] run-runner.sh[1431]: √ Removed .credentials",
+		"[   55.1] run-runner.sh[1431]: √ Removed .runner",
+		"[   55.2] run-runner.sh[1427]: Runner listener exit with 0 return code, stop the service, no retry needed.",
+		"[   55.2] run-runner.sh[1339]: Exiting runner...",
+	}, "\n"))
+	if !runnerFinished(done) {
+		t.Fatal("a machine whose runner has gone is not recognised, so nothing will ever stop it")
+	}
+
+	// A runner waiting for work has not finished, and its machine must not be
+	// stopped underneath it.
+	waiting := writeConsole(t, "[   16.0] run-runner.sh[1436]: 2026-08-22 13:46:17Z: Listening for Jobs")
+	if runnerFinished(waiting) {
+		t.Fatal("an idle runner was taken for a finished one")
+	}
+
+	// Nor mid-job.
+	working := writeConsole(t, strings.Join([]string{
+		"[   16.0] run-runner.sh[1436]: Listening for Jobs",
+		"[   18.1] run-runner.sh[1436]: Running job: installer",
+	}, "\n"))
+	if runnerFinished(working) {
+		t.Fatal("a runner with a job on it was taken for a finished one")
+	}
+
+	// A console that cannot be read says nothing rather than stopping a machine
+	// on a guess.
+	if runnerFinished(filepath.Join(t.TempDir(), "missing")) {
+		t.Fatal("a missing console was taken as proof the runner had finished")
+	}
+}
