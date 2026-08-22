@@ -165,7 +165,9 @@ jobs:
         run: |
           set -euo pipefail
           for dir in /run/runner-fleet /run/runner-fleet/credentials /var/lib/runner-fleet; do
-            owner=$(stat -c '%U' "$dir")
+            # As root, because these are 0700 and this job's user is neither
+            # root nor the service user — which is the point of them.
+            owner=$(sudo stat -c '%U' "$dir")
             if [ "$owner" != "runner-fleet" ]; then
               echo "::error::$dir belongs to $owner; a machine runner could not use it"
               exit 1
