@@ -57,6 +57,27 @@ const runner = (over: Partial<Runner> = {}): Runner => ({
 })
 
 describe('FleetPage', () => {
+  // A runner can be dead and look busy. The dashboard said "running" for a
+  // whole afternoon while every machine on the host was crash-looping on a
+  // credential it could not read, so a failing runner now says so beside its
+  // state, with the command that explains why.
+  it('shows a runner that is failing to start, and where to look', async () => {
+    renderPage([
+      runner({
+        state: 'stopped',
+        job: 'unknown',
+        trouble: 'failing to start (exit-code), 9 times over; journalctl -u gh-runner@web-1.service',
+      }),
+    ])
+
+    expect(screen.getByText('failing')).toBeInTheDocument()
+  })
+
+  it('says nothing about a runner that is fine', () => {
+    renderPage([runner()])
+    expect(screen.queryByText('failing')).not.toBeInTheDocument()
+  })
+
   it('says what to do when there is nothing yet', () => {
     renderPage([])
     expect(screen.getByText('No runners yet')).toBeInTheDocument()

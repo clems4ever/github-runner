@@ -496,6 +496,9 @@ type RunnerStatus struct {
 	Job        string      `json:"job"`
 	Generation string      `json:"generation"`
 	UpToDate   bool        `json:"upToDate"`
+	// Trouble is what the host says is wrong with this runner, if anything.
+	// A runner can be dead and look busy, and this is where it says so.
+	Trouble string `json:"trouble,omitempty"`
 }
 
 // Status reports the fleet for the UI.
@@ -559,6 +562,7 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 			Job:        job,
 			Generation: runner.Generation,
 			UpToDate:   known && want == runner.Generation,
+			Trouble:    runner.Trouble,
 		})
 	}
 	return out, errs

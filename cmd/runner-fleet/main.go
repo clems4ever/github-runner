@@ -121,7 +121,9 @@ func passwdCommand(args []string) error {
 	}
 
 	layout := layoutFor(*root)
-	if err := layout.EnsureDirs(); err != nil {
+	// Setting a password creates nothing the runners read, so it hands nothing
+	// over: the daemon does that when it starts.
+	if err := layout.EnsureDirs(paths.CurrentOwner()); err != nil {
 		return err
 	}
 	ring, err := secrets.LoadOrCreateKey(layout.MasterKey())

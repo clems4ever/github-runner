@@ -141,7 +141,20 @@ export function FleetPage({
                     </Badge>
                   </Table.Td>
                   <Table.Td>
-                    <StateBadge state={runner.state} />
+                    <Group gap={6} wrap="nowrap">
+                      <StateBadge state={runner.state} />
+                      {runner.trouble && (
+                        <Tooltip label={runner.trouble} multiline maw={420}>
+                          <Badge
+                            color="red"
+                            variant="light"
+                            leftSection={<IconAlertTriangle size={12} />}
+                          >
+                            failing
+                          </Badge>
+                        </Tooltip>
+                      )}
+                    </Group>
                   </Table.Td>
                   <Table.Td>
                     <JobBadge job={runner.job} />

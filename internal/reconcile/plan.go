@@ -78,6 +78,15 @@ type Runner struct {
 	ScopeKind    model.ScopeKind
 	Scope        string
 	CredentialID int64
+	// Trouble is what the host says is wrong with this runner, when it says
+	// anything: a unit that keeps failing, a container that keeps exiting.
+	//
+	// It exists because a runner can be dead and busy-looking at the same time.
+	// A crash-looping unit spends most of its life in systemd's "activating"
+	// state, which read as running, so the fleet showed a healthy runner that
+	// had never once registered — for as long as anyone cared to look. Nothing
+	// plans on this field; it is carried so that a person is told.
+	Trouble string
 }
 
 // Op is a single thing to do.

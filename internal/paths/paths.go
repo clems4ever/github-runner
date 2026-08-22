@@ -82,14 +82,39 @@ func (l Layout) VMDir(name string) string { return filepath.Join(l.State, "vms",
 // SSHKey is the key that reaches every VM this host runs.
 func (l Layout) SSHKey() string { return filepath.Join(l.State, "ssh", "id_ed25519") }
 
-// EnsureDirs creates what must exist before anything else runs.
-func (l Layout) EnsureDirs() error {
+// EnsureDirs creates what must exist before anything else runs, and hands the
+// ones the runners use to the account they run as.
+//
+// Which directories those are is the part worth being explicit about. The
+// daemon is root and the agents are not, so anything an agent reads or writes
+// has to belong to the service user: the state directory, where a machine
+// builds its images and disks, and the credentials directory, where it finds
+// the token it registers with. The rest stays root's.
+func (l Layout) EnsureDirs(owner Owner) error {
 	// 0700 throughout: these hold credentials, configuration naming private
-	// repositories, and disk images a job has written to.
+	// repositories, and disk images a job has written to. Ownership, not the
+	// mode, is what decides who that one user is.
 	for _, dir := range []string{l.Etc, l.RunnersDir(), l.State, l.ImagesDir(), l.Run, l.CredentialsDir()} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
+	for _, dir := range l.AgentDirs() {
+		if err := owner.Give(dir); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// AgentDirs are the directories an agent needs of its own. The daemon creates
+// them; the runners live in them.
+//
+// Run is in the list as well as the credentials directory inside it. Handing
+// over a directory nobody can walk into is handing over nothing, and a 0700
+// root-owned parent is exactly that — which is the second half of the same bug,
+// found by the test that reads the file as the other user rather than looking
+// at its mode.
+func (l Layout) AgentDirs() []string {
+	return []string{l.State, l.ImagesDir(), l.Run, l.CredentialsDir()}
 }

@@ -96,7 +96,7 @@ func newExecutor(t *testing.T) (*Executor, *fakeDocker) {
 	t.Cleanup(srv.Close)
 
 	layout := paths.Under(t.TempDir())
-	if err := layout.EnsureDirs(); err != nil {
+	if err := layout.EnsureDirs(paths.CurrentOwner()); err != nil {
 		t.Fatal(err)
 	}
 	e := New(layout, "/usr/local/bin/runner-fleet", WithHTTPClient(srv.Client(), srv.URL))
