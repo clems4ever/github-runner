@@ -60,16 +60,51 @@ var (
 	segmentRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 )
 
-// Credential is a GitHub credential. The token itself is never in this struct
-// in clear: Sealed is what the database holds, and only the daemon's keyring
-// can turn it back into a token.
+// CredentialKind is how a credential proves who it is.
+type CredentialKind string
+
+const (
+	// CredentialPAT is a personal access token: one string, belonging to a
+	// person, expiring on whatever date they chose.
+	CredentialPAT CredentialKind = "pat"
+	// CredentialApp is a GitHub App: an id and a private key, which the daemon
+	// exchanges for a short-lived installation token whenever it needs one.
+	// Nothing expires on a calendar, the repositories it can reach are a list
+	// that can be edited without touching the credential, and uninstalling the
+	// app revokes everything at once.
+	CredentialApp CredentialKind = "app"
+)
+
+// Credential is how the fleet proves who it is to GitHub. The secret itself is
+// never in this struct in clear: Sealed is what the database holds, and only
+// the daemon's keyring can open it.
 type Credential struct {
-	ID        int64     `json:"id"`
-	Name      string    `json:"name"`
-	Sealed    string    `json:"-"`
-	Hint      string    `json:"hint"` // last four characters, to tell two apart
-	CreatedAt time.Time `json:"createdAt"`
+	ID   int64          `json:"id"`
+	Name string         `json:"name"`
+	Kind CredentialKind `json:"kind"`
+	// AppID and InstallationID are only meaningful for an app. An installation
+	// of zero means "find it", which is the usual case: an app installed on one
+	// account has one installation, and making someone look up its id is a step
+	// with no decision in it.
+	AppID          int64     `json:"appId,omitempty"`
+	InstallationID int64     `json:"installationId,omitempty"`
+	Sealed         string    `json:"-"`
+	Hint           string    `json:"hint"` // enough to tell two apart, no more
+	CreatedAt      time.Time `json:"createdAt"`
 }
+
+// Secret is a credential with its secret opened, for the daemon's own use. It
+// never leaves the process except to be written to tmpfs for the runners.
+type Secret struct {
+	Kind CredentialKind
+	// Token is the personal access token, or the app's PEM private key.
+	Token          string
+	AppID          int64
+	InstallationID int64
+}
+
+// IsApp reports whether this is a GitHub App credential.
+func (s Secret) IsApp() bool { return s.Kind == CredentialApp }
 
 // Pool is a set of identical runners on one repository or organisation.
 type Pool struct {

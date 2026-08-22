@@ -69,7 +69,7 @@ func newHarness(t *testing.T) *harness {
 	h.server = httptest.NewServer(srv.Handler())
 	t.Cleanup(h.server.Close)
 
-	cred, err := db.CreateCredential(context.Background(), "pat", "github_pat_test")
+	cred, err := db.CreateCredential(context.Background(), model.Credential{Name: "pat"}, "github_pat_test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +325,7 @@ func TestCredentialsNeverComeBackOut(t *testing.T) {
 	h := newHarness(t)
 
 	resp := h.do("POST", "/api/credentials", map[string]string{
-		"name": "another", "token": "github_pat_SECRETVALUE",
+		"name": "another", "secret": "github_pat_SECRETVALUE",
 	})
 	raw := readAll(t, resp)
 	if resp.StatusCode != http.StatusCreated {
@@ -349,8 +349,8 @@ func TestCredentialsNeverComeBackOut(t *testing.T) {
 func TestRotatingACredentialAsksForAReconcile(t *testing.T) {
 	h := newHarness(t)
 	before := h.nudges
-	resp := h.do("PUT", "/api/credentials/"+itoa(h.credID)+"/token", map[string]string{
-		"token": "github_pat_rotated",
+	resp := h.do("PUT", "/api/credentials/"+itoa(h.credID)+"/secret", map[string]string{
+		"secret": "github_pat_rotated",
 	})
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {

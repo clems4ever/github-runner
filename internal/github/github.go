@@ -25,8 +25,13 @@ import (
 const DefaultBaseURL = "https://api.github.com"
 
 // Client talks to one GitHub with one credential.
+//
+// The credential is either a personal access token, used as it is, or a GitHub
+// App, whose key is exchanged for a short-lived installation token behind this
+// interface. Nothing above here has to know which.
 type Client struct {
 	token   string
+	app     *appAuth
 	baseURL string
 	http    *http.Client
 }
@@ -173,14 +178,31 @@ func (c *Client) Deregister(ctx context.Context, scope Scope, name string) error
 	return nil
 }
 
+// do makes a call with whatever credential this client has.
 func (c *Client) do(ctx context.Context, method, path string, out any, scope Scope) error {
+	bearer := c.token
+	if c.app != nil {
+		// An app's key cannot call these endpoints directly; it buys an
+		// installation token first, which is cached until it is nearly spent.
+		minted, err := c.app.bearer(ctx, c, scope)
+		if err != nil {
+			return err
+		}
+		bearer = minted
+	}
+	return c.doAs(ctx, method, path, bearer, out, scope)
+}
+
+// doAs makes a call with an explicit bearer, which is how the app flow signs
+// its own requests with a JWT rather than recursing into do.
+func (c *Client) doAs(ctx context.Context, method, path, bearer string, out any, scope Scope) error {
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+bearer)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -236,7 +258,7 @@ func apiError(status int, body []byte, scope Scope) error {
 	e := &Error{Status: status, Scope: scope.Path, Message: message}
 	switch status {
 	case http.StatusUnauthorized:
-		e.Advice = "the token itself is wrong, not its permissions: check the value, not the scopes"
+		e.Advice = "the credential itself is wrong, not its permissions: check the value, not the scopes. For an app, check the private key belongs to the app id, and that this host's clock is right — a JWT from the future is refused"
 	case http.StatusForbidden:
 		if scope.Kind == model.ScopeOrganization {
 			e.Advice = "the credential is valid but not allowed to do this: an organisation needs Self-hosted runners: Read and write, or the classic admin:org scope"

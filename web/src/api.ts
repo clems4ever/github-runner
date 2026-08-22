@@ -43,11 +43,27 @@ export interface Runner {
   upToDate: boolean
 }
 
+export type CredentialKind = 'pat' | 'app'
+
 export interface Credential {
   id: number
   name: string
+  kind: CredentialKind
+  /** Only meaningful for an app. */
+  appId?: number
+  installationId?: number
   hint: string
   createdAt: string
+}
+
+/** What goes in when a credential is created. The secret never comes back out. */
+export interface NewCredential {
+  name: string
+  kind: CredentialKind
+  /** A personal access token, or a GitHub App's PEM private key. */
+  secret: string
+  appId?: number
+  installationId?: number
 }
 
 /** One point of fleet history: the whole fleet at a moment. */
@@ -125,10 +141,10 @@ export const api = {
   reconcile: () => request<{ actions: unknown[]; errors: string[] }>('/api/reconcile', { method: 'POST' }),
 
   credentials: () => request<Credential[]>('/api/credentials'),
-  createCredential: (name: string, token: string) =>
-    request<Credential>('/api/credentials', { method: 'POST', body: JSON.stringify({ name, token }) }),
-  rotateCredential: (id: number, token: string) =>
-    request<void>(`/api/credentials/${id}/token`, { method: 'PUT', body: JSON.stringify({ token }) }),
+  createCredential: (credential: NewCredential) =>
+    request<Credential>('/api/credentials', { method: 'POST', body: JSON.stringify(credential) }),
+  rotateCredential: (id: number, secret: string) =>
+    request<void>(`/api/credentials/${id}/secret`, { method: 'PUT', body: JSON.stringify({ secret }) }),
   deleteCredential: (id: number) => request<void>(`/api/credentials/${id}`, { method: 'DELETE' }),
 
   settings: () => request<{ authUser: string; version: string }>('/api/settings'),

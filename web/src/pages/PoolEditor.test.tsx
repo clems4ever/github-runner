@@ -10,7 +10,7 @@ function renderEditor(pool = emptyPool(1)) {
     <MantineProvider>
       <PoolEditor
         pool={pool}
-        credentials={[{ id: 1, name: 'pat', hint: '…1234', createdAt: '' }]}
+        credentials={[{ id: 1, name: 'pat', kind: 'pat', hint: '…1234', createdAt: '' }]}
         onSaved={vi.fn()}
         onCancel={vi.fn()}
       />

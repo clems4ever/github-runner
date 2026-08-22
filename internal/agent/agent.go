@@ -42,11 +42,19 @@ func Run(ctx context.Context, c Config, log *slog.Logger) error {
 // One per boot: it expires an hour after it is issued, so it cannot be stored
 // in the machine's configuration and reused.
 func registrationToken(ctx context.Context, c Config) (string, error) {
-	token, err := c.Token()
+	secret, err := c.Token()
 	if err != nil {
 		return "", err
 	}
-	client := github.New(token)
+	client, err := github.NewFromSecret(github.Secret{
+		IsAppCredential: c.CredentialKind == model.CredentialApp,
+		Token:           secret,
+		AppID:           c.AppID,
+		InstallationID:  c.InstallationID,
+	})
+	if err != nil {
+		return "", err
+	}
 	return client.RegistrationToken(ctx, github.Scope{Kind: c.ScopeKind, Path: c.Scope})
 }
 

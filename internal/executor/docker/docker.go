@@ -190,6 +190,9 @@ func env(spec reconcile.Spec, layout paths.Layout) []string {
 		fmt.Sprintf("FLEET_EPHEMERAL=%t", spec.Ephemeral),
 		fmt.Sprintf("FLEET_NESTED=%t", spec.Nested),
 		"FLEET_RUNTIME=container",
+		"FLEET_CREDENTIAL_KIND=" + string(spec.CredentialKind),
+		fmt.Sprintf("FLEET_APP_ID=%d", spec.AppID),
+		fmt.Sprintf("FLEET_INSTALLATION_ID=%d", spec.InstallationID),
 		// Inside the container the credential is at a fixed path, because the
 		// bind mount put it there.
 		"FLEET_CREDENTIAL_FILE=/run/secrets/github_token",

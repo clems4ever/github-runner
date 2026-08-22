@@ -38,6 +38,12 @@ type Config struct {
 	Image          string
 	CredentialFile string
 	StateDir       string
+	// How to authenticate. A GitHub App's agent signs its own assertion with
+	// the key beside it and buys an installation token, so a runner can come
+	// back after a reboot with the daemon still starting.
+	CredentialKind model.CredentialKind
+	AppID          int64
+	InstallationID int64
 }
 
 // ConfigFromEnv reads the runner's configuration out of its environment.
@@ -59,6 +65,9 @@ func ConfigFromEnv(name string) (Config, error) {
 		Image:          first(os.Getenv("FLEET_IMAGE"), "default"),
 		CredentialFile: os.Getenv("FLEET_CREDENTIAL_FILE"),
 		StateDir:       first(os.Getenv("FLEET_STATE_DIR"), "/var/lib/runner-fleet"),
+		CredentialKind: model.CredentialKind(first(os.Getenv("FLEET_CREDENTIAL_KIND"), string(model.CredentialPAT))),
+		AppID:          int64(intEnv("FLEET_APP_ID", 0)),
+		InstallationID: int64(intEnv("FLEET_INSTALLATION_ID", 0)),
 	}
 	if labels := os.Getenv("FLEET_LABELS"); labels != "" {
 		c.Labels = strings.Split(labels, ",")
@@ -71,7 +80,10 @@ func ConfigFromEnv(name string) (Config, error) {
 		return c, fmt.Errorf("%s: no repository or organisation to register on", c.Runner)
 	}
 	if c.CredentialFile == "" {
-		return c, fmt.Errorf("%s: no credential file. A runner registers afresh on every start, so it needs a token that can mint registration tokens", c.Runner)
+		return c, fmt.Errorf("%s: no credential file. A runner registers afresh on every start, so it needs a credential that can mint registration tokens", c.Runner)
+	}
+	if c.CredentialKind == model.CredentialApp && c.AppID == 0 {
+		return c, fmt.Errorf("%s: an app credential without an app id", c.Runner)
 	}
 	return c, nil
 }
@@ -108,7 +120,10 @@ func boolEnv(key string) bool {
 
 func intEnv(key string, fallback int) int {
 	value, err := strconv.Atoi(os.Getenv(key))
-	if err != nil || value <= 0 {
+	if err != nil || value < 0 {
+		return fallback
+	}
+	if value == 0 {
 		return fallback
 	}
 	return value

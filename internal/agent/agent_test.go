@@ -291,3 +291,66 @@ func contains(list []string, want string) bool {
 	}
 	return false
 }
+
+// The agent authenticates on its own, so a runner can come back after a reboot
+// with the daemon still starting. For an app that means signing an assertion,
+// which needs the app id beside the key.
+func TestConfigReadsAppCredentials(t *testing.T) {
+	for key, value := range map[string]string{
+		"FLEET_RUNNER":          "web-1",
+		"FLEET_URL":             "https://github.com/o/r",
+		"FLEET_SCOPE":           "o/r",
+		"FLEET_CREDENTIAL_FILE": "/run/runner-fleet/credentials/1",
+		"FLEET_CREDENTIAL_KIND": "app",
+		"FLEET_APP_ID":          "123456",
+		"FLEET_INSTALLATION_ID": "42",
+	} {
+		t.Setenv(key, value)
+	}
+
+	c, err := ConfigFromEnv("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CredentialKind != model.CredentialApp || c.AppID != 123456 || c.InstallationID != 42 {
+		t.Fatalf("got %+v", c)
+	}
+}
+
+func TestAnAppWithoutAnAppIDIsRefused(t *testing.T) {
+	for key, value := range map[string]string{
+		"FLEET_RUNNER":          "web-1",
+		"FLEET_URL":             "https://github.com/o/r",
+		"FLEET_SCOPE":           "o/r",
+		"FLEET_CREDENTIAL_FILE": "/run/x",
+		"FLEET_CREDENTIAL_KIND": "app",
+		"FLEET_APP_ID":          "",
+	} {
+		t.Setenv(key, value)
+	}
+	_, err := ConfigFromEnv("")
+	if err == nil || !strings.Contains(err.Error(), "app id") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// A runner with no credential kind is a token one, which is what every runner
+// created before apps existed will report.
+func TestConfigDefaultsToATokenCredential(t *testing.T) {
+	for key, value := range map[string]string{
+		"FLEET_RUNNER":          "web-1",
+		"FLEET_URL":             "https://github.com/o/r",
+		"FLEET_SCOPE":           "o/r",
+		"FLEET_CREDENTIAL_FILE": "/run/x",
+		"FLEET_CREDENTIAL_KIND": "",
+	} {
+		t.Setenv(key, value)
+	}
+	c, err := ConfigFromEnv("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CredentialKind != model.CredentialPAT {
+		t.Fatalf("got %q", c.CredentialKind)
+	}
+}

@@ -48,6 +48,13 @@ type Spec struct {
 	DiskGB       int
 	Image        string
 	CredentialID int64
+	// How the runner authenticates. An app's agent signs its own assertion and
+	// buys an installation token, so it needs the app id as well as the key —
+	// which is what lets a runner come back after a reboot with the daemon
+	// still starting.
+	CredentialKind model.CredentialKind
+	AppID          int64
+	InstallationID int64
 }
 
 // Runner is what an executor found on the host.
@@ -216,28 +223,37 @@ func sortedRunners(in []Runner) []Runner {
 // should have. The names are decided elsewhere, because how many a pool needs
 // depends on what its runners are doing and this does not.
 func SpecsFor(p model.Pool, credentialFingerprint string, names []string) []Spec {
+	return SpecsForCredential(p, credentialFingerprint, names, model.Secret{Kind: model.CredentialPAT})
+}
+
+// SpecsForCredential is SpecsFor with the credential's shape, which the agent
+// needs in order to authenticate without the daemon.
+func SpecsForCredential(p model.Pool, credentialFingerprint string, names []string, secret model.Secret) []Spec {
 	generation := p.Generation(credentialFingerprint)
 	labels := p.EffectiveLabels()
 
 	var specs []Spec
 	for _, name := range names {
 		specs = append(specs, Spec{
-			Name:         name,
-			Pool:         p.Name,
-			PoolID:       p.ID,
-			Generation:   generation,
-			Runtime:      p.Runtime,
-			URL:          p.URL(),
-			ScopeKind:    p.ScopeKind,
-			Scope:        p.Scope,
-			Labels:       labels,
-			Ephemeral:    p.Ephemeral,
-			Nested:       p.Nested,
-			CPUs:         p.CPUs,
-			MemoryMB:     p.MemoryMB,
-			DiskGB:       p.DiskGB,
-			Image:        p.Image,
-			CredentialID: p.CredentialID,
+			Name:           name,
+			Pool:           p.Name,
+			PoolID:         p.ID,
+			Generation:     generation,
+			Runtime:        p.Runtime,
+			URL:            p.URL(),
+			ScopeKind:      p.ScopeKind,
+			Scope:          p.Scope,
+			Labels:         labels,
+			Ephemeral:      p.Ephemeral,
+			Nested:         p.Nested,
+			CPUs:           p.CPUs,
+			MemoryMB:       p.MemoryMB,
+			DiskGB:         p.DiskGB,
+			Image:          p.Image,
+			CredentialID:   p.CredentialID,
+			CredentialKind: secret.Kind,
+			AppID:          secret.AppID,
+			InstallationID: secret.InstallationID,
 		})
 	}
 	return specs

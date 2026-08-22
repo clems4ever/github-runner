@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/secrets"
 
@@ -109,6 +110,12 @@ var migrations = []string{
 		target  INTEGER NOT NULL
 	)`,
 	`CREATE INDEX samples_at ON samples(at)`,
+	// GitHub Apps. A credential used to be a token and nothing else; it is now
+	// either that or an app, which is an id and a private key. Existing rows
+	// become what they already were.
+	`ALTER TABLE credentials ADD COLUMN kind TEXT NOT NULL DEFAULT 'pat'`,
+	`ALTER TABLE credentials ADD COLUMN app_id INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE credentials ADD COLUMN installation_id INTEGER NOT NULL DEFAULT 0`,
 }
 
 // SampleRetention is how much history the daemon keeps. Two days covers "what
@@ -155,49 +162,88 @@ func (s *Store) migrate(ctx context.Context) error {
 // Credentials
 // ---------------------------------------------------------------------------
 
-// CreateCredential seals a token and stores it. The token is never written in
+// CreateCredential seals a secret and stores it. The secret is never written in
 // clear, and never returned again — only used.
-func (s *Store) CreateCredential(ctx context.Context, name, token string) (model.Credential, error) {
-	name = strings.TrimSpace(name)
-	token = strings.TrimSpace(token)
-	if name == "" {
-		return model.Credential{}, errors.New("a credential needs a name to tell it from the others")
+//
+// The secret is a personal access token, or a GitHub App's PEM private key.
+// Which one it is decides how it is checked: a key that does not parse is
+// refused here, while whoever pasted it is still looking, rather than at the
+// first runner boot an hour later.
+func (s *Store) CreateCredential(ctx context.Context, credential model.Credential, secret string) (model.Credential, error) {
+	credential.Name = strings.TrimSpace(credential.Name)
+	// Trimmed, because a pasted token picks up whitespace and a pasted PEM
+	// picks up a blank line, and neither is meant to be part of the secret. A
+	// PEM parses with or without its final newline.
+	secret = strings.TrimSpace(secret)
+	if credential.Kind == "" {
+		credential.Kind = model.CredentialPAT
 	}
-	if token == "" {
-		return model.Credential{}, errors.New("the token is empty")
+	if err := validateCredential(credential, secret); err != nil {
+		return model.Credential{}, err
 	}
 
-	sealed, err := s.ring.Seal(token)
+	sealed, err := s.ring.Seal(secret)
 	if err != nil {
 		return model.Credential{}, err
 	}
 
-	now := time.Now().UTC()
+	credential.Hint = hintOf(credential, secret)
+	credential.CreatedAt = time.Now().UTC()
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO credentials (name, sealed, hint, created_at) VALUES (?, ?, ?, ?)`,
-		name, sealed, hintOf(token), now.Format(time.RFC3339Nano))
+		`INSERT INTO credentials (name, kind, app_id, installation_id, sealed, hint, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		credential.Name, string(credential.Kind), credential.AppID, credential.InstallationID,
+		sealed, credential.Hint, credential.CreatedAt.Format(time.RFC3339Nano))
 	if err != nil {
 		if isUnique(err) {
-			return model.Credential{}, fmt.Errorf("credential %q: %w", name, ErrConflict)
+			return model.Credential{}, fmt.Errorf("credential %q: %w", credential.Name, ErrConflict)
 		}
 		return model.Credential{}, err
 	}
-	id, _ := res.LastInsertId()
-	return model.Credential{ID: id, Name: name, Hint: hintOf(token), CreatedAt: now}, nil
+	credential.ID, _ = res.LastInsertId()
+	return credential, nil
 }
 
-// hintOf is the tail of a token, which is enough to tell two apart in a list
-// without showing anything usable.
-func hintOf(token string) string {
-	if len(token) <= 4 {
+func validateCredential(credential model.Credential, secret string) error {
+	if credential.Name == "" {
+		return errors.New("a credential needs a name to tell it from the others")
+	}
+	if secret == "" {
+		return errors.New("the secret is empty")
+	}
+
+	switch credential.Kind {
+	case model.CredentialPAT:
+		return nil
+	case model.CredentialApp:
+		if credential.AppID <= 0 {
+			return errors.New("an app needs its app id, which is on the app's settings page")
+		}
+		if _, err := github.ParsePrivateKey([]byte(secret)); err != nil {
+			return fmt.Errorf("the app's private key: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("credential kind %q: want %q or %q", credential.Kind, model.CredentialPAT, model.CredentialApp)
+	}
+}
+
+// hintOf is enough to tell two credentials apart in a list, and no more: the
+// tail of a token, or which app it is.
+func hintOf(credential model.Credential, secret string) string {
+	if credential.Kind == model.CredentialApp {
+		return fmt.Sprintf("app %d", credential.AppID)
+	}
+	if len(secret) <= 4 {
 		return "****"
 	}
-	return "…" + token[len(token)-4:]
+	return "…" + secret[len(secret)-4:]
 }
 
-// ListCredentials returns every credential, without their tokens.
+// ListCredentials returns every credential, without their secrets.
 func (s *Store) ListCredentials(ctx context.Context) ([]model.Credential, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, hint, created_at FROM credentials ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, kind, app_id, installation_id, hint, created_at FROM credentials ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -206,59 +252,90 @@ func (s *Store) ListCredentials(ctx context.Context) ([]model.Credential, error)
 	out := []model.Credential{}
 	for rows.Next() {
 		var c model.Credential
-		var created string
-		if err := rows.Scan(&c.ID, &c.Name, &c.Hint, &created); err != nil {
+		var kind, created string
+		if err := rows.Scan(&c.ID, &c.Name, &kind, &c.AppID, &c.InstallationID, &c.Hint, &created); err != nil {
 			return nil, err
 		}
+		c.Kind = model.CredentialKind(kind)
 		c.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
-// Token decrypts one credential, for the daemon's own use.
-func (s *Store) Token(ctx context.Context, id int64) (string, error) {
-	var sealed string
-	err := s.db.QueryRowContext(ctx, `SELECT sealed FROM credentials WHERE id = ?`, id).Scan(&sealed)
+// Secret opens one credential, for the daemon's own use.
+func (s *Store) Secret(ctx context.Context, id int64) (model.Secret, error) {
+	var (
+		sealed, kind string
+		secret       model.Secret
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT kind, app_id, installation_id, sealed FROM credentials WHERE id = ?`, id).
+		Scan(&kind, &secret.AppID, &secret.InstallationID, &sealed)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", fmt.Errorf("credential %d: %w", id, ErrNotFound)
+		return model.Secret{}, fmt.Errorf("credential %d: %w", id, ErrNotFound)
 	}
 	if err != nil {
-		return "", err
+		return model.Secret{}, err
 	}
-	return s.ring.Open(sealed)
+
+	opened, err := s.ring.Open(sealed)
+	if err != nil {
+		return model.Secret{}, err
+	}
+	secret.Kind = model.CredentialKind(kind)
+	secret.Token = opened
+	return secret, nil
 }
 
-// CredentialFingerprint identifies the token behind a credential without
+// CredentialFingerprint identifies the secret behind a credential without
 // revealing it, so the reconciler can notice that it was replaced.
+//
+// The app id and installation are part of it: pointing a credential at a
+// different app is as much a change as replacing its key, and either has to
+// reach the runners.
 func (s *Store) CredentialFingerprint(ctx context.Context, id int64) (string, error) {
-	token, err := s.Token(ctx, id)
+	secret, err := s.Secret(ctx, id)
 	if err != nil {
 		return "", err
 	}
-	return s.ring.Fingerprint(token), nil
+	return s.ring.Fingerprint(fmt.Sprintf("%s\x00%d\x00%d\x00%s",
+		secret.Kind, secret.AppID, secret.InstallationID, secret.Token)), nil
 }
 
-// ReplaceCredentialToken rotates a token in place, keeping the pools pointed at
-// it. The generation changes with the fingerprint, so runners are replaced
-// gracefully rather than left holding a token that no longer works.
-func (s *Store) ReplaceCredentialToken(ctx context.Context, id int64, token string) error {
-	token = strings.TrimSpace(token)
-	if token == "" {
-		return errors.New("the token is empty")
-	}
-	sealed, err := s.ring.Seal(token)
-	if err != nil {
-		return err
-	}
-	res, err := s.db.ExecContext(ctx, `UPDATE credentials SET sealed = ?, hint = ? WHERE id = ?`, sealed, hintOf(token), id)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
+// ReplaceCredentialSecret rotates a secret in place, keeping the pools pointed
+// at it. The generation changes with the fingerprint, so runners are replaced
+// gracefully rather than left holding a credential that no longer works.
+func (s *Store) ReplaceCredentialSecret(ctx context.Context, id int64, secret string) error {
+	secret = strings.TrimSpace(secret)
+
+	var (
+		kind     string
+		existing model.Credential
+	)
+	err := s.db.QueryRowContext(ctx, `SELECT name, kind, app_id FROM credentials WHERE id = ?`, id).
+		Scan(&existing.Name, &kind, &existing.AppID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("credential %d: %w", id, ErrNotFound)
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	existing.Kind = model.CredentialKind(kind)
+
+	// The same checks as creating one: a key that does not parse must not be
+	// able to get in by the side door.
+	if err := validateCredential(existing, secret); err != nil {
+		return err
+	}
+
+	sealed, err := s.ring.Seal(secret)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE credentials SET sealed = ?, hint = ? WHERE id = ?`,
+		sealed, hintOf(existing, secret), id)
+	return err
 }
 
 // DeleteCredential refuses while a pool still needs it, since the pools would

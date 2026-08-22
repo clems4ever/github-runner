@@ -34,7 +34,7 @@ type Executor interface {
 type Fleet interface {
 	ListPools(ctx context.Context) ([]model.Pool, error)
 	CredentialFingerprint(ctx context.Context, id int64) (string, error)
-	Token(ctx context.Context, id int64) (string, error)
+	Secret(ctx context.Context, id int64) (model.Secret, error)
 	RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error
 }
 
@@ -44,12 +44,14 @@ type GitHubClient interface {
 	Deregister(ctx context.Context, scope github.Scope, name string) error
 }
 
-// ClientFactory builds a GitHub client for one credential.
-type ClientFactory func(token string) GitHubClient
+// ClientFactory builds a GitHub client for one credential, whichever kind it
+// is. Injected rather than reached for, so the fleet's rules can be tested
+// without a network.
+type ClientFactory func(secret model.Secret) (GitHubClient, error)
 
-// CredentialWriter puts a decrypted token where a runner can read it without
+// CredentialWriter puts a decrypted secret where a runner can read it without
 // the daemon's help — on tmpfs, so it never reaches a disk.
-type CredentialWriter func(id int64, token string) error
+type CredentialWriter func(id int64, secret string) error
 
 // Reconciler drives the fleet towards what the store asks for.
 type Reconciler struct {
@@ -180,6 +182,7 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	states := map[string]github.State{}
 	poolByName := map[string]model.Pool{}
 	fingerprints := map[string]string{}
+	secrets := map[string]model.Secret{}
 	scopeSeen := map[string]bool{}
 
 	for _, pool := range pools {
@@ -193,20 +196,22 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 
 		// The runners need the credential without the daemon: they restart on
 		// their own, after a reboot or a crash, and mint a registration token
-		// each time.
-		token, err := r.store.Token(ctx, pool.CredentialID)
+		// each time. For an app that is its private key, which the agent
+		// exchanges for an installation token itself.
+		secret, err := r.store.Secret(ctx, pool.CredentialID)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("pool %s: %v", pool.Name, err))
 			continue
 		}
 		if r.writeSecret != nil {
-			if err := r.writeSecret(pool.CredentialID, token); err != nil {
+			if err := r.writeSecret(pool.CredentialID, secret.Token); err != nil {
 				result.Errors = append(result.Errors, fmt.Sprintf("pool %s: %v", pool.Name, err))
 				continue
 			}
 		}
 
 		fingerprints[pool.Name] = fingerprint
+		secrets[pool.Name] = secret
 
 		// One question per scope, not per runner: three replicas on one
 		// repository are one call.
@@ -216,7 +221,12 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			continue
 		}
 		scopeSeen[key] = true
-		poolStates, err := r.newClient(token).States(ctx, scope)
+		client, err := r.newClient(secret)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("pool %s: %v", pool.Name, err))
+			continue
+		}
+		poolStates, err := client.States(ctx, scope)
 		if err != nil {
 			// Not fatal, but it does change what the plan is allowed to do:
 			// without an answer, nothing is known to be busy. The plan still
@@ -254,7 +264,8 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 		if scale.ScaledUp {
 			result.ScaledUp = true
 		}
-		desired = append(desired, SpecsFor(pool, fingerprint, DesiredNames(pool, mine, states, scale.Target))...)
+		desired = append(desired,
+			SpecsForCredential(pool, fingerprint, DesiredNames(pool, mine, states, scale.Target), secrets[pool.Name])...)
 	}
 	result.Scaling = scaling
 	r.rememberScaling(scaling)
@@ -331,14 +342,18 @@ func (r *Reconciler) statesForOrphans(ctx context.Context, actual []Runner, stat
 		}
 		scopeSeen[key] = true
 
-		token, err := r.store.Token(ctx, runner.CredentialID)
+		secret, err := r.store.Secret(ctx, runner.CredentialID)
 		if err != nil {
 			// The credential is gone too. Nothing can be learned, so the plan
 			// falls back to what the host says — and the host only reports a
 			// drained runner as stopped once it really has stopped.
 			continue
 		}
-		orphanStates, err := r.newClient(token).States(ctx, scope)
+		client, err := r.newClient(secret)
+		if err != nil {
+			continue
+		}
+		orphanStates, err := client.States(ctx, scope)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("ask GitHub about %s: %v", runner.Name, err))
 			continue
@@ -400,11 +415,15 @@ func (r *Reconciler) deregister(ctx context.Context, action Action, pools map[st
 		// own eventually.
 		return
 	}
-	token, err := r.store.Token(ctx, pool.CredentialID)
+	secret, err := r.store.Secret(ctx, pool.CredentialID)
 	if err != nil {
 		return
 	}
-	if err := r.newClient(token).Deregister(ctx, github.ScopeOf(pool), action.Runner); err != nil {
+	client, err := r.newClient(secret)
+	if err != nil {
+		return
+	}
+	if err := client.Deregister(ctx, github.ScopeOf(pool), action.Runner); err != nil {
 		r.log.Warn("could not deregister", "runner", action.Runner, "error", err)
 	}
 }
@@ -472,11 +491,16 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 			continue
 		}
 		scopeSeen[key] = true
-		token, err := r.store.Token(ctx, pool.CredentialID)
+		secret, err := r.store.Secret(ctx, pool.CredentialID)
 		if err != nil {
 			continue
 		}
-		poolStates, err := r.newClient(token).States(ctx, scope)
+		client, err := r.newClient(secret)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("pool %s: %v", pool.Name, err))
+			continue
+		}
+		poolStates, err := client.States(ctx, scope)
 		if err != nil {
 			errs = append(errs, fmt.Sprintf("pool %s: %v", pool.Name, err))
 			continue

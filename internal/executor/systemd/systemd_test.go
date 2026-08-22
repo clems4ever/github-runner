@@ -330,3 +330,44 @@ func TestMapActiveState(t *testing.T) {
 		}
 	}
 }
+
+// A GitHub App's agent signs its own assertion and buys an installation token,
+// so the unit has to carry which app the key belongs to. The key itself stays
+// where every other secret does: on tmpfs, referenced by path.
+func TestTheEnvironmentFileCarriesTheAppDetails(t *testing.T) {
+	_, _, layout := newExecutor(t)
+
+	spec := testSpec("web-1")
+	spec.CredentialKind = model.CredentialApp
+	spec.AppID = 123456
+	spec.InstallationID = 42
+
+	env := RenderEnv(spec, layout)
+	for _, want := range []string{
+		"FLEET_CREDENTIAL_KIND=app",
+		"FLEET_APP_ID=123456",
+		"FLEET_INSTALLATION_ID=42",
+		"FLEET_CREDENTIAL_FILE=" + layout.Credential(7),
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("the configuration is missing %q:\n%s", want, env)
+		}
+	}
+	if strings.Contains(env, "PRIVATE KEY") {
+		t.Fatal("the app's key was written into the unit's environment")
+	}
+}
+
+// An installation of zero means "work it out", and writing it would tell the
+// agent to use installation zero.
+func TestAnUnknownInstallationIsLeftOut(t *testing.T) {
+	_, _, layout := newExecutor(t)
+	spec := testSpec("web-1")
+	spec.CredentialKind = model.CredentialApp
+	spec.AppID = 123456
+
+	env := RenderEnv(spec, layout)
+	if strings.Contains(env, "FLEET_INSTALLATION_ID") {
+		t.Fatalf("an unknown installation was written anyway:\n%s", env)
+	}
+}
