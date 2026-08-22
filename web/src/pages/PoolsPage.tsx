@@ -22,6 +22,7 @@ import {
   IconDots,
   IconDownload,
   IconFileImport,
+  IconMinus,
   IconPencil,
   IconPlus,
   IconStack2,
@@ -31,6 +32,9 @@ import {
   api,
   effectiveLabels,
   emptyPool,
+  isFixed,
+  maxReplicas,
+  scaled,
   type Credential,
   type Pool,
   type Runner,
@@ -57,8 +61,30 @@ export function PoolsPage({
   const [editing, setEditing] = useState<Partial<Pool> | null>(null)
   const [deleting, setDeleting] = useState<Pool | null>(null)
   const [importing, setImporting] = useState(false)
+  // Growing is applied where it is clicked; shrinking is asked about first,
+  // so this holds the pool as it would be once the operator agrees.
+  const [shrinking, setShrinking] = useState<Pool | null>(null)
+  // Which pool is mid-write, so a second click cannot race the first — the
+  // list only catches up once the daemon has answered.
+  const [pending, setPending] = useState<number | null>(null)
 
   const runnersOf = (pool: Pool) => runners.filter((r) => r.pool === pool.name)
+
+  const applyScale = async (next: Pool) => {
+    setPending(next.id)
+    try {
+      await api.updatePool(next.id, next)
+      await onChange()
+    } catch (error) {
+      notifications.show({
+        color: 'red',
+        title: 'Could not scale the pool',
+        message: error instanceof Error ? error.message : String(error),
+      })
+    } finally {
+      setPending(null)
+    }
+  }
 
   // Saved as a file rather than shown: this is something to keep next to a
   // repository, so the next host can be set up by importing it.
@@ -141,7 +167,10 @@ export function PoolsPage({
               pool={pool}
               live={runnersOf(pool).length}
               decision={scaling[pool.name]}
+              scaling={pending === pool.id}
               onChange={onChange}
+              onScaleUp={applyScale}
+              onScaleDown={setShrinking}
               onEdit={() => setEditing(pool)}
               onDelete={() => setDeleting(pool)}
             />
@@ -177,7 +206,14 @@ export function PoolsPage({
                       <RuntimeBadges pool={pool} />
                     </Table.Td>
                     <Table.Td>
-                      <RunnersCell pool={pool} live={live.length} decision={scaling[pool.name]} />
+                      <RunnersCell
+                        pool={pool}
+                        live={live.length}
+                        decision={scaling[pool.name]}
+                        scaling={pending === pool.id}
+                        onScaleUp={applyScale}
+                        onScaleDown={setShrinking}
+                      />
                     </Table.Td>
                     <Table.Td>
                       <LabelBadges pool={pool} />
@@ -242,6 +278,30 @@ export function PoolsPage({
         />
       </Modal>
 
+      <Modal opened={shrinking !== null} onClose={() => setShrinking(null)} title="Scale down">
+        <Stack>
+          <Text size="sm">
+            Scale <b>{shrinking?.name}</b> down to {shrinking && describeSize(shrinking)}?{' '}
+            {shrinking && shrinkEffect(shrinking, runnersOf(shrinking).length)}
+          </Text>
+          <Group justify="flex-end">
+            <Button variant="default" onClick={() => setShrinking(null)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={async () => {
+                if (!shrinking) return
+                const next = shrinking
+                setShrinking(null)
+                await applyScale(next)
+              }}
+            >
+              Scale down
+            </Button>
+          </Group>
+        </Stack>
+      </Modal>
+
       <Modal opened={deleting !== null} onClose={() => setDeleting(null)} title="Delete pool">
         <Stack>
           <Text size="sm">
@@ -289,14 +349,20 @@ function PoolCard({
   pool,
   live,
   decision,
+  scaling,
   onChange,
+  onScaleUp,
+  onScaleDown,
   onEdit,
   onDelete,
 }: {
   pool: Pool
   live: number
   decision?: Scale
+  scaling: boolean
   onChange: () => Promise<void>
+  onScaleUp: (next: Pool) => void
+  onScaleDown: (next: Pool) => void
   onEdit: () => void
   onDelete: () => void
 }) {
@@ -319,7 +385,14 @@ function PoolCard({
           <RuntimeBadges pool={pool} />
         </Field>
         <Field label="Runners">
-          <RunnersCell pool={pool} live={live} decision={decision} />
+          <RunnersCell
+            pool={pool}
+            live={live}
+            decision={decision}
+            scaling={scaling}
+            onScaleUp={onScaleUp}
+            onScaleDown={onScaleDown}
+          />
         </Field>
         <Field label="Labels">
           <LabelBadges pool={pool} />
@@ -364,26 +437,137 @@ function RuntimeBadges({ pool }: { pool: Pool }) {
   )
 }
 
-function RunnersCell({ pool, live, decision }: { pool: Pool; live: number; decision?: Scale }) {
+function RunnersCell({
+  pool,
+  live,
+  decision,
+  scaling,
+  onScaleUp,
+  onScaleDown,
+}: {
+  pool: Pool
+  live: number
+  decision?: Scale
+  scaling: boolean
+  onScaleUp: (next: Pool) => void
+  onScaleDown: (next: Pool) => void
+}) {
   return (
-    <Tooltip label={decision?.reason ?? 'no decision recorded yet'} disabled={!decision}>
-      <Group gap={6} wrap="nowrap" justify="flex-end">
-        <Text size="sm" fw={500}>
-          {live}
-        </Text>
-        <Text size="sm" c="dimmed">
-          {pool.minReplicas === pool.maxReplicas
-            ? `/ ${pool.maxReplicas}`
-            : `of ${pool.minReplicas}–${pool.maxReplicas}`}
-        </Text>
-        {decision?.scaledUp && (
-          <Badge size="xs" color="blue" variant="light">
-            scaling up
-          </Badge>
-        )}
-      </Group>
-    </Tooltip>
+    <Group gap="xs" wrap="nowrap" justify="flex-end">
+      <Tooltip label={decision?.reason ?? 'no decision recorded yet'} disabled={!decision}>
+        <Group gap={6} wrap="nowrap">
+          <Text size="sm" fw={500}>
+            {live}
+          </Text>
+          <Text size="sm" c="dimmed">
+            {pool.minReplicas === pool.maxReplicas
+              ? `/ ${pool.maxReplicas}`
+              : `of ${pool.minReplicas}–${pool.maxReplicas}`}
+          </Text>
+          {decision?.scaledUp && (
+            <Badge size="xs" color="blue" variant="light">
+              scaling up
+            </Badge>
+          )}
+        </Group>
+      </Tooltip>
+      <ScaleStepper
+        pool={pool}
+        busy={scaling}
+        onScaleUp={onScaleUp}
+        onScaleDown={onScaleDown}
+      />
+    </Group>
   )
+}
+
+/**
+ * Resizing a pool without opening its definition.
+ *
+ * A step moves the ceiling, which is the number that says how big the pool may
+ * get; on a fixed pool the floor comes along, so it stays fixed. That keeps one
+ * click from turning an autoscaling pool into a fixed one or the other way
+ * round — anything that changes a pool's kind belongs on the editor, where
+ * there is room to explain it.
+ */
+function ScaleStepper({
+  pool,
+  busy,
+  onScaleUp,
+  onScaleDown,
+}: {
+  pool: Pool
+  busy: boolean
+  onScaleUp: (next: Pool) => void
+  onScaleDown: (next: Pool) => void
+}) {
+  const smaller = scaled(pool, -1)
+  const bigger = scaled(pool, 1)
+  return (
+    <Group gap={2} wrap="nowrap">
+      <Tooltip label={smaller ? `Scale to ${describeSize(smaller)}` : floorReason(pool)}>
+        <ActionIcon
+          variant="default"
+          size="sm"
+          aria-label={`Scale ${pool.name} down`}
+          disabled={busy || !smaller}
+          onClick={() => smaller && onScaleDown(smaller)}
+        >
+          <IconMinus size={14} />
+        </ActionIcon>
+      </Tooltip>
+      <Tooltip
+        label={
+          bigger
+            ? `Scale to ${describeSize(bigger)}`
+            : `${maxReplicas} runners is the most a pool can have`
+        }
+      >
+        <ActionIcon
+          variant="default"
+          size="sm"
+          aria-label={`Scale ${pool.name} up`}
+          disabled={busy || !bigger}
+          onClick={() => bigger && onScaleUp(bigger)}
+        >
+          <IconPlus size={14} />
+        </ActionIcon>
+      </Tooltip>
+    </Group>
+  )
+}
+
+/** How big a pool is, in the terms its kind makes true. */
+function describeSize(pool: Pool): string {
+  return isFixed(pool)
+    ? countOf(pool.maxReplicas)
+    : `${pool.minReplicas}–${countOf(pool.maxReplicas)}`
+}
+
+/** Why a pool will not go any smaller from here. */
+function floorReason(pool: Pool): string {
+  return isFixed(pool)
+    ? 'A pool keeps at least one runner — switch it off instead'
+    : `Its minimum is ${pool.minReplicas}. Lower that in the editor, where a pool can also stop autoscaling`
+}
+
+/** What shrinking would actually do to the runners that are up right now. */
+function shrinkEffect(next: Pool, live: number): string {
+  const over = live - next.maxReplicas
+  if (live === 0) {
+    return 'Nothing is running, so nothing goes away.'
+  }
+  if (over <= 0) {
+    return `Its ${countOf(live)} fit under the new maximum, so none goes away — the pool simply cannot grow past ${next.maxReplicas} any more.`
+  }
+  if (over === 1) {
+    return 'The runner over the new maximum is drained rather than killed: it finishes the job it is on before it goes away.'
+  }
+  return `The ${countOf(over)} over the new maximum are drained rather than killed: each finishes the job it is on before it goes away.`
+}
+
+function countOf(n: number): string {
+  return `${n} runner${n === 1 ? '' : 's'}`
 }
 
 function LabelBadges({ pool }: { pool: Pool }) {
