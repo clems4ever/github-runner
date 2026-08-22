@@ -389,6 +389,68 @@ type ActivityPoint struct {
 	Busy    int       `json:"busy"`
 }
 
+// HostSample is one observation of the machine the fleet runs on. Kept over
+// time, these are what the resource history draws.
+//
+// The totals are stored alongside the used figures rather than being assumed
+// constant: memory and disk both change under a host that is resized or has a
+// volume grown, and a chart drawn against yesterday's total would be wrong for
+// yesterday.
+type HostSample struct {
+	CPUPercent       float64
+	MemoryUsedBytes  int64
+	MemoryTotalBytes int64
+	DiskUsedBytes    int64
+	DiskTotalBytes   int64
+}
+
+// HostPoint is one point on the resource history chart.
+//
+// Percentages rather than bytes, so that three quantities measured in three
+// different units share one axis and can be read against each other. The bytes
+// are in the live report, where a number is being read rather than a shape.
+type HostPoint struct {
+	At            time.Time `json:"at"`
+	CPUPercent    float64   `json:"cpuPercent"`
+	MemoryPercent float64   `json:"memoryPercent"`
+	DiskPercent   float64   `json:"diskPercent"`
+}
+
+// Commitment is what the pools have promised the host, if every one of them
+// grew to its ceiling at once.
+//
+// It is a configured number, not a measured one, and the difference is the
+// point of showing it: a fleet can be idle and still be oversubscribed three
+// times over, and the moment that matters is the moment every pool is busy.
+type Commitment struct {
+	// Runners is how many would exist at full stretch.
+	Runners int `json:"runners"`
+	// CPUs is the sum of what they would be given. Machines are handed a fixed
+	// number of processors and containers a quota, so both count.
+	CPUs        int   `json:"cpus"`
+	MemoryBytes int64 `json:"memoryBytes"`
+	// DiskBytes counts machines only. A container writes into the host's
+	// filesystem without reserving anything, so there is no figure to add.
+	DiskBytes int64 `json:"diskBytes"`
+}
+
+// Commit adds up what a set of pools would take at their ceiling. Pools that
+// are switched off are left out: they have a ceiling of zero runners.
+func Commit(pools []Pool) Commitment {
+	var total Commitment
+	for i := range pools {
+		pool := pools[i]
+		ceiling := pool.Ceiling()
+		total.Runners += ceiling
+		total.CPUs += ceiling * pool.CPUs
+		total.MemoryBytes += int64(ceiling) * int64(pool.MemoryMB) * 1024 * 1024
+		if pool.Runtime == RuntimeVM {
+			total.DiskBytes += int64(ceiling) * int64(pool.DiskGB) * 1024 * 1024 * 1024
+		}
+	}
+	return total
+}
+
 // DefaultImage is what a pool runs when nothing else is asked for.
 //
 // The value is a variant key rather than a path: pools will grow per-repository

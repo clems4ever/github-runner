@@ -813,3 +813,104 @@ func TestUpgradingADatabaseFromBeforeApps(t *testing.T) {
 		t.Fatalf("got %+v", secret)
 	}
 }
+
+func TestHostHistoryKeepsThePeakOfEachBucket(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	start := time.Now().UTC().Add(-time.Hour)
+
+	// Three readings inside one bucket. The middle one is a build storm, and a
+	// mean over the bucket would leave no trace of it at all.
+	for i, cpu := range []float64{5, 92, 7} {
+		if err := s.RecordHostSample(ctx, start.Add(time.Duration(i)*time.Second), model.HostSample{
+			CPUPercent:       cpu,
+			MemoryUsedBytes:  int64(i+1) * 1024,
+			MemoryTotalBytes: 4096,
+			DiskUsedBytes:    1024,
+			DiskTotalBytes:   4096,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	points, err := s.HostHistory(ctx, start.Add(-time.Minute), time.Now().UTC(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("want the readings in one bucket, got %d: %+v", len(points), points)
+	}
+	if points[0].CPUPercent != 92 {
+		t.Fatalf("want the peak, got %v", points[0].CPUPercent)
+	}
+	if points[0].MemoryPercent != 75 {
+		t.Fatalf("want the peak memory as a share of the total, got %v", points[0].MemoryPercent)
+	}
+	if points[0].DiskPercent != 25 {
+		t.Fatalf("disk: got %v", points[0].DiskPercent)
+	}
+}
+
+// A daemon that was not running should read as a gap in the line rather than
+// as a host that was switched off and using nothing.
+func TestHostHistoryLeavesEmptyBucketsOut(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	until := time.Now().UTC()
+
+	if err := s.RecordHostSample(ctx, until.Add(-time.Minute), model.HostSample{
+		CPUPercent: 10, MemoryUsedBytes: 1, MemoryTotalBytes: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	points, err := s.HostHistory(ctx, until.Add(-6*time.Hour), until, 180)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("want only the bucket that has a reading, got %d", len(points))
+	}
+}
+
+func TestHostHistoryIsPrunedToTheRetentionWindow(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := s.RecordHostSample(ctx, now.Add(-SampleRetention-time.Hour), model.HostSample{CPUPercent: 50}); err != nil {
+		t.Fatal(err)
+	}
+	// Writing the next one is what prunes: nobody has to think about the size
+	// of this table.
+	if err := s.RecordHostSample(ctx, now, model.HostSample{CPUPercent: 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	points, err := s.HostHistory(ctx, now.Add(-SampleRetention-2*time.Hour), now.Add(time.Minute), 180)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].CPUPercent != 10 {
+		t.Fatalf("the aged-out reading is still here: %+v", points)
+	}
+}
+
+// A host whose totals are zero — a disk that could not be measured — must not
+// divide by them.
+func TestHostHistorySurvivesAMeasurementThatFailed(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := s.RecordHostSample(ctx, now, model.HostSample{CPUPercent: 3}); err != nil {
+		t.Fatal(err)
+	}
+	points, err := s.HostHistory(ctx, now.Add(-time.Hour), now.Add(time.Minute), 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].DiskPercent != 0 {
+		t.Fatalf("got %+v", points)
+	}
+}

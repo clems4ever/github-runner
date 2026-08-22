@@ -116,6 +116,18 @@ var migrations = []string{
 	`ALTER TABLE credentials ADD COLUMN kind TEXT NOT NULL DEFAULT 'pat'`,
 	`ALTER TABLE credentials ADD COLUMN app_id INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE credentials ADD COLUMN installation_id INTEGER NOT NULL DEFAULT 0`,
+	// What the host itself was using, over time. A table of its own rather than
+	// columns on samples: that one has a row per pool per pass, and the host is
+	// one thing however many pools are on it.
+	`CREATE TABLE host_samples (
+		at           TEXT    NOT NULL,
+		cpu_percent  REAL    NOT NULL,
+		memory_used  INTEGER NOT NULL,
+		memory_total INTEGER NOT NULL,
+		disk_used    INTEGER NOT NULL,
+		disk_total   INTEGER NOT NULL
+	)`,
+	`CREATE INDEX host_samples_at ON host_samples(at)`,
 }
 
 // SampleRetention is how much history the daemon keeps. Two days covers "what
@@ -758,6 +770,107 @@ func (s *Store) Activity(ctx context.Context, since, until time.Time, buckets in
 		}
 	}
 	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Host resources
+// ---------------------------------------------------------------------------
+
+// RecordHostSample stores one observation of the host and prunes what has aged
+// out, on the same two-day retention as the fleet's own history.
+func (s *Store) RecordHostSample(ctx context.Context, at time.Time, sample model.HostSample) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO host_samples (at, cpu_percent, memory_used, memory_total, disk_used, disk_total)
+		 VALUES (?,?,?,?,?,?)`,
+		at.UTC().Format(time.RFC3339Nano), sample.CPUPercent,
+		sample.MemoryUsedBytes, sample.MemoryTotalBytes,
+		sample.DiskUsedBytes, sample.DiskTotalBytes); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM host_samples WHERE at < ?`,
+		at.Add(-SampleRetention).UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// HostHistory returns what the host has been using over a window, bucketed the
+// same way the activity chart is.
+//
+// Each bucket reports the peak, for the same reason: a build storm that pinned
+// every core for ninety seconds is the thing worth seeing, and a mean over a
+// ten-minute bucket would leave no trace of it at all.
+func (s *Store) HostHistory(ctx context.Context, since, until time.Time, buckets int) ([]model.HostPoint, error) {
+	if buckets < 1 {
+		buckets = 1
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT at, cpu_percent, memory_used, memory_total, disk_used, disk_total
+		 FROM host_samples WHERE at >= ? AND at <= ? ORDER BY at`,
+		since.UTC().Format(time.RFC3339Nano), until.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	width := until.Sub(since) / time.Duration(buckets)
+	if width <= 0 {
+		width = time.Second
+	}
+	peaks := make([]*model.HostPoint, buckets)
+
+	for rows.Next() {
+		var stamp string
+		var sample model.HostSample
+		if err := rows.Scan(&stamp, &sample.CPUPercent, &sample.MemoryUsedBytes,
+			&sample.MemoryTotalBytes, &sample.DiskUsedBytes, &sample.DiskTotalBytes); err != nil {
+			return nil, err
+		}
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil {
+			continue
+		}
+		index := int(at.Sub(since) / width)
+		if index < 0 || index >= buckets {
+			continue
+		}
+		if peaks[index] == nil {
+			peaks[index] = &model.HostPoint{At: since.Add(time.Duration(index) * width)}
+		}
+		point := peaks[index]
+		point.CPUPercent = max(point.CPUPercent, sample.CPUPercent)
+		point.MemoryPercent = max(point.MemoryPercent, share(sample.MemoryUsedBytes, sample.MemoryTotalBytes))
+		point.DiskPercent = max(point.DiskPercent, share(sample.DiskUsedBytes, sample.DiskTotalBytes))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Empty buckets are left out rather than drawn as zero, so a daemon that
+	// was not running reads as a gap in the line rather than as an idle host.
+	out := []model.HostPoint{}
+	for _, point := range peaks {
+		if point != nil {
+			out = append(out, *point)
+		}
+	}
+	return out, nil
+}
+
+// share turns a used-of-total pair into a percentage, rounded to the two
+// decimals a chart can actually draw.
+func share(used, total int64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return float64(int64(float64(used)/float64(total)*10000+0.5)) / 100
 }
 
 func isUnique(err error) bool {

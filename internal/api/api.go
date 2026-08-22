@@ -21,6 +21,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
+	"github.com/clems4ever/github-runner/internal/resources"
 	"github.com/clems4ever/github-runner/internal/store"
 	"github.com/clems4ever/github-runner/internal/template"
 )
@@ -35,6 +36,7 @@ type Store interface {
 	DeletePool(ctx context.Context, id int64) error
 	ImportPools(ctx context.Context, pools []model.Pool, replaceExisting, dryRun bool) ([]store.ImportOutcome, error)
 	Activity(ctx context.Context, since, until time.Time, buckets int, pool string) ([]model.ActivityPoint, error)
+	HostHistory(ctx context.Context, since, until time.Time, buckets int) ([]model.HostPoint, error)
 	ListCredentials(ctx context.Context) ([]model.Credential, error)
 	CreateCredential(ctx context.Context, credential model.Credential, secret string) (model.Credential, error)
 	ReplaceCredentialSecret(ctx context.Context, id int64, secret string) error
@@ -48,14 +50,21 @@ type Fleet interface {
 	Scaling() map[string]reconcile.Scale
 }
 
+// Resources is what the API needs from the resource sampler: the most recent
+// reading, and whether one has been taken yet.
+type Resources interface {
+	Latest() (resources.Report, bool)
+}
+
 // Server is the HTTP surface.
 type Server struct {
-	store   Store
-	fleet   Fleet
-	auth    *Authenticator
-	ui      fs.FS
-	version string
-	check   CheckAccess
+	store     Store
+	fleet     Fleet
+	resources Resources
+	auth      *Authenticator
+	ui        fs.FS
+	version   string
+	check     CheckAccess
 	// nudge asks the daemon to reconcile now rather than at the next tick, so
 	// a change made in the UI takes effect while the operator is still looking
 	// at it.
@@ -68,8 +77,11 @@ type CheckAccess func(ctx context.Context, credentialID int64, scope github.Scop
 
 // Options configures the server.
 type Options struct {
-	Store       Store
-	Fleet       Fleet
+	Store Store
+	Fleet Fleet
+	// Resources may be nil, which is a daemon that serves everything else and
+	// says it has not measured the host.
+	Resources   Resources
 	UI          fs.FS
 	Version     string
 	Nudge       func()
@@ -79,13 +91,14 @@ type Options struct {
 // New builds the server.
 func New(opts Options) *Server {
 	s := &Server{
-		store:   opts.Store,
-		fleet:   opts.Fleet,
-		auth:    NewAuthenticator(opts.Store),
-		ui:      opts.UI,
-		version: opts.Version,
-		nudge:   opts.Nudge,
-		check:   opts.CheckAccess,
+		store:     opts.Store,
+		fleet:     opts.Fleet,
+		resources: opts.Resources,
+		auth:      NewAuthenticator(opts.Store),
+		ui:        opts.UI,
+		version:   opts.Version,
+		nudge:     opts.Nudge,
+		check:     opts.CheckAccess,
 	}
 	if s.nudge == nil {
 		s.nudge = func() {}
@@ -109,6 +122,8 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/runners", s.listRunners)
 	api.HandleFunc("POST /api/reconcile", s.reconcileNow)
 	api.HandleFunc("GET /api/activity", s.activity)
+	api.HandleFunc("GET /api/resources", s.resourceReport)
+	api.HandleFunc("GET /api/resources/history", s.resourceHistory)
 	api.HandleFunc("GET /api/credentials", s.listCredentials)
 	api.HandleFunc("POST /api/credentials", s.createCredential)
 	api.HandleFunc("PUT /api/credentials/{id}/secret", s.rotateCredential)
@@ -388,21 +403,11 @@ func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 // activity is the fleet's history: how many runners existed and how many were
 // working, over a window.
 func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
-	hours := 6
-	if raw := r.URL.Query().Get("hours"); raw != "" {
-		parsed, err := strconv.Atoi(raw)
-		if err != nil || parsed < 1 || parsed > 48 {
-			writeError(w, errBadRequest("hours must be a whole number from 1 to 48"))
-			return
-		}
-		hours = parsed
+	since, until, err := window(r)
+	if err != nil {
+		writeError(w, err)
+		return
 	}
-
-	// Enough points for a chart to have shape, few enough that the browser is
-	// drawing a picture rather than a spreadsheet.
-	const buckets = 180
-	until := time.Now().UTC()
-	since := until.Add(-time.Duration(hours) * time.Hour)
 
 	// An unknown pool is not an error: it comes back empty, which is what a
 	// pool created a moment ago honestly has.
@@ -421,8 +426,88 @@ func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// buckets is how many points a history window is reduced to: enough for a
+// chart to have shape, few enough that the browser is drawing a picture rather
+// than a spreadsheet.
+const buckets = 180
+
+// window is the span a history request is asking about. It is shared by every
+// chart, so that "6h" means the same thing and lines up on all of them.
+func window(r *http.Request) (since, until time.Time, err error) {
+	hours := 6
+	if raw := r.URL.Query().Get("hours"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 48 {
+			return time.Time{}, time.Time{}, errBadRequest("hours must be a whole number from 1 to 48")
+		}
+		hours = parsed
+	}
+	until = time.Now().UTC()
+	return until.Add(-time.Duration(hours) * time.Hour), until, nil
+}
+
 func (s *Server) reconcileNow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.fleet.Once(r.Context()))
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+// resourceReport is what the host and its runners are using now, next to what
+// the pools have promised.
+//
+// The reading is the sampler's most recent one rather than a fresh one taken
+// here. A percentage is the difference between two readings at a known
+// cadence, so a request that took its own would be measuring a window it had
+// just stolen from the next one — and every open browser tab would be doing
+// it. The response says when the reading was taken, so nobody has to guess how
+// fresh it is.
+func (s *Server) resourceReport(w http.ResponseWriter, r *http.Request) {
+	if s.resources == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ready": false})
+		return
+	}
+	report, ready := s.resources.Latest()
+	if !ready {
+		// Not an error: the daemon has been up for less than one sample. The
+		// UI says so rather than drawing a host with no memory.
+		writeJSON(w, http.StatusOK, map[string]any{"ready": false})
+		return
+	}
+
+	pools, err := s.store.ListPools(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ready":     true,
+		"at":        report.At,
+		"host":      report.Host,
+		"runners":   report.Runners,
+		"warnings":  report.Warnings,
+		"committed": model.Commit(pools),
+	})
+}
+
+// resourceHistory is what the host has been using, over a window.
+func (s *Server) resourceHistory(w http.ResponseWriter, r *http.Request) {
+	since, until, err := window(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	points, err := s.store.HostHistory(r.Context(), since, until, buckets)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"points": points,
+		"since":  since,
+		"until":  until,
+	})
 }
 
 // ---------------------------------------------------------------------------

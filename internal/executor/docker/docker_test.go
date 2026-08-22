@@ -25,13 +25,23 @@ type fakeDocker struct {
 	containers []container
 	imageKnown bool
 	stopDelay  time.Duration
+	// stats is the statistics document per container name. A name that is not
+	// in here is a container Docker refuses to talk about.
+	stats map[string]string
 }
 
 func (f *fakeDocker) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := strings.TrimPrefix(r.URL.Path, "/v1.44")
+		// The query is recorded too: some of what the daemon asks for — the
+		// label filter on a listing, one-shot statistics — is in it, and a test
+		// that could not see it could not tell that it had been dropped.
+		recorded := r.Method + " " + path
+		if r.URL.RawQuery != "" {
+			recorded += "?" + r.URL.RawQuery
+		}
 		f.mu.Lock()
-		f.requests = append(f.requests, r.Method+" "+path)
+		f.requests = append(f.requests, recorded)
 		if r.Body != nil {
 			if raw, _ := io.ReadAll(r.Body); len(raw) > 0 {
 				var decoded map[string]any
@@ -69,6 +79,17 @@ func (f *fakeDocker) handler() http.Handler {
 			list := f.containers
 			f.mu.Unlock()
 			json.NewEncoder(w).Encode(list)
+		case strings.HasSuffix(path, "/stats"):
+			name := strings.TrimSuffix(strings.TrimPrefix(path, "/containers/"), "/stats")
+			f.mu.Lock()
+			document, known := f.stats[name]
+			f.mu.Unlock()
+			if !known {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"message":"cannot read cgroup"}`))
+				return
+			}
+			w.Write([]byte(document))
 		case r.Method == http.MethodDelete:
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -441,5 +462,136 @@ func TestUnreachableDockerSaysWhy(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "dockerd") {
 		t.Fatalf("got %q", err)
+	}
+}
+
+// The memory figure is deliberately not Docker's "usage": that includes the
+// page cache, so a container that has cloned a large repository reports most of
+// its limit used and looks about to die. Docker's own CLI subtracts the
+// inactive file cache before printing, and so does this.
+func TestUsageSubtractsThePageCacheFromMemory(t *testing.T) {
+	e, fake := newExecutor(t)
+	fake.containers = []container{{
+		ID: "1", State: "running",
+		Labels: map[string]string{LabelRunner: "api-1", LabelPool: "api", LabelGeneration: "g"},
+	}}
+	fake.stats = map[string]string{
+		"api-1": `{"cpu_stats":{"cpu_usage":{"total_usage":1000000000}},
+			"memory_stats":{"usage":1073741824,"stats":{"inactive_file":536870912}}}`,
+	}
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 {
+		t.Fatalf("got %v", usage)
+	}
+	if usage[0].MemoryBytes != 536870912 {
+		t.Fatalf("want the cache left out, got %d", usage[0].MemoryBytes)
+	}
+	if usage[0].Name != "api-1" || usage[0].Pool != "api" || usage[0].Runtime != "container" {
+		t.Fatalf("the row does not say which runner this is: %+v", usage[0])
+	}
+	// One reading, so no rate yet.
+	if usage[0].CPUPercent != nil {
+		t.Fatalf("want no figure from one reading, got %v", *usage[0].CPUPercent)
+	}
+}
+
+// Cgroup v1 spells the same number differently, and a host on it must not
+// report every container as using its whole page cache.
+func TestUsageUnderstandsBothCgroupVersions(t *testing.T) {
+	e, fake := newExecutor(t)
+	fake.containers = []container{{
+		ID: "1", State: "running",
+		Labels: map[string]string{LabelRunner: "api-1", LabelPool: "api"},
+	}}
+	fake.stats = map[string]string{
+		"api-1": `{"memory_stats":{"usage":1000,"stats":{"total_inactive_file":400}}}`,
+	}
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage[0].MemoryBytes != 600 {
+		t.Fatalf("got %d", usage[0].MemoryBytes)
+	}
+}
+
+// Asked without one-shot, Docker holds the request open for a second per
+// container so it can work out a percentage of its own. Across a fleet that is
+// a second of the daemon's attention each, every sample, for a number this
+// works out for itself from the counter.
+func TestUsageAsksForOneShotStatistics(t *testing.T) {
+	e, fake := newExecutor(t)
+	fake.containers = []container{{
+		ID: "1", State: "running", Labels: map[string]string{LabelRunner: "api-1"},
+	}}
+	fake.stats = map[string]string{"api-1": `{"memory_stats":{"usage":1}}`}
+
+	if _, err := e.Usage(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.called("one-shot=true") || !fake.called("stream=false") {
+		t.Fatalf("requests were %v", fake.requests)
+	}
+}
+
+// A stopped container has no cgroup to ask about, and a row of zeroes reads as
+// a runner doing nothing rather than as a runner that is not there.
+func TestUsageLeavesOutContainersThatAreNotRunning(t *testing.T) {
+	e, fake := newExecutor(t)
+	fake.containers = []container{
+		{ID: "1", State: "exited", Labels: map[string]string{LabelRunner: "api-1"}},
+		{ID: "2", State: "running", Labels: map[string]string{LabelRunner: "api-2"}},
+	}
+	fake.stats = map[string]string{"api-2": `{"memory_stats":{"usage":2048}}`}
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 || usage[0].Name != "api-2" {
+		t.Fatalf("got %+v", usage)
+	}
+	if fake.called("/containers/api-1/stats") {
+		t.Fatal("a stopped container was asked about")
+	}
+}
+
+// Nine containers answered and the tenth did not. Throwing the nine away would
+// leave a page saying a busy host is empty, so the rows come back with an error
+// naming what is missing.
+func TestUsageKeepsWhatItCouldReadAndNamesWhatItCouldNot(t *testing.T) {
+	e, fake := newExecutor(t)
+	fake.containers = []container{
+		{ID: "1", State: "running", Labels: map[string]string{LabelRunner: "api-1"}},
+		{ID: "2", State: "running", Labels: map[string]string{LabelRunner: "api-2"}},
+	}
+	fake.stats = map[string]string{"api-1": `{"memory_stats":{"usage":4096}}`}
+
+	usage, err := e.Usage(context.Background())
+	if err == nil {
+		t.Fatal("want the container that could not be read reported")
+	}
+	if !strings.Contains(err.Error(), "api-2") {
+		t.Fatalf("the error should name it: %v", err)
+	}
+	if len(usage) != 1 || usage[0].Name != "api-1" {
+		t.Fatalf("the readable row was thrown away: %+v", usage)
+	}
+}
+
+// A host without Docker has no container runners, which is a true answer
+// rather than an error — the same rule listing follows.
+func TestUsageIsQuietWhenThereIsNoDocker(t *testing.T) {
+	e, _ := newExecutor(t)
+	e.socket = "/nowhere/docker.sock"
+
+	usage, err := e.Usage(context.Background())
+	if err != nil || usage != nil {
+		t.Fatalf("got %v, %v", usage, err)
 	}
 }

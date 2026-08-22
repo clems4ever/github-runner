@@ -26,6 +26,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
+	"github.com/clems4ever/github-runner/internal/resources"
 )
 
 // Labels the daemon stamps on every container it owns. They are how a
@@ -74,6 +75,10 @@ type Executor struct {
 	// nothing.
 	mu       sync.Mutex
 	draining map[string]bool
+
+	// cpu remembers each container's processor counter between samples, which
+	// is what makes a percentage out of it.
+	cpu *resources.Rate
 }
 
 // Option configures the executor.
@@ -93,6 +98,7 @@ func New(layout paths.Layout, binary string, opts ...Option) *Executor {
 		host:     "http://docker",
 		socket:   DefaultSocket,
 		draining: map[string]bool{},
+		cpu:      resources.NewRate(),
 		http: &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -324,6 +330,95 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 	}
 	sort.Slice(runners, func(i, j int) bool { return runners[i].Name < runners[j].Name })
 	return runners, nil
+}
+
+// containerStats is the part of Docker's stats document this needs.
+//
+// The memory figure is deliberately not "usage": that includes the page cache,
+// so a container that has read a large repository reports most of its limit
+// used and looks about to die. Docker's own CLI subtracts the inactive file
+// cache before printing, and so does this — under both names the two cgroup
+// versions give it.
+type containerStats struct {
+	CPU struct {
+		Usage struct {
+			Total uint64 `json:"total_usage"`
+		} `json:"cpu_usage"`
+	} `json:"cpu_stats"`
+	Memory struct {
+		Usage int64            `json:"usage"`
+		Stats map[string]int64 `json:"stats"`
+	} `json:"memory_stats"`
+}
+
+func (s containerStats) memory() int64 {
+	used := s.Memory.Usage
+	for _, key := range []string{"inactive_file", "total_inactive_file"} {
+		if cache, ok := s.Memory.Stats[key]; ok {
+			used -= cache
+			break
+		}
+	}
+	if used < 0 {
+		return 0
+	}
+	return used
+}
+
+// Usage reports what each container runner is consuming.
+//
+// One-shot statistics: asked without it, Docker holds the request open for a
+// second so that it can compute a processor percentage from two readings of
+// its own. Across a fleet that is a second of the daemon's attention per
+// container, every sample, to arrive at a number this can work out for itself
+// from the counter — and over a fifteen-second window rather than a one-second
+// one, which is the better measurement anyway.
+func (e *Executor) Usage(ctx context.Context) ([]resources.RunnerUsage, error) {
+	if !e.available() {
+		return nil, nil
+	}
+	runners, err := e.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list what the containers are using: %w", err)
+	}
+
+	usage := make([]resources.RunnerUsage, 0, len(runners))
+	names := make([]string, 0, len(runners))
+	var unreadable []string
+	for _, runner := range runners {
+		names = append(names, runner.Name)
+		// A stopped container has no cgroup to ask about, and asking would only
+		// produce a row of zeroes that reads as a runner doing nothing rather
+		// than as a runner that is not there.
+		if runner.State == reconcile.StateStopped {
+			continue
+		}
+
+		var stats containerStats
+		path := "/containers/" + url.PathEscape(runner.Name) + "/stats?stream=false&one-shot=true"
+		if err := e.do(ctx, http.MethodGet, path, nil, &stats); err != nil {
+			// Removed between the listing and the question, which is ordinary
+			// for an ephemeral fleet and not worth telling anyone about.
+			if !isNotFound(err) {
+				unreadable = append(unreadable, runner.Name)
+			}
+			continue
+		}
+		usage = append(usage, resources.RunnerUsage{
+			Name:        runner.Name,
+			Pool:        runner.Pool,
+			Runtime:     string(model.RuntimeContainer),
+			CPUPercent:  e.cpu.Percent(runner.Name, stats.CPU.Usage.Total),
+			MemoryBytes: stats.memory(),
+		})
+	}
+	e.cpu.Keep(names)
+
+	if len(unreadable) > 0 {
+		return usage, fmt.Errorf("docker would not say what these containers are using: %s",
+			strings.Join(unreadable, ", "))
+	}
+	return usage, nil
 }
 
 // mapState turns Docker's vocabulary into the three states the reconciler

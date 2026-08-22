@@ -196,6 +196,37 @@ other one recycles, so a queue never pays the turnaround at all. Turning
 jobs and the boot disappears entirely, at the cost of a job seeing what the
 last one left behind.
 
+### Resources
+
+The **Resources** page is what the host is actually doing, as opposed to what
+its pools were promised. Three meters — processor, memory, and the filesystem
+holding the state directory, which is the one golden images and machine disks
+fill — over a chart of the same three across the last day, and under it a row
+per runner.
+
+Everything is read from the kernel, and each runtime is measured the way that
+runtime can be measured. A **container** is asked of Docker, minus the page
+cache, which is what makes a container that has cloned a large repository look
+about to die when it is fine. A **machine** is asked of systemd: every runner is
+a unit, every unit is a cgroup, and the accounting is already there — so nothing
+has to be read out of the guest, and a machine that has wandered off into swap
+is still counted. Processor figures are a share of the whole host, the same
+scale the meters use, so a runner's number and the host's can be read against
+each other. A runner that has only been seen once shows a dash rather than a
+zero: a rate needs two readings, and a machine that is busily booting is not
+idle.
+
+Beneath them is what the pools have **committed** — what they would take if
+every one of them grew to its ceiling at the same moment. That is arithmetic on
+the configuration rather than a measurement, and it is the number a quiet fleet
+hides: a host at four per cent can still be promising three times the machine it
+is on. Over-committing is not flagged as a fault, because it is usually
+deliberate; it is stated, and left to you.
+
+Readings are taken every fifteen seconds — `--resource-interval` moves that —
+and two days of them are kept, on the same retention as the activity history.
+Each point on the chart is the peak of its interval, for the same reason.
+
 ### Virtual machines or containers
 
 A **virtual machine** gives a job its own kernel, its own Docker daemon, a disk

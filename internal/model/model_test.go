@@ -284,3 +284,37 @@ func TestURL(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// Commitment is arithmetic on the configuration, not a measurement: a fleet can
+// sit at four per cent and still be promising three times the machine it is on,
+// and the moment that matters is the one nobody is watching.
+func TestCommitCountsEveryPoolAtItsCeiling(t *testing.T) {
+	total := Commit([]Pool{
+		{Name: "web", Runtime: RuntimeVM, MinReplicas: 1, MaxReplicas: 4, CPUs: 2, MemoryMB: 4096, DiskGB: 40, Enabled: true},
+		{Name: "api", Runtime: RuntimeContainer, MinReplicas: 2, MaxReplicas: 2, CPUs: 1, MemoryMB: 1024, Enabled: true},
+	})
+
+	if total.Runners != 6 {
+		t.Fatalf("runners: got %d", total.Runners)
+	}
+	if total.CPUs != 4*2+2*1 {
+		t.Fatalf("cpus: got %d", total.CPUs)
+	}
+	if total.MemoryBytes != int64(4*4096+2*1024)*1024*1024 {
+		t.Fatalf("memory: got %d", total.MemoryBytes)
+	}
+	// Machines only. A container writes into the host's filesystem without
+	// reserving anything, so there is no figure to add for it.
+	if total.DiskBytes != 4*40*1024*1024*1024 {
+		t.Fatalf("disk: got %d", total.DiskBytes)
+	}
+}
+
+func TestAPoolThatIsSwitchedOffPromisesNothing(t *testing.T) {
+	total := Commit([]Pool{
+		{Name: "web", Runtime: RuntimeVM, MinReplicas: 1, MaxReplicas: 8, CPUs: 4, MemoryMB: 8192, DiskGB: 40},
+	})
+	if total != (Commitment{}) {
+		t.Fatalf("a disabled pool was counted: %+v", total)
+	}
+}
