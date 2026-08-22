@@ -81,26 +81,51 @@ func (a *Authenticator) Configured(ctx context.Context) bool {
 }
 
 // Middleware refuses anything without valid credentials.
+//
+// The order here matters, and it is the opposite of the obvious one. The right
+// password is checked first and always accepted, even from a client that has
+// been failing; only a wrong one meets the lockout. Refusing a correct password
+// protects nobody — whoever sent it can already have everything behind this —
+// and it took an operator out of their own dashboard for five minutes at a
+// time.
+//
+// It matters most behind a reverse proxy, where every request arrives from the
+// same address. One script guessing at a public name would otherwise lock out
+// everybody, which is a denial of service delivered by the defence.
 func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		client := clientKey(r)
+		user, password, offered := r.BasicAuth()
+
+		if offered && a.check(r.Context(), user, password) {
+			a.recordSuccess(client)
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// No credentials at all is not a guess. It is how Basic auth begins:
+		// a browser asks once without them, is challenged, and asks again with
+		// them. Counting that as an attempt meant ten page loads could lock
+		// somebody out of their own fleet.
+		if !offered {
+			challenge(w)
+			return
+		}
+
+		a.recordFailure(client)
 		if a.lockedOut(client) {
 			http.Error(w, "too many failed attempts; try again shortly", http.StatusTooManyRequests)
 			return
 		}
-
-		user, password, ok := r.BasicAuth()
-		if !ok || !a.check(r.Context(), user, password) {
-			a.recordFailure(client)
-			// The realm is what makes a browser offer a login box.
-			w.Header().Set("WWW-Authenticate", `Basic realm="runner-fleet", charset="UTF-8"`)
-			http.Error(w, "unauthorised", http.StatusUnauthorized)
-			return
-		}
-
-		a.recordSuccess(client)
-		next.ServeHTTP(w, r)
+		challenge(w)
 	})
+}
+
+// challenge asks the browser for credentials. The realm is what makes it offer
+// a login box rather than showing the error.
+func challenge(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="runner-fleet", charset="UTF-8"`)
+	http.Error(w, "unauthorised", http.StatusUnauthorized)
 }
 
 func (a *Authenticator) check(ctx context.Context, user, password string) bool {
