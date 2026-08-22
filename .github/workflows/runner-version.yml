@@ -1,0 +1,85 @@
+name: runner version
+
+# The runner baked into the golden image has an expiry date, and it is not ours
+# to set. GitHub deprecates old runner versions server-side, and a deprecated
+# runner does not warn: it registers, connects, is told "this version cannot
+# receive messages", and exits. On ephemeral machines that is a boot loop with
+# no jobs ever running, which is what 2.330.0 did to a real fleet for a day.
+#
+# So the version is checked weekly against GitHub's own latest release, and a
+# pull request is opened when it has moved. Merging it changes the image hash,
+# so every host builds a fresh golden image the next time it starts a machine.
+
+on:
+  schedule:
+    # Mondays, early. A week of drift is well inside GitHub's deprecation
+    # window, which is measured in months.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: What is current, and what do we ship
+        id: versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release view --repo actions/runner --json tagName --jq .tagName)
+          latest=${latest#v}
+          ours=$(grep -oP 'RunnerVersion = "\K[^"]+' internal/agent/cloudinit.go)
+
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+          echo "ours=${ours}" >> "$GITHUB_OUTPUT"
+          echo "The image carries ${ours}; GitHub's latest is ${latest}." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Bump it
+        if: steps.versions.outputs.latest != steps.versions.outputs.ours
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          OURS: ${{ steps.versions.outputs.ours }}
+        run: |
+          set -euo pipefail
+          branch="runner-${LATEST}"
+
+          # Already proposed and not yet merged: nothing to do, and opening a
+          # second pull request every Monday would be noise.
+          if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qv '^0$'; then
+            echo "::notice::${LATEST} is already proposed"
+            exit 0
+          fi
+
+          sed -i "s/RunnerVersion = \"${OURS}\"/RunnerVersion = \"${LATEST}\"/" internal/agent/cloudinit.go
+          # The test names the floor as well, so it moves with it.
+          sed -i "s/RunnerVersion < \"${OURS}\"/RunnerVersion < \"${LATEST}\"/" internal/agent/console_test.go
+          go test ./internal/agent/
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git commit -am "Carry actions runner ${LATEST} in the golden image
+
+          GitHub deprecates old runner versions server-side, and a deprecated
+          runner cannot receive jobs at all — it connects, is refused, and exits,
+          which on an ephemeral machine is a boot loop rather than an error.
+
+          Merging this changes the image hash, so each host builds a fresh golden
+          image the next time it starts a machine."
+          git push -u origin "$branch"
+
+          gh pr create \
+            --title "Carry actions runner ${LATEST} in the golden image" \
+            --body "GitHub's latest runner is \`${LATEST}\`; the golden image carries \`${OURS}\`.
+
+          Old versions are deprecated server-side and cannot receive jobs — the runner connects, is refused, and exits, which on an ephemeral machine looks like a boot loop rather than an error. Merging this changes the image hash, so every host builds a fresh golden image the next time it starts a machine.
+
+          Opened by the weekly \`runner version\` workflow."

@@ -14,7 +14,20 @@ import (
 const UbuntuRelease = "noble"
 
 // RunnerVersion is the actions runner baked into the golden image.
-const RunnerVersion = "2.330.0"
+//
+// This is not a preference, it is an expiry date. GitHub deprecates old runner
+// versions server-side, and a deprecated runner is not merely warned at: it
+// registers, connects, is told "this version cannot receive messages", and
+// exits. On an ephemeral machine that means the runner stops, the machine
+// powers off, and the host starts another one — two boots a minute, for ever,
+// with the fleet showing a healthy runner throughout. That is what 2.330.0 did.
+//
+// So this is kept current, the runner is allowed to update itself when it is
+// not (see GuestRunnerScript), and a weekly workflow opens a pull request when
+// a newer one exists. Any one of those three would have been enough; the point
+// of having all three is that the failure is silent and the clock is somebody
+// else's.
+const RunnerVersion = "2.336.0"
 
 // basePackages is what a job can reasonably expect to find: the toolchain that
 // workflows written for GitHub-hosted runners assume, plus Docker and QEMU so a
@@ -247,7 +260,14 @@ args=(
   --runnergroup "$RUNNER_GROUP"
   --work /home/runner/_work
   --unattended
-  --disableupdate
+  # Updates are deliberately NOT disabled here, unlike in a container.
+  #
+  # A container's runner is updated by pulling a newer image, and the default
+  # tag is a rolling one, so it is never far behind. A machine's runner is baked
+  # into a golden image built once on this host, which can be months old — and a
+  # runner GitHub considers deprecated cannot receive jobs at all. Letting it
+  # update itself costs a download on a stale image and nothing on a fresh one,
+  # which is a better trade than a fleet that quietly stops accepting work.
   # Take over an entry of the same name left by an earlier machine: this
   # runner's name is its identity in the fleet, and it is reused on purpose.
   --replace

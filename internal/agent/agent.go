@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -132,9 +133,21 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 
 	select {
 	case err := <-exited:
-		// The machine powered itself off: the runner finished, or the job did
-		// on an ephemeral runner. Either way this agent is done, and systemd
-		// will start a fresh one.
+		// The machine powered itself off. Usually that is the runner finishing
+		// — the job did, on an ephemeral runner — and this agent is done.
+		//
+		// But it is also what a machine does when its runner cannot work at
+		// all: the runner exits, the guest's unit powers the machine off, and
+		// systemd here starts another one. That loop is indistinguishable from
+		// healthy churn from the outside, and it ran for hours on a real host
+		// while the fleet showed a runner in perfect health. So the console is
+		// kept and asked whether the runner ever got as far as being able to
+		// accept a job.
+		kept := keepConsole(c.StateDir, c.Runner, options.Console)
+		if problem := whyItCouldNotWork(options.Console); problem != "" {
+			return fmt.Errorf("the machine powered off without the runner ever listening for jobs: %s"+
+				" (its console is at %s)", problem, kept)
+		}
 		log.Info("the machine powered off", "runner", c.Runner)
 		return ignoreCleanExit(err)
 
@@ -154,6 +167,104 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 			return errors.New("the machine did not shut down within the grace period")
 		}
 	}
+}
+
+// listening is what the actions runner prints once GitHub can give it work.
+const listening = "Listening for Jobs"
+
+// refusals are the runner saying it is not going to work, in its own words.
+//
+// Reaching "Listening for Jobs" is not proof of health, which is the trap this
+// avoided by being written against a real console: a deprecated runner connects,
+// announces it is listening, and is then told it cannot receive messages. The
+// last word decides, not the first.
+//
+//	An error occured: ...      the runner's own error line, typo included
+//	exit with terminated error the listener saying it will not retry
+//	registration failed        the guest script, when config.sh was refused
+var refusals = []string{"An error occured", "exit with terminated error", "registration failed"}
+
+// whyItCouldNotWork reads a dead machine's console and returns the reason its
+// runner could not do the job it exists for, or "" if it could.
+//
+// The console is the only account of what happened inside the machine: the
+// guest's journal goes with the disk. What comes back is the runner's own last
+// words, which is the difference between "deprecated and cannot receive
+// messages" and a guess.
+func whyItCouldNotWork(console string) string {
+	raw, err := os.ReadFile(console)
+	if err != nil {
+		// No console is not evidence of failure. Saying nothing is right: the
+		// alternative is a healthy fleet reporting problems it cannot support.
+		return ""
+	}
+
+	// The guest's unit tags the runner's output with the script that produced
+	// it, so those lines are the runner talking and everything else is the
+	// operating system booting around it.
+	var said []string
+	refused := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		i := strings.Index(line, "run-runner.sh")
+		if i < 0 {
+			continue
+		}
+		_, message, found := strings.Cut(line[i:], ": ")
+		message = strings.TrimSpace(message)
+		if !found || message == "" {
+			continue
+		}
+		said = append(said, message)
+		for _, refusal := range refusals {
+			if strings.Contains(message, refusal) {
+				refused = true
+			}
+		}
+	}
+
+	switch {
+	case len(said) == 0:
+		return "its console records nothing from the runner at all"
+	case refused:
+	case containsAny(said, listening):
+		// It listened and nothing complained: it worked, and this is an
+		// ephemeral runner finishing or a machine being drained.
+		return ""
+	}
+	if len(said) > 3 {
+		said = said[len(said)-3:]
+	}
+	return strings.Join(said, " / ")
+}
+
+func containsAny(lines []string, want string) bool {
+	for _, line := range lines {
+		if strings.Contains(line, want) {
+			return true
+		}
+	}
+	return false
+}
+
+// keepConsole copies a machine's console somewhere that outlives it, and
+// returns where.
+//
+// The machine's directory is deleted when this agent exits, which is exactly
+// the moment its console becomes worth reading. One file per runner, replaced
+// on each boot: the interesting one is always the last.
+func keepConsole(stateDir, runner, console string) string {
+	kept := filepath.Join(stateDir, "consoles", runner+".log")
+	if err := os.MkdirAll(filepath.Dir(kept), 0o700); err != nil {
+		return console
+	}
+	raw, err := os.ReadFile(console)
+	if err != nil {
+		return console
+	}
+	if err := os.WriteFile(kept, raw, 0o600); err != nil {
+		return console
+	}
+	return kept
 }
 
 // ignoreCleanExit treats a machine that powered itself off as success. QEMU
