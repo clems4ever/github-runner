@@ -88,6 +88,26 @@ func ConfigFromEnv(name string) (Config, error) {
 	return c, nil
 }
 
+// RegistrationToken is a token the daemon minted for this runner, used instead
+// of a credential of its own.
+//
+// This is how a container runner registers. A container shares everything with
+// the job it runs, so handing it the credential that mints tokens would hand
+// the job a key that administers repositories; a registration token is
+// short-lived and can do one thing. A virtual machine has no such problem —
+// the job is inside the guest and the credential never is — so a VM keeps the
+// credential and mints for itself, which is what lets it come back after a
+// reboot with the daemon still down.
+func (c Config) RegistrationToken() string {
+	token := os.Getenv("FLEET_REGISTRATION_TOKEN")
+	if token != "" {
+		// Taken out of the environment as it is read: everything this process
+		// starts inherits that environment, and the job is one of them.
+		_ = os.Unsetenv("FLEET_REGISTRATION_TOKEN")
+	}
+	return token
+}
+
 // Token reads the credential the daemon left for this runner.
 //
 // It is read on every registration rather than kept, so a rotated token is

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -352,5 +353,61 @@ func TestConfigDefaultsToATokenCredential(t *testing.T) {
 	}
 	if c.CredentialKind != model.CredentialPAT {
 		t.Fatalf("got %q", c.CredentialKind)
+	}
+}
+
+// The official runner image puts the runner in the home directory; others put
+// it in a subdirectory. Looking for config.sh rather than assuming a path is
+// what makes a custom image work, and it is what the first container pool ran
+// into: the agent looked in /home/runner/actions-runner and the image had it
+// in /home/runner.
+func TestFindRunnerHome(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("FLEET_RUNNER_HOME", filepath.Join(dir, "somewhere-else"))
+	got, err := findRunnerHome()
+	if err != nil || got != filepath.Join(dir, "somewhere-else") {
+		t.Fatalf("an override was ignored: %q, %v", got, err)
+	}
+}
+
+func TestFindRunnerHomeSaysWhereItLooked(t *testing.T) {
+	t.Setenv("FLEET_RUNNER_HOME", "")
+	_, err := findRunnerHome()
+	if err == nil {
+		t.Skip("this host happens to have a runner installed in one of the usual places")
+	}
+	for _, want := range []string{"/home/runner", "config.sh", "FLEET_RUNNER_HOME"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the message does not mention %q: %v", want, err)
+		}
+	}
+}
+
+// A container is handed a token by the daemon rather than a credential of its
+// own, and must not leave it lying in the environment for the job to read.
+func TestTheMintedTokenIsTakenOutOfTheEnvironment(t *testing.T) {
+	t.Setenv("FLEET_REGISTRATION_TOKEN", "AAAA-registration")
+	c := Config{Runner: "api-1"}
+
+	if got := c.RegistrationToken(); got != "AAAA-registration" {
+		t.Fatalf("got %q", got)
+	}
+	// Everything this process starts inherits its environment, and the job is
+	// one of them.
+	if left := os.Getenv("FLEET_REGISTRATION_TOKEN"); left != "" {
+		t.Fatalf("the token is still in the environment: %q", left)
+	}
+	if again := c.RegistrationToken(); again != "" {
+		t.Fatalf("it came back: %q", again)
+	}
+}
+
+// A machine has no minted token and mints for itself, which is what lets it
+// come back after a reboot with the daemon still down.
+func TestAMachineHasNoMintedToken(t *testing.T) {
+	t.Setenv("FLEET_REGISTRATION_TOKEN", "")
+	c := Config{Runner: "web-1"}
+	if got := c.RegistrationToken(); got != "" {
+		t.Fatalf("got %q", got)
 	}
 }

@@ -216,7 +216,11 @@ func RenderEnv(spec reconcile.Spec, layout paths.Layout) string {
 }
 
 // Start brings a runner back that exists but is not running.
-func (e *Executor) Start(ctx context.Context, name string) error {
+//
+// The spec is not needed: a machine keeps its own credential and mints what it
+// needs at boot, so starting the unit again is enough.
+func (e *Executor) Start(ctx context.Context, spec reconcile.Spec) error {
+	name := spec.Name
 	// A unit that failed keeps its restart counter, and would refuse to start
 	// with "start request repeated too quickly".
 	_, _ = e.cmd.Run(ctx, "systemctl", "reset-failed", unitName(name))

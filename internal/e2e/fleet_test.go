@@ -42,6 +42,7 @@ type host struct {
 	runners map[string]*reconcile.Runner
 	created []string
 	specs   []reconcile.Spec
+	started []reconcile.Spec
 }
 
 func newHost(runtime model.Runtime) *host {
@@ -78,12 +79,13 @@ func (h *host) Create(_ context.Context, spec reconcile.Spec) error {
 	return nil
 }
 
-func (h *host) Start(_ context.Context, name string) error {
+func (h *host) Start(_ context.Context, spec reconcile.Spec) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if r, ok := h.runners[name]; ok {
+	if r, ok := h.runners[spec.Name]; ok {
 		r.State = reconcile.StateRunning
 	}
+	h.started = append(h.started, spec)
 	return nil
 }
 
@@ -127,6 +129,7 @@ func (h *host) names() []string {
 type fakeGitHub struct {
 	mu     sync.Mutex
 	states map[string]github.State
+	minted int
 }
 
 func (f *fakeGitHub) States(context.Context, github.Scope) (map[string]github.State, error) {
@@ -140,6 +143,13 @@ func (f *fakeGitHub) States(context.Context, github.Scope) (map[string]github.St
 }
 
 func (f *fakeGitHub) Deregister(context.Context, github.Scope, string) error { return nil }
+
+func (f *fakeGitHub) RegistrationToken(context.Context, github.Scope) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.minted++
+	return fmt.Sprintf("AAAA-registration-%d", f.minted), nil
+}
 
 func (f *fakeGitHub) setBusy(name string) {
 	f.mu.Lock()
@@ -883,5 +893,79 @@ func TestTokenAndAppPoolsSideBySide(t *testing.T) {
 	}
 	if kinds["web-1"] != model.CredentialPAT || kinds["api-1"] != model.CredentialApp {
 		t.Fatalf("got %v", kinds)
+	}
+}
+
+// A container runner is given a token the daemon minted, not the credential —
+// a container shares everything with the job it runs.
+func TestContainerRunnersAreGivenATokenNotTheCredential(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addAppCredential(123456)
+	f.addPool(map[string]any{
+		"name": "api", "scopeKind": "repository", "scope": "clems4ever/claude-control",
+		"runtime": "container", "minReplicas": 1, "maxReplicas": 1,
+		"credentialId": credential, "enabled": true,
+	})
+	f.reconcileNow()
+
+	if len(f.containers.specs) != 1 {
+		t.Fatalf("got %d containers", len(f.containers.specs))
+	}
+	spec := f.containers.specs[0]
+	if spec.RegistrationToken == "" {
+		t.Fatal("the container was created without a registration token, so it cannot register")
+	}
+	if f.gh.minted != 1 {
+		t.Fatalf("minted %d tokens for one container", f.gh.minted)
+	}
+}
+
+// A machine gets no minted token: it holds the credential and mints for
+// itself, which is what lets it come back after a reboot with the daemon down.
+func TestMachineRunnersMintForThemselves(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 1))
+	f.reconcileNow()
+
+	if f.vm.specs[0].RegistrationToken != "" {
+		t.Fatal("a machine was handed a token it did not need, which expires in an hour")
+	}
+	if f.gh.minted != 0 {
+		t.Fatalf("the daemon minted %d tokens for a machine", f.gh.minted)
+	}
+}
+
+// A container that has exited is rebuilt with a fresh token rather than
+// started again with the expired one it registered with.
+func TestAStoppedContainerIsRebuiltWithAFreshToken(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(map[string]any{
+		"name": "api", "scopeKind": "repository", "scope": "o/r",
+		"runtime": "container", "minReplicas": 1, "maxReplicas": 1,
+		"credentialId": credential, "enabled": true,
+	})
+	f.reconcileNow()
+	first := f.containers.specs[0].RegistrationToken
+
+	// The job finished and the container exited, which is what an ephemeral
+	// container runner does after every job.
+	f.containers.mu.Lock()
+	f.containers.runners["api-1"].State = reconcile.StateStopped
+	f.containers.mu.Unlock()
+
+	f.reconcileNow()
+	if len(f.containers.started) != 1 {
+		t.Fatalf("it was not brought back: %+v", f.containers.started)
+	}
+	if got := f.containers.started[0].RegistrationToken; got == "" || got == first {
+		t.Fatalf("it was brought back with %q, want a token minted for this attempt", got)
 	}
 }

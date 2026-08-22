@@ -141,6 +141,19 @@ shares the host kernel. Nested virtualisation in a container means handing the
 job the host's `/dev/kvm`, which is a real hole in an already weaker boundary.
 Both are offered; the UI says which is which.
 
+The two also differ in what the runner is trusted with. A machine keeps the
+credential and mints its own registration tokens, which is what lets it come
+back after a reboot with the daemon still down — the job is inside the guest
+and never sees it. A container shares everything with its job, so it is given
+nothing but a registration token the daemon minted: short-lived, and able only
+to register a runner. The cost is that containers are replaced by the daemon
+rather than restarted by Docker, so a container that finishes a job while the
+daemon is down waits for it to come back.
+
+Container images are expected to carry the GitHub Actions runner. The official
+`ghcr.io/actions/actions-runner` works as it is; a custom image is found by
+looking for `config.sh`, or told where to look with `FLEET_RUNNER_HOME`.
+
 ## How the daemon works
 
 It is a reconciler. The database holds what you asked for; systemd and Docker

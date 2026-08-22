@@ -150,14 +150,18 @@ func (e *Executor) Create(ctx context.Context, spec reconcile.Spec) error {
 
 func (e *Executor) hostConfig(spec reconcile.Spec) map[string]any {
 	host := map[string]any{
-		// unless-stopped, not always: a container the daemon has deliberately
-		// stopped — one being drained — must stay stopped, or draining would
-		// be undone by dockerd a second later.
-		"RestartPolicy": map[string]any{"Name": "unless-stopped"},
+		// No restart policy: the daemon replaces these rather than dockerd
+		// restarting them. A container registers with a token that expires in
+		// an hour, so starting the same one again later cannot work — it would
+		// fail to register and loop, looking healthy to anyone watching
+		// Docker.
+		"RestartPolicy": map[string]any{"Name": "no"},
 		"Binds": []string{
-			// The credential lives on tmpfs and is mounted read-only. It is
-			// never baked into the image or the container's environment.
-			e.layout.Credential(spec.CredentialID) + ":/run/secrets/github_token:ro",
+			// Only the agent. The credential is deliberately not here: a
+			// container shares everything with the job it runs, so mounting the
+			// key that mints tokens would hand every job something that
+			// administers repositories. The daemon mints instead, and passes a
+			// token that can do one thing.
 			e.binary + ":/usr/local/bin/runner-fleet:ro",
 		},
 		"Memory":   int64(spec.MemoryMB) * 1024 * 1024,
@@ -190,21 +194,29 @@ func env(spec reconcile.Spec, layout paths.Layout) []string {
 		fmt.Sprintf("FLEET_EPHEMERAL=%t", spec.Ephemeral),
 		fmt.Sprintf("FLEET_NESTED=%t", spec.Nested),
 		"FLEET_RUNTIME=container",
-		"FLEET_CREDENTIAL_KIND=" + string(spec.CredentialKind),
-		fmt.Sprintf("FLEET_APP_ID=%d", spec.AppID),
-		fmt.Sprintf("FLEET_INSTALLATION_ID=%d", spec.InstallationID),
-		// Inside the container the credential is at a fixed path, because the
-		// bind mount put it there.
-		"FLEET_CREDENTIAL_FILE=/run/secrets/github_token",
+		// What the runner registers with. Short-lived and single-purpose: the
+		// worst a job can do with it is register another runner, where the
+		// credential it replaces could administer the repository.
+		"FLEET_REGISTRATION_TOKEN=" + spec.RegistrationToken,
 	}
 }
 
-// Start brings back a container that exists but has stopped.
-func (e *Executor) Start(ctx context.Context, name string) error {
+// Start brings back a runner that exists but has stopped, by building it
+// again.
+//
+// Not by starting the container it left behind: that container registered with
+// a token that has since expired, so starting it would fail to register, exit,
+// and be started again on the next pass. A runner is cheap to rebuild and a
+// loop is expensive to debug.
+func (e *Executor) Start(ctx context.Context, spec reconcile.Spec) error {
 	e.mu.Lock()
-	delete(e.draining, name)
+	delete(e.draining, spec.Name)
 	e.mu.Unlock()
-	return e.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(name)+"/start", nil, nil)
+
+	if err := e.Remove(ctx, spec.Name); err != nil {
+		return err
+	}
+	return e.Create(ctx, spec)
 }
 
 // Drain asks a runner to stop when its job is done, and returns immediately.
@@ -305,7 +317,12 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 // reasons about.
 func mapState(state string) reconcile.RunnerState {
 	switch state {
-	case "running", "restarting", "created":
+	case "running", "created":
+		return reconcile.StateRunning
+	case "restarting":
+		// Only reachable for a container from before this daemon stopped using
+		// a restart policy. Treated as running so it is not rebuilt underneath
+		// itself; the next generation change replaces it.
 		return reconcile.StateRunning
 	case "removing":
 		return reconcile.StateStopping

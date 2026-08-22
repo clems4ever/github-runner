@@ -22,6 +22,8 @@ type fakeExecutor struct {
 	runtime model.Runtime
 	runners map[string]*Runner
 	calls   []string
+	started []Spec
+	created []Spec
 	failOn  map[string]error
 }
 
@@ -45,6 +47,7 @@ func (f *fakeExecutor) List(ctx context.Context) ([]Runner, error) {
 
 func (f *fakeExecutor) Create(ctx context.Context, spec Spec) error {
 	f.calls = append(f.calls, "create "+spec.Name)
+	f.created = append(f.created, spec)
 	if err := f.failOn["create "+spec.Name]; err != nil {
 		return err
 	}
@@ -55,11 +58,12 @@ func (f *fakeExecutor) Create(ctx context.Context, spec Spec) error {
 	return nil
 }
 
-func (f *fakeExecutor) Start(ctx context.Context, name string) error {
-	f.calls = append(f.calls, "start "+name)
-	if r, ok := f.runners[name]; ok {
+func (f *fakeExecutor) Start(ctx context.Context, spec Spec) error {
+	f.calls = append(f.calls, "start "+spec.Name)
+	if r, ok := f.runners[spec.Name]; ok {
 		r.State = StateRunning
 	}
+	f.started = append(f.started, spec)
 	return nil
 }
 
@@ -124,6 +128,7 @@ type fakeGitHub struct {
 	states       map[string]github.State
 	deregistered []string
 	scopeCalls   int
+	minted       int
 	err          error
 }
 
@@ -138,6 +143,11 @@ func (f *fakeGitHub) States(ctx context.Context, scope github.Scope) (map[string
 func (f *fakeGitHub) Deregister(ctx context.Context, scope github.Scope, name string) error {
 	f.deregistered = append(f.deregistered, name)
 	return nil
+}
+
+func (f *fakeGitHub) RegistrationToken(ctx context.Context, scope github.Scope) (string, error) {
+	f.minted++
+	return fmt.Sprintf("AAAA-registration-%d", f.minted), nil
 }
 
 // testPool is a fixed-size pool: minimum equal to maximum, so these tests are

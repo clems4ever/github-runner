@@ -55,6 +55,11 @@ type Spec struct {
 	CredentialKind model.CredentialKind
 	AppID          int64
 	InstallationID int64
+	// RegistrationToken is minted by the daemon for runtimes that must not be
+	// given the credential itself. It is filled in as an action is applied, not
+	// when the plan is made: these expire in an hour, and a plan is not a
+	// promise that anything will happen.
+	RegistrationToken string
 }
 
 // Runner is what an executor found on the host.
@@ -81,7 +86,9 @@ type Op string
 const (
 	// OpCreate builds a runner that should exist and does not.
 	OpCreate Op = "create"
-	// OpStart restarts one that exists, is wanted, and is not running.
+	// OpStart brings back one that exists, is wanted, and is not running.
+	// Whether that means starting it or rebuilding it is the executor's
+	// business.
 	OpStart Op = "start"
 	// OpDrain asks a runner to stop when its job is done. It returns
 	// immediately; the stop happens in the background and shows up as
@@ -166,9 +173,12 @@ func Plan(desired []Spec, actual []Runner, states map[string]github.State) []Act
 		}
 
 		if current.State == StateStopped {
+			// The spec goes with it: a container cannot simply be started
+			// again, because the token it registered with has expired, so its
+			// executor rebuilds it from this.
 			actions = append(actions, Action{
 				Op: OpStart, Runner: spec.Name, Pool: spec.Pool, Runtime: current.Runtime,
-				Reason: "wanted but not running",
+				Spec: specPtr(spec), Reason: "wanted but not running",
 			})
 		}
 		// Running with the right generation: nothing to do. This is the case

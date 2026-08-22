@@ -131,10 +131,12 @@ func TestCreate(t *testing.T) {
 
 	host, _ := body["HostConfig"].(map[string]any)
 	policy, _ := host["RestartPolicy"].(map[string]any)
-	// unless-stopped, not always: a container that is being drained has been
-	// deliberately stopped, and always would undo that a second later.
-	if policy["Name"] != "unless-stopped" {
-		t.Fatalf("restart policy is %v", policy)
+	// No restart policy at all. A container registers with a token that
+	// expires in an hour, so dockerd starting the same one again later would
+	// fail to register and loop — while looking healthy to anyone watching
+	// Docker. The daemon replaces them instead.
+	if policy["Name"] != "no" {
+		t.Fatalf("restart policy is %v, want the daemon to own replacement", policy)
 	}
 	if host["Memory"] != float64(4096*1024*1024) {
 		t.Fatalf("memory limit is %v", host["Memory"])
@@ -144,35 +146,92 @@ func TestCreate(t *testing.T) {
 	}
 }
 
-// The token reaches the container as a read-only mount from tmpfs, never as an
-// environment variable — those show up in docker inspect and in every child
-// process.
-func TestTheCredentialIsMountedNotPassedAsEnvironment(t *testing.T) {
+// The credential never enters a container.
+//
+// A container shares everything with the job it runs: same filesystem, same
+// user, same process tree. Mounting the key that mints tokens would hand every
+// job something that administers repositories. The daemon mints instead, and
+// what goes in is a registration token — short-lived, and able to do one
+// thing.
+func TestTheCredentialNeverEntersTheContainer(t *testing.T) {
 	e, fake := newExecutor(t)
-	if err := e.Create(context.Background(), testSpec("api-1")); err != nil {
+
+	spec := testSpec("api-1")
+	spec.CredentialKind = model.CredentialApp
+	spec.AppID = 123456
+	spec.RegistrationToken = "AAAA-registration"
+
+	if err := e.Create(context.Background(), spec); err != nil {
 		t.Fatal(err)
 	}
 	body := fake.bodies["/containers/create"]
 
-	for _, value := range body["Env"].([]any) {
-		text := value.(string)
-		if strings.HasPrefix(text, "FLEET_CREDENTIAL_FILE=") {
-			continue
+	host := body["HostConfig"].(map[string]any)
+	for _, bind := range host["Binds"].([]any) {
+		text := bind.(string)
+		if strings.Contains(text, "credentials") || strings.Contains(text, "github_token") {
+			t.Fatalf("the credential is mounted into the container: %q", text)
 		}
-		if strings.Contains(strings.ToLower(text), "token=") || strings.Contains(text, "github_pat") {
-			t.Fatalf("a credential was passed in the environment: %q", text)
-		}
+	}
+	// Only the agent goes in.
+	if len(host["Binds"].([]any)) != 1 {
+		t.Fatalf("more than the agent is mounted: %v", host["Binds"])
 	}
 
-	host := body["HostConfig"].(map[string]any)
-	var mounted bool
-	for _, bind := range host["Binds"].([]any) {
-		if strings.Contains(bind.(string), "/run/secrets/github_token:ro") {
-			mounted = true
+	var registered bool
+	for _, value := range body["Env"].([]any) {
+		text := value.(string)
+		if text == "FLEET_REGISTRATION_TOKEN=AAAA-registration" {
+			registered = true
+		}
+		if strings.Contains(text, "PRIVATE KEY") || strings.Contains(text, "github_pat") {
+			t.Fatalf("a credential was passed in the environment: %q", text)
+		}
+		if strings.HasPrefix(text, "FLEET_CREDENTIAL_FILE=") {
+			t.Fatalf("the container was pointed at a credential file: %q", text)
 		}
 	}
-	if !mounted {
-		t.Fatalf("the credential is not mounted read-only: %v", host["Binds"])
+	if !registered {
+		t.Fatalf("no registration token reached the runner: %v", body["Env"])
+	}
+}
+
+// A stopped container cannot simply be started: the token it registered with
+// has expired. It is rebuilt with a fresh one.
+func TestStartRebuildsRatherThanRestarts(t *testing.T) {
+	e, fake := newExecutor(t)
+	ctx := context.Background()
+
+	spec := testSpec("api-1")
+	spec.RegistrationToken = "AAAA-first"
+	if err := e.Create(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+
+	fake.mu.Lock()
+	fake.requests = nil
+	fake.mu.Unlock()
+
+	spec.RegistrationToken = "AAAA-second"
+	if err := e.Start(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+
+	if !fake.called("DELETE /containers/api-1") {
+		t.Fatalf("the old container was left behind: %v", fake.requests)
+	}
+	if !fake.called("POST /containers/create") {
+		t.Fatalf("nothing was rebuilt: %v", fake.requests)
+	}
+	body := fake.bodies["/containers/create"]
+	var fresh bool
+	for _, value := range body["Env"].([]any) {
+		if value.(string) == "FLEET_REGISTRATION_TOKEN=AAAA-second" {
+			fresh = true
+		}
+	}
+	if !fresh {
+		t.Fatalf("it was rebuilt with the old token: %v", body["Env"])
 	}
 }
 
