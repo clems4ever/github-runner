@@ -630,3 +630,74 @@ func TestADisabledPoolIsNotChecked(t *testing.T) {
 		t.Error("it asked GitHub about a pool that is switched off")
 	}
 }
+
+// The lockout took the operator out of their own dashboard: "too many failed
+// attempts; try again shortly", in a browser, with the right password.
+//
+// Behind a reverse proxy every request arrives from the same address, so one
+// script guessing at a public name locks out everybody — a denial of service
+// delivered by the defence. And the right password being refused protects
+// nobody: whoever sent it can already have everything behind this.
+func TestTheRightPasswordWorksEvenAfterAFloodOfWrongOnes(t *testing.T) {
+	h := newHarness(t)
+
+	for i := 0; i < maxAttempts*2; i++ {
+		req, _ := http.NewRequest("GET", h.server.URL+"/api/pools", nil)
+		req.SetBasicAuth("admin", "not-the-password")
+		resp, err := h.server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+
+	// Guessing is still refused, which is what the lockout is for.
+	req, _ := http.NewRequest("GET", h.server.URL+"/api/pools", nil)
+	req.SetBasicAuth("admin", "still-not-the-password")
+	resp, err := h.server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("a client that has guessed %d times got %d, and should be refused",
+			maxAttempts*2, resp.StatusCode)
+	}
+
+	// The operator is not.
+	resp = h.do("GET", "/api/pools", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("the right password was refused with %d; the lockout is locking out the wrong person",
+			resp.StatusCode)
+	}
+}
+
+// A browser's first request to a protected page carries no credentials at all.
+// That is how Basic auth starts, not an attempt at guessing, and counting it
+// meant ten page loads could lock somebody out.
+func TestAskingWithoutCredentialsIsNotAGuess(t *testing.T) {
+	h := newHarness(t)
+
+	for i := 0; i < maxAttempts*2; i++ {
+		resp, err := h.server.Client().Get(h.server.URL + "/api/pools")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("request %d answered %d; a browser that has not logged in yet must be"+
+				" challenged, not locked out", i+1, resp.StatusCode)
+		}
+		if resp.Header.Get("WWW-Authenticate") == "" {
+			t.Fatal("no login box was offered")
+		}
+	}
+
+	// And the fleet is still reachable afterwards.
+	resp := h.do("GET", "/api/pools", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d after a browser knocked without credentials", resp.StatusCode)
+	}
+}
