@@ -40,9 +40,10 @@ ssh -N -L 8080:127.0.0.1:8080 your-host
 
 ## Getting started
 
-1. **Add a credential.** A fine-grained PAT with **Administration: Read and
-   write** on a repository, or **Self-hosted runners: Read and write** on an
-   organisation. It is encrypted at rest and never shown again.
+1. **Add a credential** — a GitHub App, or a personal access token. Either
+   needs **Administration: Read and write** on the repositories it covers, or
+   **Self-hosted runners: Read and write** on an organisation, and either is
+   encrypted at rest and never shown again.
 2. **Create a pool.** Pick the scope, the runtime, and the number of replicas.
 3. Runners appear within a few seconds, and again after a reboot.
 
@@ -170,17 +171,56 @@ replaced, gracefully. The scaling bounds deliberately are not part of that hash:
 the autoscaler moves them many times an hour, and that must never replace a
 runner that is already correct.
 
+## Credentials
+
+A **GitHub App** is the better of the two, and what the form offers first:
+
+- Nothing expires on a calendar. The daemon signs a short assertion with the
+  app's key and exchanges it for an installation token that lives an hour, and
+  it does that again whenever it needs to.
+- The repositories it can reach are a list you edit on GitHub, not a token you
+  regenerate.
+- Uninstalling the app revokes everything on this host at once.
+
+![Adding a GitHub App](docs/img/credential-app.png)
+
+Setting one up, in full:
+
+1. Register an App under your account — **Settings → Developer settings →
+   GitHub Apps → New GitHub App**.
+2. Set **Where can this GitHub App be installed?** to **Only on this account**.
+   It never becomes public and nobody else can install it.
+3. Under **Webhook**, deselect **Active**. This app is a credential, not an
+   integration, and nothing on your host has to be reachable from the internet:
+   the daemon only ever makes outbound calls.
+4. Give it **Repository permissions → Administration: Read and write** (or, for
+   an organisation, **Organization permissions → Self-hosted runners: Read and
+   write**).
+5. **Homepage URL** is a required field but only a link — GitHub never fetches
+   it. Point it anywhere.
+6. Generate a private key, install the app, and choose the repositories it may
+   use. Paste the app id and the `.pem` into runner-fleet.
+
+A **personal access token** still works everywhere an app does; a pool cannot
+tell the difference. Existing installations keep the token they have.
+
+Rotating either — a new key, a new token — replaces the runners using it,
+gracefully, as each finishes the job it is on.
+
 ## Security
 
 - The web UI is HTTP Basic over a loopback bind, with bcrypt and attempt
   throttling. Until a password is set, the daemon serves nothing.
-- GitHub tokens are encrypted with AES-256-GCM under a key in
+- Credentials are encrypted with AES-256-GCM under a key in
   `/etc/runner-fleet/master.key` (0600, root, generated on first start). The
   daemon has to decrypt to use them, so this is not protection against root: it
   protects backups, snapshots and disks that travel where the key does not.
 - The decrypted copy a runner needs lives in `/run/runner-fleet`, which is a
   tmpfs. It never reaches a disk, and a runner can still register itself after
-  a reboot with the daemon still starting.
+  a reboot with the daemon still starting — for an app that means the private
+  key is there, and the agent does its own token exchange. That is the cost of
+  runners that do not depend on the daemon: losing the host means uninstalling
+  the app to revoke it.
 - GitHub recommends self-hosted runners only for **private** repositories: on a
   public one, a pull request from a fork can run arbitrary code on the runner.
   A VM is a much harder boundary than a container, and ephemeral runners give

@@ -167,7 +167,7 @@ func TestErrorsSayWhatToCheck(t *testing.T) {
 		scope  Scope
 		want   string
 	}{
-		{http.StatusUnauthorized, repoScope(), "the token itself is wrong"},
+		{http.StatusUnauthorized, repoScope(), "the credential itself is wrong"},
 		{http.StatusForbidden, repoScope(), "Administration: Read and write"},
 		{http.StatusForbidden, orgScope(), "Self-hosted runners: Read and write"},
 		{http.StatusNotFound, repoScope(), "cannot see the repository"},

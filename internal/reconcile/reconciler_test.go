@@ -113,11 +113,11 @@ func (f *fakeStore) CredentialFingerprint(ctx context.Context, id int64) (string
 	}
 	return f.fingerprint, nil
 }
-func (f *fakeStore) Token(ctx context.Context, id int64) (string, error) {
+func (f *fakeStore) Secret(ctx context.Context, id int64) (model.Secret, error) {
 	if f.tokenErr != nil {
-		return "", f.tokenErr
+		return model.Secret{}, f.tokenErr
 	}
-	return fmt.Sprintf("token-%d", id), nil
+	return model.Secret{Kind: model.CredentialPAT, Token: fmt.Sprintf("token-%d", id)}, nil
 }
 
 type fakeGitHub struct {
@@ -170,7 +170,7 @@ func newHarness(pools ...model.Pool) *harness {
 		secrets: map[int64]string{},
 	}
 	h.rec = New(h.store, []Executor{h.vm, h.docker},
-		func(token string) GitHubClient { return h.gh },
+		func(model.Secret) (GitHubClient, error) { return h.gh, nil },
 		func(id int64, token string) error { h.secrets[id] = token; return nil },
 		discardLogger())
 	return h
@@ -211,7 +211,7 @@ func TestANewDaemonAdoptsTheRunningFleet(t *testing.T) {
 	// A new reconciler over the same host and the same store — a restarted or
 	// upgraded daemon.
 	fresh := New(h.store, []Executor{h.vm, h.docker},
-		func(token string) GitHubClient { return h.gh }, nil, discardLogger())
+		func(model.Secret) (GitHubClient, error) { return h.gh, nil }, nil, discardLogger())
 
 	h.vm.calls = nil
 	result := fresh.Once(ctx)
@@ -378,7 +378,7 @@ func TestOnePoolFailingDoesNotStopTheOthers(t *testing.T) {
 
 	failing := &fakeStore{pools: []model.Pool{good}, tokenErr: errors.New("credential 9: not found")}
 	rec := New(&splitStore{good: h.store, bad: failing, badPool: "api"},
-		[]Executor{h.vm}, func(string) GitHubClient { return h.gh }, nil, discardLogger())
+		[]Executor{h.vm}, func(model.Secret) (GitHubClient, error) { return h.gh, nil }, nil, discardLogger())
 
 	result := rec.Once(context.Background())
 	if len(result.Errors) == 0 {
@@ -414,11 +414,11 @@ func (s *splitStore) CredentialFingerprint(ctx context.Context, id int64) (strin
 	return s.good.CredentialFingerprint(ctx, id)
 }
 
-func (s *splitStore) Token(ctx context.Context, id int64) (string, error) {
+func (s *splitStore) Secret(ctx context.Context, id int64) (model.Secret, error) {
 	if id == 99 {
-		return "", errors.New("credential 99: not found")
+		return model.Secret{}, errors.New("credential 99: not found")
 	}
-	return s.good.Token(ctx, id)
+	return s.good.Secret(ctx, id)
 }
 
 func (s *splitStore) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {

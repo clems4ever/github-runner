@@ -9,7 +9,11 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log/slog"
@@ -37,6 +41,7 @@ type host struct {
 	runtime model.Runtime
 	runners map[string]*reconcile.Runner
 	created []string
+	specs   []reconcile.Spec
 }
 
 func newHost(runtime model.Runtime) *host {
@@ -60,6 +65,7 @@ func (h *host) Create(_ context.Context, spec reconcile.Spec) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.created = append(h.created, spec.Name)
+	h.specs = append(h.specs, spec)
 	// A real executor writes the scope and credential alongside the runner —
 	// in an environment file, or in container labels — so that a runner whose
 	// pool is later deleted can still be asked about. The fake has to keep the
@@ -187,7 +193,7 @@ func (f *fleet) start() {
 
 	f.reconciler = reconcile.New(db,
 		[]reconcile.Executor{f.vm, f.containers},
-		func(string) reconcile.GitHubClient { return f.gh },
+		func(model.Secret) (reconcile.GitHubClient, error) { return f.gh, nil },
 		func(int64, string) error { return nil },
 		slog.New(slog.NewTextHandler(io.Discard, nil))).WithClock(func() time.Time { return f.now })
 
@@ -249,7 +255,7 @@ func (f *fleet) mustRequest(method, path string, body any, wantStatus int) strin
 func (f *fleet) addCredential() int64 {
 	f.t.Helper()
 	payload := f.mustRequest("POST", "/api/credentials", map[string]string{
-		"name": "pat", "token": "github_pat_11TESTVALUE",
+		"name": "pat", "secret": "github_pat_11TESTVALUE",
 	}, http.StatusCreated)
 	var credential model.Credential
 	if err := json.Unmarshal([]byte(payload), &credential); err != nil {
@@ -475,8 +481,8 @@ func TestRotatingACredentialSupersedesTheRunners(t *testing.T) {
 	f.reconcileNow()
 	f.vm.created = nil
 
-	f.mustRequest("PUT", fmt.Sprintf("/api/credentials/%d/token", credential),
-		map[string]string{"token": "github_pat_11ROTATED"}, http.StatusNoContent)
+	f.mustRequest("PUT", fmt.Sprintf("/api/credentials/%d/secret", credential),
+		map[string]string{"secret": "github_pat_11ROTATED"}, http.StatusNoContent)
 
 	f.reconcileNow()
 	f.vm.jobsFinish()
@@ -503,9 +509,9 @@ func TestConfigurationSurvivesARestart(t *testing.T) {
 	}
 	// And the credential is still usable, which means the key was reloaded and
 	// still decrypts what the last process wrote.
-	token, err := f.store.Token(context.Background(), credential)
-	if err != nil || token != "github_pat_11TESTVALUE" {
-		t.Fatalf("got %q, %v", token, err)
+	secret, err := f.store.Secret(context.Background(), credential)
+	if err != nil || secret.Token != "github_pat_11TESTVALUE" {
+		t.Fatalf("got %q, %v", secret.Token, err)
 	}
 }
 
@@ -776,5 +782,106 @@ func TestScalingDecisionsAreReported(t *testing.T) {
 	}
 	if scale.Floor != 1 || scale.Ceiling != 3 {
 		t.Fatalf("the bounds are %d..%d", scale.Floor, scale.Ceiling)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GitHub App credentials
+// ---------------------------------------------------------------------------
+
+func appKey(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	}))
+}
+
+func (f *fleet) addAppCredential(appID int64) int64 {
+	f.t.Helper()
+	payload := f.mustRequest("POST", "/api/credentials", map[string]any{
+		"name": "app", "kind": "app", "appId": appID, "secret": appKey(f.t),
+	}, http.StatusCreated)
+	var credential model.Credential
+	if err := json.Unmarshal([]byte(payload), &credential); err != nil {
+		f.t.Fatal(err)
+	}
+	return credential.ID
+}
+
+// A runner authenticates on its own — it comes back after a reboot with the
+// daemon still starting — so everything it needs to do that has to reach it.
+func TestAPoolOnAnAppReachesItsRunners(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addAppCredential(123456)
+	pool := vmPool(credential, 1)
+	f.addPool(pool)
+	f.reconcileNow()
+
+	if len(f.vm.specs) != 1 {
+		t.Fatalf("got %d runners", len(f.vm.specs))
+	}
+	spec := f.vm.specs[0]
+	if spec.CredentialKind != model.CredentialApp || spec.AppID != 123456 {
+		t.Fatalf("the runner was not told which app to authenticate as: %+v", spec)
+	}
+	// The key itself travels the same way every secret does: on tmpfs, by
+	// reference, never in the runner's configuration.
+	if spec.CredentialID != credential {
+		t.Fatalf("the runner points at credential %d, want %d", spec.CredentialID, credential)
+	}
+}
+
+// Replacing an app's key must reach the runners, which means replacing them.
+func TestRotatingAnAppKeySupersedesTheRunners(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addAppCredential(123456)
+	f.addPool(vmPool(credential, 1))
+	f.reconcileNow()
+	f.vm.created = nil
+
+	f.mustRequest("PUT", fmt.Sprintf("/api/credentials/%d/secret", credential),
+		map[string]string{"secret": appKey(t)}, http.StatusNoContent)
+
+	f.reconcileNow()
+	f.vm.jobsFinish()
+	f.reconcileNow()
+
+	if got := strings.Join(f.vm.created, ","); got != "web-1" {
+		t.Fatalf("the runner was not rebuilt with the new key: %v", f.vm.created)
+	}
+}
+
+// Both kinds work at once: an installation that was on a token does not have
+// to move everything to an app in one go.
+func TestTokenAndAppPoolsSideBySide(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	token := f.addCredential()
+	app := f.addAppCredential(999)
+
+	f.addPool(vmPool(token, 1))
+	f.addPool(map[string]any{
+		"name": "api", "scopeKind": "repository", "scope": "clems4ever/other",
+		"runtime": "vm", "minReplicas": 1, "maxReplicas": 1,
+		"credentialId": app, "enabled": true,
+	})
+	f.reconcileNow()
+
+	kinds := map[string]model.CredentialKind{}
+	for _, spec := range f.vm.specs {
+		kinds[spec.Name] = spec.CredentialKind
+	}
+	if kinds["web-1"] != model.CredentialPAT || kinds["api-1"] != model.CredentialApp {
+		t.Fatalf("got %v", kinds)
 	}
 }

@@ -33,8 +33,8 @@ type Store interface {
 	DeletePool(ctx context.Context, id int64) error
 	Activity(ctx context.Context, since, until time.Time, buckets int, pool string) ([]model.ActivityPoint, error)
 	ListCredentials(ctx context.Context) ([]model.Credential, error)
-	CreateCredential(ctx context.Context, name, token string) (model.Credential, error)
-	ReplaceCredentialToken(ctx context.Context, id int64, token string) error
+	CreateCredential(ctx context.Context, credential model.Credential, secret string) (model.Credential, error)
+	ReplaceCredentialSecret(ctx context.Context, id int64, secret string) error
 	DeleteCredential(ctx context.Context, id int64) error
 }
 
@@ -99,7 +99,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/activity", s.activity)
 	api.HandleFunc("GET /api/credentials", s.listCredentials)
 	api.HandleFunc("POST /api/credentials", s.createCredential)
-	api.HandleFunc("PUT /api/credentials/{id}/token", s.rotateCredential)
+	api.HandleFunc("PUT /api/credentials/{id}/secret", s.rotateCredential)
 	api.HandleFunc("DELETE /api/credentials/{id}", s.deleteCredential)
 	api.HandleFunc("PUT /api/settings/auth", s.setPassword)
 	api.HandleFunc("GET /api/settings", s.getSettings)
@@ -306,19 +306,32 @@ func (s *Server) listCredentials(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createCredential(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name  string `json:"name"`
-		Token string `json:"token"`
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+		// Secret is the personal access token, or the app's PEM private key.
+		Secret         string `json:"secret"`
+		AppID          int64  `json:"appId"`
+		InstallationID int64  `json:"installationId"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, err)
 		return
 	}
-	created, err := s.store.CreateCredential(r.Context(), body.Name, body.Token)
+	kind := model.CredentialKind(body.Kind)
+	if kind == "" {
+		kind = model.CredentialPAT
+	}
+	created, err := s.store.CreateCredential(r.Context(), model.Credential{
+		Name:           body.Name,
+		Kind:           kind,
+		AppID:          body.AppID,
+		InstallationID: body.InstallationID,
+	}, body.Secret)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	// The response carries the name and a hint, never the token: it goes in
+	// The response carries the name and a hint, never the secret: it goes in
 	// once and only ever comes back out as a runner's registration.
 	writeJSON(w, http.StatusCreated, created)
 }
@@ -330,13 +343,13 @@ func (s *Server) rotateCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Token string `json:"token"`
+		Secret string `json:"secret"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, err)
 		return
 	}
-	if err := s.store.ReplaceCredentialToken(r.Context(), id, body.Token); err != nil {
+	if err := s.store.ReplaceCredentialSecret(r.Context(), id, body.Secret); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -453,7 +466,8 @@ func isValidation(err error) bool {
 	message := err.Error()
 	for _, prefix := range []string{
 		"name ", "scope ", "runtime ", "replicas ", "cpus ", "memory ", "disk ", "label ",
-		"a credential is required", "the token is empty", "a credential needs a name",
+		"a credential is required", "the secret is empty", "a credential needs a name",
+		"an app needs its app id", "the app's private key", "credential kind ",
 	} {
 		if strings.HasPrefix(message, prefix) {
 			return true

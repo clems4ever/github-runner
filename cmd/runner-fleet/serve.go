@@ -17,6 +17,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/executor/docker"
 	"github.com/clems4ever/github-runner/internal/executor/systemd"
 	"github.com/clems4ever/github-runner/internal/github"
+	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
 	"github.com/clems4ever/github-runner/internal/secrets"
@@ -70,7 +71,14 @@ func serveCommand(args []string) error {
 	// is what lets the fleet's rules be tested without either.
 	reconciler := reconcile.New(db,
 		[]reconcile.Executor{vm, containers},
-		func(token string) reconcile.GitHubClient { return github.New(token) },
+		func(secret model.Secret) (reconcile.GitHubClient, error) {
+			return github.NewFromSecret(github.Secret{
+				IsAppCredential: secret.IsApp(),
+				Token:           secret.Token,
+				AppID:           secret.AppID,
+				InstallationID:  secret.InstallationID,
+			})
+		},
 		credentialWriter(layout),
 		log)
 

@@ -2,13 +2,18 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"database/sql"
+	"encoding/pem"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/secrets"
 )
@@ -30,7 +35,7 @@ func newStore(t *testing.T) *Store {
 
 func credential(t *testing.T, s *Store) model.Credential {
 	t.Helper()
-	c, err := s.CreateCredential(context.Background(), "default", "github_pat_secret_value")
+	c, err := s.CreateCredential(context.Background(), model.Credential{Name: "default"}, "github_pat_secret_value")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +95,7 @@ func TestCredentialTokenIsNotStoredInClear(t *testing.T) {
 	ctx := context.Background()
 
 	const token = "github_pat_11ONLY_IN_MEMORY"
-	c, err := s.CreateCredential(ctx, "pat", token)
+	c, err := s.CreateCredential(ctx, model.Credential{Name: "pat"}, token)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,18 +109,21 @@ func TestCredentialTokenIsNotStoredInClear(t *testing.T) {
 		t.Fatalf("the token is in the database in clear: %q", sealed)
 	}
 
-	got, err := s.Token(ctx, c.ID)
+	got, err := s.Secret(ctx, c.ID)
 	if err != nil {
-		t.Fatalf("token: %v", err)
+		t.Fatalf("secret: %v", err)
 	}
-	if got != token {
-		t.Fatalf("got %q, want the original token", got)
+	if got.Token != token {
+		t.Fatalf("got %q, want the original token", got.Token)
+	}
+	if got.Kind != model.CredentialPAT {
+		t.Fatalf("kind came back as %q", got.Kind)
 	}
 }
 
 func TestCredentialHintIdentifiesWithoutRevealing(t *testing.T) {
 	s := newStore(t)
-	c, err := s.CreateCredential(context.Background(), "pat", "github_pat_ABCD1234")
+	c, err := s.CreateCredential(context.Background(), model.Credential{Name: "pat"}, "github_pat_ABCD1234")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,10 +135,10 @@ func TestCredentialHintIdentifiesWithoutRevealing(t *testing.T) {
 func TestCredentialNamesAreUnique(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
-	if _, err := s.CreateCredential(ctx, "pat", "one"); err != nil {
+	if _, err := s.CreateCredential(ctx, model.Credential{Name: "pat"}, "one"); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.CreateCredential(ctx, "pat", "two")
+	_, err := s.CreateCredential(ctx, model.Credential{Name: "pat"}, "two")
 	if !errors.Is(err, ErrConflict) {
 		t.Fatalf("want ErrConflict, got %v", err)
 	}
@@ -169,7 +177,7 @@ func TestReplaceCredentialTokenChangesTheFingerprint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.ReplaceCredentialToken(ctx, cred.ID, "github_pat_rotated"); err != nil {
+	if err := s.ReplaceCredentialSecret(ctx, cred.ID, "github_pat_rotated"); err != nil {
 		t.Fatal(err)
 	}
 	after, err := s.CredentialFingerprint(ctx, cred.ID)
@@ -180,9 +188,9 @@ func TestReplaceCredentialTokenChangesTheFingerprint(t *testing.T) {
 		t.Fatal("rotating the token left the fingerprint alone, so runners would keep the old one")
 	}
 
-	token, err := s.Token(ctx, cred.ID)
-	if err != nil || token != "github_pat_rotated" {
-		t.Fatalf("got %q, %v", token, err)
+	secret, err := s.Secret(ctx, cred.ID)
+	if err != nil || secret.Token != "github_pat_rotated" {
+		t.Fatalf("got %q, %v", secret.Token, err)
 	}
 }
 
@@ -576,5 +584,232 @@ func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
 	}
 	if len(none) != 0 {
 		t.Fatalf("got %+v", none)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GitHub App credentials
+// ---------------------------------------------------------------------------
+
+// testAppKey is a real RSA key in the format GitHub issues.
+func testAppKey(t *testing.T) string {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(key),
+	}))
+}
+
+func TestAppCredentialRoundTrip(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	key := testAppKey(t)
+
+	created, err := s.CreateCredential(ctx, model.Credential{
+		Name: "runyard app", Kind: model.CredentialApp, AppID: 123456, InstallationID: 42,
+	}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The hint says which app it is, since there is no token tail to show.
+	if created.Hint != "app 123456" {
+		t.Fatalf("hint is %q", created.Hint)
+	}
+
+	secret, err := s.Secret(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !secret.IsApp() || secret.AppID != 123456 || secret.InstallationID != 42 {
+		t.Fatalf("got %+v", secret)
+	}
+	// Trimmed of the whitespace a paste picks up, but the same key: it still
+	// parses, which is what the agent will do with it.
+	if secret.Token != strings.TrimSpace(key) {
+		t.Fatal("the private key did not survive the round trip")
+	}
+	if _, err := github.ParsePrivateKey([]byte(secret.Token)); err != nil {
+		t.Fatalf("what came back is no longer a usable key: %v", err)
+	}
+
+	// And the list still says nothing secret.
+	credentials, err := s.ListCredentials(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if credentials[0].Kind != model.CredentialApp || credentials[0].AppID != 123456 {
+		t.Fatalf("got %+v", credentials[0])
+	}
+}
+
+func TestTheAppKeyIsNotStoredInClear(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	key := testAppKey(t)
+
+	created, err := s.CreateCredential(ctx,
+		model.Credential{Name: "app", Kind: model.CredentialApp, AppID: 1}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sealed string
+	if err := s.db.QueryRowContext(ctx, `SELECT sealed FROM credentials WHERE id = ?`, created.ID).Scan(&sealed); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(sealed, "PRIVATE KEY") {
+		t.Fatalf("the key is on disk in clear: %q", sealed[:60])
+	}
+}
+
+// A key that went wrong in the paste has to be caught here, while whoever
+// pasted it is still looking — not at the first runner boot an hour later.
+func TestAppCredentialsAreCheckedBeforeTheyAreStored(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name       string
+		credential model.Credential
+		secret     string
+		want       string
+	}{
+		{
+			name:       "no app id",
+			credential: model.Credential{Name: "a", Kind: model.CredentialApp},
+			secret:     testAppKey(t),
+			want:       "app id",
+		},
+		{
+			name:       "a token pasted where the key goes",
+			credential: model.Credential{Name: "b", Kind: model.CredentialApp, AppID: 1},
+			secret:     "github_pat_11ABCDEF",
+			want:       "not a PEM file",
+		},
+		{
+			name:       "a public key",
+			credential: model.Credential{Name: "c", Kind: model.CredentialApp, AppID: 1},
+			secret:     "-----BEGIN PUBLIC KEY-----\nMIIBIjAN\n-----END PUBLIC KEY-----\n",
+			want:       "private key",
+		},
+		{
+			name:       "a kind nobody has heard of",
+			credential: model.Credential{Name: "d", Kind: "oauth"},
+			secret:     "x",
+			want:       "credential kind",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := s.CreateCredential(ctx, tt.credential, tt.secret)
+			if err == nil {
+				t.Fatal("stored a credential that cannot work")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("the message does not say what is wrong: %v", err)
+			}
+		})
+	}
+}
+
+// Rotating must not be a side door around the checks.
+func TestRotatingAnAppKeyIsCheckedToo(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	created, err := s.CreateCredential(ctx,
+		model.Credential{Name: "app", Kind: model.CredentialApp, AppID: 7}, testAppKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ReplaceCredentialSecret(ctx, created.ID, "github_pat_not_a_key"); err == nil {
+		t.Fatal("a token was accepted as an app's private key")
+	}
+
+	replacement := testAppKey(t)
+	if err := s.ReplaceCredentialSecret(ctx, created.ID, replacement); err != nil {
+		t.Fatal(err)
+	}
+	secret, err := s.Secret(ctx, created.ID)
+	if err != nil || secret.Token != strings.TrimSpace(replacement) {
+		t.Fatalf("the new key did not stick: %v", err)
+	}
+	// The app it belongs to is unchanged, so the hint is too.
+	if secret.AppID != 7 {
+		t.Fatalf("the app id changed to %d", secret.AppID)
+	}
+}
+
+// The fingerprint drives the generation, so anything that changes which
+// credential a runner is using has to move it.
+func TestAppFingerprintCoversMoreThanTheKey(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	key := testAppKey(t)
+
+	first, err := s.CreateCredential(ctx,
+		model.Credential{Name: "one", Kind: model.CredentialApp, AppID: 1}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same key, a different app: a different credential in every way that
+	// matters, and the runners have to be rebuilt.
+	second, err := s.CreateCredential(ctx,
+		model.Credential{Name: "two", Kind: model.CredentialApp, AppID: 2}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a, err := s.CredentialFingerprint(ctx, first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.CredentialFingerprint(ctx, second.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatal("two apps sharing a key share a fingerprint")
+	}
+
+	// And a token credential is never confused with an app one.
+	pat, err := s.CreateCredential(ctx, model.Credential{Name: "pat"}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.CredentialFingerprint(ctx, pat.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c == a {
+		t.Fatal("a token and an app with the same secret share a fingerprint")
+	}
+}
+
+// An installation that existed before GitHub Apps did must keep working
+// untouched.
+func TestUpgradingADatabaseFromBeforeApps(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+
+	created, err := s.CreateCredential(ctx, model.Credential{Name: "old"}, "github_pat_11EXISTING")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A row written before the app columns existed defaults to what it was.
+	if created.Kind != model.CredentialPAT {
+		t.Fatalf("kind is %q", created.Kind)
+	}
+	secret, err := s.Secret(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secret.IsApp() || secret.Token != "github_pat_11EXISTING" {
+		t.Fatalf("got %+v", secret)
 	}
 }

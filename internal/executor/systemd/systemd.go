@@ -200,6 +200,17 @@ func RenderEnv(spec reconcile.Spec, layout paths.Layout) string {
 	// registered somewhere, and this is what lets the daemon find the
 	// credential that can ask GitHub about it.
 	fmt.Fprintf(&b, "FLEET_CREDENTIAL_ID=%d\n", spec.CredentialID)
+	// A GitHub App's agent does its own JWT exchange, so it needs to know which
+	// app the key belongs to. None of this is secret; the key beside it is.
+	if spec.CredentialKind != "" {
+		fmt.Fprintf(&b, "FLEET_CREDENTIAL_KIND=%s\n", spec.CredentialKind)
+	}
+	if spec.AppID != 0 {
+		fmt.Fprintf(&b, "FLEET_APP_ID=%d\n", spec.AppID)
+	}
+	if spec.InstallationID != 0 {
+		fmt.Fprintf(&b, "FLEET_INSTALLATION_ID=%d\n", spec.InstallationID)
+	}
 	fmt.Fprintf(&b, "FLEET_STATE_DIR=%s\n", layout.State)
 	return b.String()
 }
