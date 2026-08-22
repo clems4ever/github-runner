@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
 	"github.com/clems4ever/github-runner/internal/store"
@@ -52,19 +53,25 @@ type Server struct {
 	auth    *Authenticator
 	ui      fs.FS
 	version string
+	check   CheckAccess
 	// nudge asks the daemon to reconcile now rather than at the next tick, so
 	// a change made in the UI takes effect while the operator is still looking
 	// at it.
 	nudge func()
 }
 
+// CheckAccess asks GitHub whether a credential can do what a pool will need,
+// before the pool is created. Injected, so the API can be tested without one.
+type CheckAccess func(ctx context.Context, credentialID int64, scope github.Scope) error
+
 // Options configures the server.
 type Options struct {
-	Store   Store
-	Fleet   Fleet
-	UI      fs.FS
-	Version string
-	Nudge   func()
+	Store       Store
+	Fleet       Fleet
+	UI          fs.FS
+	Version     string
+	Nudge       func()
+	CheckAccess CheckAccess
 }
 
 // New builds the server.
@@ -76,6 +83,7 @@ func New(opts Options) *Server {
 		ui:      opts.UI,
 		version: opts.Version,
 		nudge:   opts.Nudge,
+		check:   opts.CheckAccess,
 	}
 	if s.nudge == nil {
 		s.nudge = func() {}
@@ -190,6 +198,10 @@ func (s *Server) createPool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pool.ID = 0
+	if err := s.reachable(r.Context(), pool); err != nil {
+		writeError(w, err)
+		return
+	}
 	created, err := s.store.CreatePool(r.Context(), pool)
 	if err != nil {
 		writeError(w, err)
@@ -211,6 +223,10 @@ func (s *Server) updatePool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	pool.ID = id
+	if err := s.reachable(r.Context(), pool); err != nil {
+		writeError(w, err)
+		return
+	}
 	updated, err := s.store.UpdatePool(r.Context(), pool)
 	if err != nil {
 		writeError(w, err)
@@ -234,6 +250,23 @@ func (s *Server) deletePool(w http.ResponseWriter, r *http.Request) {
 	// what keeps deleting a pool from failing a job that is in flight.
 	s.nudge()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// reachable refuses a pool whose credential GitHub says cannot serve it.
+//
+// Only when GitHub gave a definite answer. A daemon that cannot reach GitHub at
+// all must not stop someone configuring their fleet — the pool will work when
+// the network does, and the reconcile loop reports what it finds either way.
+func (s *Server) reachable(ctx context.Context, pool model.Pool) error {
+	if s.check == nil || !pool.Enabled {
+		return nil
+	}
+	err := s.check(ctx, pool.CredentialID, github.Scope{Kind: pool.ScopeKind, Path: pool.Scope})
+	var apiErr *github.Error
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +476,18 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 // "you asked for something that is not there" from "that name is taken" from
 // "this is not going to work".
 func writeError(w http.ResponseWriter, err error) {
+	// GitHub refusing is the operator's problem to fix, not a fault of this
+	// daemon, and sometimes there is a page that fixes it.
+	var apiErr *github.Error
+	if errors.As(err, &apiErr) {
+		body := map[string]string{"error": apiErr.Error()}
+		if apiErr.GrantURL != "" {
+			body["grantUrl"] = apiErr.GrantURL
+		}
+		writeJSON(w, http.StatusBadRequest, body)
+		return
+	}
+
 	status := http.StatusInternalServerError
 	switch {
 	case errors.Is(err, store.ErrNotFound):

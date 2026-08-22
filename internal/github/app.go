@@ -189,6 +189,34 @@ func (a *appAuth) discoverInstallation(ctx context.Context, c *Client, assertion
 	return installation.ID, nil
 }
 
+// grantURL is the page where someone can give this app access to a repository.
+//
+// The app's own installations are readable with its assertion even when the
+// repository in question is not, which is what makes this possible at the exact
+// moment it is needed. One installation is the ordinary case for an app
+// installed on one account, and its page has the repository picker on it;
+// anything else falls back to the list.
+func (a *appAuth) grantURL(ctx context.Context, c *Client) string {
+	const fallback = "https://github.com/settings/installations"
+
+	assertion, err := a.signJWT()
+	if err != nil {
+		return fallback
+	}
+
+	var installations []struct {
+		ID      int64  `json:"id"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := c.doAs(ctx, http.MethodGet, "/app/installations", assertion, &installations, Scope{}); err != nil {
+		return fallback
+	}
+	if len(installations) == 1 && installations[0].HTMLURL != "" {
+		return installations[0].HTMLURL
+	}
+	return fallback
+}
+
 // signJWT builds the assertion that proves ownership of the app's key.
 func (a *appAuth) signJWT() (string, error) {
 	now := a.now()
