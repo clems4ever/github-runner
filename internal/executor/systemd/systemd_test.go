@@ -2,9 +2,11 @@ package systemd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
@@ -51,6 +53,21 @@ func newExecutor(t *testing.T) (*Executor, *fakeCommander, paths.Layout) {
 	cmd := &fakeCommander{output: map[string]string{}}
 	e := New(layout, "/usr/local/bin/runner-fleet", "runner-fleet",
 		WithCommander(cmd), WithUnitPath(layout.Etc+"/gh-runner@.service"))
+	return e, cmd, layout
+}
+
+// newExecutorAt is newExecutor with a clock that does not move, for the tests
+// that ask how long something has been happening.
+func newExecutorAt(t *testing.T, now time.Time) (*Executor, *fakeCommander, paths.Layout) {
+	t.Helper()
+	layout := paths.Under(t.TempDir())
+	if err := layout.EnsureDirs(paths.CurrentOwner()); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &fakeCommander{output: map[string]string{}}
+	e := New(layout, "/usr/local/bin/runner-fleet", "runner-fleet",
+		WithCommander(cmd), WithUnitPath(layout.Etc+"/gh-runner@.service"),
+		WithClock(func() time.Time { return now }))
 	return e, cmd, layout
 }
 
@@ -437,5 +454,71 @@ func TestAnUnknownInstallationIsLeftOut(t *testing.T) {
 	env := RenderEnv(spec, layout)
 	if strings.Contains(env, "FLEET_INSTALLATION_ID") {
 		t.Fatalf("an unknown installation was written anyway:\n%s", env)
+	}
+}
+
+// A machine that missed the power button looks exactly like one finishing a
+// long job: the unit says "deactivating" and nothing says for how long. This
+// one had been stopping for forty-eight minutes, holding four cpus, with the
+// fleet showing STOPPING and no clock on it.
+func TestALongDrainSaysHowLongItHasBeen(t *testing.T) {
+	now := time.Date(2026, 8, 22, 16, 58, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// It left active at 16:10, which is where this began.
+	leftActive := now.Add(-48 * time.Minute).Unix()
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=deactivating",
+		"SubState=stop-sigterm",
+		"Result=success",
+		"NRestarts=0",
+		fmt.Sprintf("ActiveExitTimestamp=@%d", leftActive),
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Still stopping, not failed: a drain is not a failure, and the reconciler
+	// must not treat it as a runner it can delete.
+	if runners[0].State != reconcile.StateStopping {
+		t.Fatalf("state is %q", runners[0].State)
+	}
+	if !strings.Contains(runners[0].Trouble, "48m") {
+		t.Errorf("the fleet does not say how long it has been draining: %q", runners[0].Trouble)
+	}
+	if !strings.Contains(runners[0].Trouble, "journalctl -u gh-runner@web-1.service") {
+		t.Errorf("no way to look into it: %q", runners[0].Trouble)
+	}
+}
+
+// A drain of a few minutes is a job finishing, and says nothing.
+func TestAnOrdinaryDrainIsQuiet(t *testing.T) {
+	now := time.Date(2026, 8, 22, 16, 58, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=deactivating",
+		"SubState=stop-sigterm",
+		"Result=success",
+		"NRestarts=0",
+		fmt.Sprintf("ActiveExitTimestamp=@%d", now.Add(-90*time.Second).Unix()),
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runners[0].Trouble != "" {
+		t.Fatalf("a runner finishing its job was reported as a problem: %q", runners[0].Trouble)
 	}
 }
