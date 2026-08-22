@@ -91,6 +91,13 @@ var migrations = []string{
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	)`,
+	// Autoscaling. A pool used to be a fixed number of runners; it is now a
+	// range. Existing pools become a fixed size — minimum equal to maximum —
+	// which is exactly what they were, so an upgrade changes nothing until
+	// someone raises the maximum.
+	`ALTER TABLE pools ADD COLUMN min_replicas INTEGER NOT NULL DEFAULT 1`,
+	`ALTER TABLE pools ADD COLUMN max_replicas INTEGER NOT NULL DEFAULT 1`,
+	`UPDATE pools SET min_replicas = MAX(replicas, 1), max_replicas = MAX(replicas, 1)`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -262,8 +269,8 @@ func (s *Store) DeleteCredential(ctx context.Context, id int64) error {
 // Pools
 // ---------------------------------------------------------------------------
 
-const poolColumns = `id, name, scope_kind, scope, runtime, nested, ephemeral, replicas, labels,
-	cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at`
+const poolColumns = `id, name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
+	labels, cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at`
 
 // CreatePool validates and stores a pool.
 func (s *Store) CreatePool(ctx context.Context, p model.Pool) (model.Pool, error) {
@@ -278,12 +285,17 @@ func (s *Store) CreatePool(ctx context.Context, p model.Pool) (model.Pool, error
 	now := time.Now().UTC()
 	p.CreatedAt, p.UpdatedAt = now, now
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, replicas, labels,
-			cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral, p.Replicas,
+		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
+			labels, cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at, replicas)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral,
+		p.MinReplicas, p.MaxReplicas,
 		strings.Join(p.Labels, ","), p.CPUs, p.MemoryMB, p.DiskGB, p.Image, p.CredentialID, p.Enabled,
-		p.CreatedAt.Format(time.RFC3339Nano), p.UpdatedAt.Format(time.RFC3339Nano))
+		p.CreatedAt.Format(time.RFC3339Nano), p.UpdatedAt.Format(time.RFC3339Nano),
+		// The old column is not dropped: SQLite makes that awkward, and a
+		// database that can still be read by the previous release is worth more
+		// than a tidy schema. It is kept in step rather than left to rot.
+		p.MaxReplicas)
 	if err != nil {
 		if isUnique(err) {
 			return model.Pool{}, fmt.Errorf("pool %q: %w", p.Name, ErrConflict)
@@ -306,10 +318,12 @@ func (s *Store) UpdatePool(ctx context.Context, p model.Pool) (model.Pool, error
 
 	p.UpdatedAt = time.Now().UTC()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE pools SET name=?, scope_kind=?, scope=?, runtime=?, nested=?, ephemeral=?, replicas=?,
+		`UPDATE pools SET name=?, scope_kind=?, scope=?, runtime=?, nested=?, ephemeral=?,
+			min_replicas=?, max_replicas=?, replicas=?,
 			labels=?, cpus=?, memory_mb=?, disk_gb=?, image=?, credential_id=?, enabled=?, updated_at=?
 		 WHERE id = ?`,
-		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral, p.Replicas,
+		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral,
+		p.MinReplicas, p.MaxReplicas, p.MaxReplicas,
 		strings.Join(p.Labels, ","), p.CPUs, p.MemoryMB, p.DiskGB, p.Image, p.CredentialID, p.Enabled,
 		p.UpdatedAt.Format(time.RFC3339Nano), p.ID)
 	if err != nil {
@@ -379,8 +393,8 @@ func scanPool(row scanner) (model.Pool, error) {
 		created, updated   string
 	)
 	err := row.Scan(&p.ID, &p.Name, &scopeKind, &p.Scope, &runtime, &p.Nested, &p.Ephemeral,
-		&p.Replicas, &labels, &p.CPUs, &p.MemoryMB, &p.DiskGB, &p.Image, &p.CredentialID,
-		&p.Enabled, &created, &updated)
+		&p.MinReplicas, &p.MaxReplicas, &labels, &p.CPUs, &p.MemoryMB, &p.DiskGB, &p.Image,
+		&p.CredentialID, &p.Enabled, &created, &updated)
 	if err != nil {
 		return model.Pool{}, err
 	}

@@ -73,14 +73,20 @@ type Credential struct {
 
 // Pool is a set of identical runners on one repository or organisation.
 type Pool struct {
-	ID           int64     `json:"id"`
-	Name         string    `json:"name"`
-	ScopeKind    ScopeKind `json:"scopeKind"`
-	Scope        string    `json:"scope"`
-	Runtime      Runtime   `json:"runtime"`
-	Nested       bool      `json:"nested"`
-	Ephemeral    bool      `json:"ephemeral"`
-	Replicas     int       `json:"replicas"`
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	ScopeKind ScopeKind `json:"scopeKind"`
+	Scope     string    `json:"scope"`
+	Runtime   Runtime   `json:"runtime"`
+	Nested    bool      `json:"nested"`
+	Ephemeral bool      `json:"ephemeral"`
+	// MinReplicas is what the pool falls back to when nothing is running, and
+	// is never below one: a pool with no runner at all cannot accept a job, and
+	// so can never discover that it needs more.
+	MinReplicas int `json:"minReplicas"`
+	// MaxReplicas is the ceiling. Equal to the minimum, the pool is a fixed
+	// size and never scales.
+	MaxReplicas  int       `json:"maxReplicas"`
 	Labels       []string  `json:"labels"`
 	CPUs         int       `json:"cpus"`
 	MemoryMB     int       `json:"memoryMb"`
@@ -103,16 +109,33 @@ func (p *Pool) RunnerName(index int) string {
 	return fmt.Sprintf("%s-%d", p.Name, index)
 }
 
-// DesiredRunnerNames lists the runners the pool should have right now.
-func (p *Pool) DesiredRunnerNames() []string {
+// Elastic reports whether the pool scales at all. A pool whose minimum equals
+// its maximum is a fixed size, which is how the previous fixed replica count
+// is expressed.
+func (p *Pool) Elastic() bool { return p.MaxReplicas > p.MinReplicas }
+
+// Floor is the smallest the pool is allowed to be, and is at least one even if
+// the stored value is not: an empty pool cannot accept a job, so it can never
+// find out that it needs to grow.
+func (p *Pool) Floor() int {
 	if !p.Enabled {
-		return nil
+		return 0
 	}
-	names := make([]string, 0, p.Replicas)
-	for i := 1; i <= p.Replicas; i++ {
-		names = append(names, p.RunnerName(i))
+	if p.MinReplicas < 1 {
+		return 1
 	}
-	return names
+	return p.MinReplicas
+}
+
+// Ceiling is the largest the pool is allowed to be.
+func (p *Pool) Ceiling() int {
+	if !p.Enabled {
+		return 0
+	}
+	if p.MaxReplicas < p.Floor() {
+		return p.Floor()
+	}
+	return p.MaxReplicas
 }
 
 // EffectiveLabels is what a runner registers with: the labels configured on
@@ -155,8 +178,9 @@ func (p *Pool) EffectiveLabels() []string {
 // generation no longer matches its pool is running the wrong configuration and
 // has to be replaced — gracefully, since it may be mid-job.
 //
-// Replicas are deliberately not in it. Scaling a pool must not replace the
-// runners that are already right.
+// The scaling bounds are deliberately not in it. Scaling a pool — by hand or
+// by the autoscaler, many times an hour — must not replace the runners that
+// are already right.
 func (p *Pool) Generation(credentialFingerprint string) string {
 	h := sha256.New()
 	write := func(parts ...string) {
@@ -212,8 +236,14 @@ func (p *Pool) Validate() error {
 		return fmt.Errorf("runtime %q: want %q or %q", p.Runtime, RuntimeVM, RuntimeContainer)
 	}
 
-	if p.Replicas < 0 || p.Replicas > MaxReplicas {
-		return fmt.Errorf("replicas %d: want 0 to %d", p.Replicas, MaxReplicas)
+	// One, not zero. A pool has to keep a runner able to accept work, or
+	// nothing would ever reveal that the pool needs to grow. Switching a pool
+	// off entirely is what "enabled" is for.
+	if p.MinReplicas < 1 || p.MinReplicas > MaxReplicas {
+		return fmt.Errorf("minimum replicas %d: want 1 to %d — use the enabled switch to stop a pool entirely", p.MinReplicas, MaxReplicas)
+	}
+	if p.MaxReplicas < p.MinReplicas || p.MaxReplicas > MaxReplicas {
+		return fmt.Errorf("maximum replicas %d: want %d to %d, and never below the minimum", p.MaxReplicas, p.MinReplicas, MaxReplicas)
 	}
 	if p.CPUs < MinCPUs || p.CPUs > MaxCPUs {
 		return fmt.Errorf("cpus %d: want %d to %d", p.CPUs, MinCPUs, MaxCPUs)
@@ -241,6 +271,12 @@ func (p *Pool) Validate() error {
 func (p *Pool) Defaults() {
 	if p.Runtime == "" {
 		p.Runtime = RuntimeVM
+	}
+	if p.MinReplicas < 1 {
+		p.MinReplicas = 1
+	}
+	if p.MaxReplicas < p.MinReplicas {
+		p.MaxReplicas = p.MinReplicas
 	}
 	if p.ScopeKind == "" {
 		p.ScopeKind = ScopeRepository

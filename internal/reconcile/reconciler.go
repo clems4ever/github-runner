@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
@@ -60,6 +61,65 @@ type Reconciler struct {
 	mu     sync.Mutex
 	last   Result
 	poolOf map[string]string // runner name -> pool, for reporting
+	// busySince records when each pool last had a runner working.
+	//
+	// It lives in memory on purpose. Losing it — on a restart, or an upgrade —
+	// makes the next scale-down wait out the stabilisation window again, which
+	// is the harmless direction to be wrong in: a pool stays one size too big
+	// for a few minutes rather than shedding a runner it was about to need.
+	busySince map[string]time.Time
+	scaling   map[string]Scale
+
+	// now is the clock, injectable so the autoscaler's timing can be tested
+	// without waiting for it.
+	now func() time.Time
+}
+
+// lastBusy is when the pool last had a runner with a job on it. A pool that is
+// busy right now is busy as of now.
+func (r *Reconciler) lastBusy(pool string, runners []Runner, states map[string]github.State) time.Time {
+	busy := false
+	for _, runner := range runners {
+		if states[runner.Name] == github.StateBusy {
+			busy = true
+			break
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if busy {
+		r.busySince[pool] = r.now()
+	} else if _, seen := r.busySince[pool]; !seen {
+		// First sight of a quiet pool: treat it as busy just now, so a daemon
+		// that has only just started does not immediately shrink a fleet whose
+		// history it never saw.
+		r.busySince[pool] = r.now()
+	}
+	return r.busySince[pool]
+}
+
+func (r *Reconciler) rememberScaling(scaling map[string]Scale) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.scaling = scaling
+}
+
+// Scaling is the most recent decision per pool, for the UI.
+func (r *Reconciler) Scaling() map[string]Scale {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]Scale, len(r.scaling))
+	for pool, scale := range r.scaling {
+		out[pool] = scale
+	}
+	return out
+}
+
+// WithClock replaces the clock, for tests.
+func (r *Reconciler) WithClock(now func() time.Time) *Reconciler {
+	r.now = now
+	return r
 }
 
 // New builds a reconciler.
@@ -78,13 +138,21 @@ func New(store Fleet, executors []Executor, newClient ClientFactory, writeSecret
 		writeSecret: writeSecret,
 		log:         log,
 		poolOf:      map[string]string{},
+		busySince:   map[string]time.Time{},
+		scaling:     map[string]Scale{},
+		now:         time.Now,
 	}
 }
 
 // Result is what one pass did.
 type Result struct {
-	Actions []Action `json:"actions"`
-	Errors  []string `json:"errors"`
+	Actions []Action         `json:"actions"`
+	Errors  []string         `json:"errors"`
+	Scaling map[string]Scale `json:"scaling"`
+	// ScaledUp says a pool grew because everything in it was busy. The daemon
+	// uses it to come back sooner than the next tick: a burst of jobs should
+	// ramp in seconds, not at one runner per interval.
+	ScaledUp bool `json:"scaledUp"`
 }
 
 // Once runs a single reconcile pass.
@@ -101,9 +169,16 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 		return result
 	}
 
+	// The host is read before anything is decided: how many runners a pool
+	// should have depends on what its runners are doing, so the observation
+	// has to come first.
+	actual, listErrs := r.listAll(ctx)
+	result.Errors = append(result.Errors, listErrs...)
+
 	var desired []Spec
 	states := map[string]github.State{}
 	poolByName := map[string]model.Pool{}
+	fingerprints := map[string]string{}
 	scopeSeen := map[string]bool{}
 
 	for _, pool := range pools {
@@ -130,7 +205,7 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			}
 		}
 
-		desired = append(desired, SpecsFor(pool, fingerprint)...)
+		fingerprints[pool.Name] = fingerprint
 
 		// One question per scope, not per runner: three replicas on one
 		// repository are one call.
@@ -154,14 +229,34 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 		}
 	}
 
-	actual, listErrs := r.listAll(ctx)
-	result.Errors = append(result.Errors, listErrs...)
-
 	// Runners whose pool is gone are the ones most at risk of being removed
 	// mid-job, and the loop above could not have asked about them: their pool
 	// is no longer in the database to say where they are registered. They
 	// carry that themselves, so they can still be asked about.
 	r.statesForOrphans(ctx, actual, states, scopeSeen, &result)
+
+	// Now that both halves are known — what is running, and what each runner is
+	// doing — each pool is sized.
+	byPool := map[string][]Runner{}
+	for _, runner := range actual {
+		byPool[runner.Pool] = append(byPool[runner.Pool], runner)
+	}
+	scaling := map[string]Scale{}
+	for _, pool := range pools {
+		fingerprint, ok := fingerprints[pool.Name]
+		if !ok {
+			continue // its credential could not be read; already reported
+		}
+		mine := byPool[pool.Name]
+		scale := Autoscale(pool, mine, states, r.lastBusy(pool.Name, mine, states), r.now())
+		scaling[pool.Name] = scale
+		if scale.ScaledUp {
+			result.ScaledUp = true
+		}
+		desired = append(desired, SpecsFor(pool, fingerprint, DesiredNames(pool, mine, states, scale.Target))...)
+	}
+	result.Scaling = scaling
+	r.rememberScaling(scaling)
 
 	actions := Plan(desired, actual, states)
 	result.Actions = actions

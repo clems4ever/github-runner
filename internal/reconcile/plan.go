@@ -212,13 +212,15 @@ func sortedRunners(in []Runner) []Runner {
 	return out
 }
 
-// SpecsFor turns a pool into the runners it should have.
-func SpecsFor(p model.Pool, credentialFingerprint string) []Spec {
+// SpecsFor turns a pool and the names the autoscaler chose into the runners it
+// should have. The names are decided elsewhere, because how many a pool needs
+// depends on what its runners are doing and this does not.
+func SpecsFor(p model.Pool, credentialFingerprint string, names []string) []Spec {
 	generation := p.Generation(credentialFingerprint)
 	labels := p.EffectiveLabels()
 
 	var specs []Spec
-	for _, name := range p.DesiredRunnerNames() {
+	for _, name := range names {
 		specs = append(specs, Spec{
 			Name:         name,
 			Pool:         p.Name,

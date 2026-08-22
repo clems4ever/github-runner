@@ -128,11 +128,30 @@ func reconcileLoop(ctx context.Context, reconciler *reconcile.Reconciler, interv
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	// A pool grows by one runner per pass, so at the normal interval a burst of
+	// ten jobs would take five minutes to be met. When a pass scaled up, the
+	// next one comes almost immediately instead, and the fleet climbs in
+	// seconds while demand lasts.
+	const rampInterval = 3 * time.Second
+	next := interval
+
 	pass := func() {
 		result := reconciler.Once(ctx)
 		for _, message := range result.Errors {
 			log.Warn("reconcile", "problem", message)
 		}
+		for pool, scale := range result.Scaling {
+			if scale.ScaledUp {
+				log.Info("scaling up", "pool", pool, "target", scale.Target,
+					"ceiling", scale.Ceiling, "reason", scale.Reason)
+			}
+		}
+		if result.ScaledUp && rampInterval < interval {
+			next = rampInterval
+		} else {
+			next = interval
+		}
+		ticker.Reset(next)
 	}
 
 	// Once at startup, which is where a restarted daemon adopts the fleet it

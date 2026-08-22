@@ -15,7 +15,10 @@ export interface Pool {
   runtime: Runtime
   nested: boolean
   ephemeral: boolean
-  replicas: number
+  /** What the pool falls back to when nothing is running. Never below one. */
+  minReplicas: number
+  /** The ceiling. Equal to the minimum, the pool is a fixed size. */
+  maxReplicas: number
   labels: string[]
   cpus: number
   memoryMb: number
@@ -45,6 +48,15 @@ export interface Credential {
   name: string
   hint: string
   createdAt: string
+}
+
+/** What the autoscaler decided for a pool, and why. */
+export interface Scale {
+  target: number
+  floor: number
+  ceiling: number
+  reason: string
+  scaledUp: boolean
 }
 
 export interface Health {
@@ -95,7 +107,8 @@ export const api = {
     request<Pool>(`/api/pools/${id}`, { method: 'PUT', body: JSON.stringify(pool) }),
   deletePool: (id: number) => request<void>(`/api/pools/${id}`, { method: 'DELETE' }),
 
-  runners: () => request<{ runners: Runner[]; warnings: string[] }>('/api/runners'),
+  runners: () =>
+    request<{ runners: Runner[]; warnings: string[]; scaling: Record<string, Scale> }>('/api/runners'),
   reconcile: () => request<{ actions: unknown[]; errors: string[] }>('/api/reconcile', { method: 'POST' }),
 
   credentials: () => request<Credential[]>('/api/credentials'),
@@ -119,7 +132,8 @@ export function emptyPool(credentialId: number): Partial<Pool> {
     runtime: 'vm',
     nested: false,
     ephemeral: true,
-    replicas: 1,
+    minReplicas: 1,
+    maxReplicas: 1,
     labels: [],
     cpus: 2,
     memoryMb: 4096,

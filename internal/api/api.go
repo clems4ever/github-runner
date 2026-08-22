@@ -40,6 +40,7 @@ type Store interface {
 type Fleet interface {
 	Status(ctx context.Context) ([]reconcile.RunnerStatus, []string)
 	Once(ctx context.Context) reconcile.Result
+	Scaling() map[string]reconcile.Scale
 }
 
 // Server is the HTTP surface.
@@ -238,7 +239,13 @@ func (s *Server) deletePool(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 	runners, errs := s.fleet.Status(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{"runners": runners, "warnings": errs})
+	// The scaling decisions go with them: a pool that resized itself should
+	// never leave anyone wondering what it reacted to.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"runners":  runners,
+		"warnings": errs,
+		"scaling":  s.fleet.Scaling(),
+	})
 }
 
 func (s *Server) reconcileNow(w http.ResponseWriter, r *http.Request) {

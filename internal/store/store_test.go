@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -37,11 +38,11 @@ func credential(t *testing.T, s *Store) model.Credential {
 
 func samplePool(credentialID int64) model.Pool {
 	return model.Pool{
-		Name:         "web",
-		ScopeKind:    model.ScopeRepository,
-		Scope:        "clems4ever/runyard",
-		Runtime:      model.RuntimeVM,
-		Replicas:     2,
+		Name:        "web",
+		ScopeKind:   model.ScopeRepository,
+		Scope:       "clems4ever/runyard",
+		Runtime:     model.RuntimeVM,
+		MinReplicas: 2, MaxReplicas: 2,
 		Labels:       []string{"fast"},
 		CredentialID: credentialID,
 		Enabled:      true,
@@ -201,7 +202,7 @@ func TestPoolRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Name != "web" || got.Scope != "clems4ever/runyard" || got.Replicas != 2 {
+	if got.Name != "web" || got.Scope != "clems4ever/runyard" || got.MinReplicas != 2 || got.MaxReplicas != 2 {
 		t.Fatalf("round trip changed the pool: %+v", got)
 	}
 	if len(got.Labels) != 1 || got.Labels[0] != "fast" {
@@ -278,14 +279,14 @@ func TestUpdatePool(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	created.Replicas = 5
+	created.MinReplicas, created.MaxReplicas = 5, 5
 	created.Nested = true
 	created.Labels = []string{"gpu"}
 	updated, err := s.UpdatePool(ctx, created)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if updated.Replicas != 5 || !updated.Nested || updated.Labels[0] != "gpu" {
+	if updated.MaxReplicas != 5 || !updated.Nested || updated.Labels[0] != "gpu" {
 		t.Fatalf("update did not stick: %+v", updated)
 	}
 	if !updated.UpdatedAt.After(created.CreatedAt) && !updated.UpdatedAt.Equal(created.CreatedAt) {
@@ -353,5 +354,73 @@ func TestListPoolsIsOrdered(t *testing.T) {
 	}
 	if strings.Join(names, ",") != "api,docs,web" {
 		t.Fatalf("got %v, want them sorted so the UI does not shuffle", names)
+	}
+}
+
+// An existing installation must survive the move to autoscaling. A pool that
+// was a fixed three runners becomes a pool whose minimum and maximum are both
+// three — exactly what it was — so an upgrade changes nothing until someone
+// raises the maximum.
+func TestUpgradingADatabaseFromBeforeAutoscaling(t *testing.T) {
+	dir := t.TempDir()
+	ring, err := secrets.LoadOrCreateKey(filepath.Join(dir, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "fleet.db")
+
+	// Build the schema as it stood before autoscaling: the first three
+	// migrations, and a pool with a fixed replica count.
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range append([]string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
+		`INSERT INTO schema_version (version) VALUES (3)`,
+	}, migrations[:3]...) {
+		if _, err := old.Exec(statement); err != nil {
+			t.Fatalf("building the old schema: %v", err)
+		}
+	}
+	if _, err := old.Exec(
+		`INSERT INTO credentials (name, sealed, hint, created_at) VALUES ('pat', 'x', '…1234', '2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(
+		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, replicas, labels,
+			cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at)
+		 VALUES ('web','repository','o/r','vm',0,1,3,'fast',2,4096,40,'default',1,1,
+			'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	// Now open it with the current code, which is what an upgrade does.
+	s, err := Open(path, ring)
+	if err != nil {
+		t.Fatalf("upgrading: %v", err)
+	}
+	defer s.Close()
+
+	pools, err := s.ListPools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pools) != 1 {
+		t.Fatalf("got %d pools", len(pools))
+	}
+	pool := pools[0]
+	if pool.MinReplicas != 3 || pool.MaxReplicas != 3 {
+		t.Fatalf("the pool became %d..%d, want the fixed 3 it already was", pool.MinReplicas, pool.MaxReplicas)
+	}
+	if pool.Elastic() {
+		t.Fatal("an upgraded pool started scaling on its own, which nobody asked for")
+	}
+	// The rest of it must come through untouched.
+	if pool.Name != "web" || pool.Scope != "o/r" || pool.CPUs != 2 || pool.Labels[0] != "fast" {
+		t.Fatalf("the upgrade changed the pool: %+v", pool)
 	}
 }

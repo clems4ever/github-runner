@@ -7,11 +7,11 @@ import (
 
 func validPool() Pool {
 	p := Pool{
-		Name:         "web",
-		ScopeKind:    ScopeRepository,
-		Scope:        "clems4ever/runyard",
-		Runtime:      RuntimeVM,
-		Replicas:     3,
+		Name:        "web",
+		ScopeKind:   ScopeRepository,
+		Scope:       "clems4ever/runyard",
+		Runtime:     RuntimeVM,
+		MinReplicas: 3, MaxReplicas: 3,
 		CredentialID: 1,
 		Enabled:      true,
 	}
@@ -40,8 +40,9 @@ func TestValidateRejects(t *testing.T) {
 		{"organisation with a slash", func(p *Pool) { p.ScopeKind = ScopeOrganization; p.Scope = "o/r" }, "single name"},
 		{"unknown scope kind", func(p *Pool) { p.ScopeKind = "user" }, "scope kind"},
 		{"unknown runtime", func(p *Pool) { p.Runtime = "podman" }, "runtime"},
-		{"negative replicas", func(p *Pool) { p.Replicas = -1 }, "replicas"},
-		{"too many replicas", func(p *Pool) { p.Replicas = MaxReplicas + 1 }, "replicas"},
+		{"a minimum of zero", func(p *Pool) { p.MinReplicas = 0 }, "minimum replicas"},
+		{"more than the host will take", func(p *Pool) { p.MaxReplicas = MaxReplicas + 1 }, "maximum replicas"},
+		{"a maximum below the minimum", func(p *Pool) { p.MinReplicas, p.MaxReplicas = 4, 2 }, "never below the minimum"},
 		{"no cpus", func(p *Pool) { p.CPUs = 0 }, "cpus"},
 		{"absurd memory", func(p *Pool) { p.MemoryMB = 64 }, "memory"},
 		{"absurd disk", func(p *Pool) { p.DiskGB = 1 }, "disk"},
@@ -74,19 +75,40 @@ func TestValidateIgnoresDiskForContainers(t *testing.T) {
 	}
 }
 
-func TestDesiredRunnerNames(t *testing.T) {
+func TestBounds(t *testing.T) {
 	p := validPool()
-	got := p.DesiredRunnerNames()
-	want := []string{"web-1", "web-2", "web-3"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("got %v, want %v", got, want)
+	if p.RunnerName(2) != "web-2" {
+		t.Fatalf("got %q", p.RunnerName(2))
 	}
 
 	// A disabled pool wants nothing running, which is how the UI's off switch
 	// drains a pool without losing its configuration.
 	p.Enabled = false
-	if names := p.DesiredRunnerNames(); len(names) != 0 {
-		t.Fatalf("a disabled pool still wants %v", names)
+	if p.Floor() != 0 || p.Ceiling() != 0 {
+		t.Fatalf("a disabled pool still wants %d to %d runners", p.Floor(), p.Ceiling())
+	}
+}
+
+// A pool must never be allowed to reach zero while it is enabled: with no
+// runner there is nothing to accept a job, and so nothing to reveal that the
+// pool needs to grow.
+func TestFloorIsNeverZeroWhileEnabled(t *testing.T) {
+	p := validPool()
+	p.MinReplicas = 0
+	if p.Floor() != 1 {
+		t.Fatalf("floor is %d", p.Floor())
+	}
+}
+
+func TestElastic(t *testing.T) {
+	p := validPool()
+	p.MinReplicas, p.MaxReplicas = 2, 2
+	if p.Elastic() {
+		t.Fatal("a pool with equal bounds is a fixed size")
+	}
+	p.MaxReplicas = 3
+	if !p.Elastic() {
+		t.Fatal("a pool with room above its minimum is elastic")
 	}
 }
 
@@ -160,12 +182,13 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 		}
 	})
 
-	// Scaling must not replace the runners that are already correct.
-	t.Run("replicas do not", func(t *testing.T) {
+	// Scaling must not replace the runners that are already correct — and the
+	// autoscaler moves these numbers many times an hour.
+	t.Run("the scaling bounds do not", func(t *testing.T) {
 		p := validPool()
-		p.Replicas = 10
+		p.MinReplicas, p.MaxReplicas = 2, 10
 		if p.Generation("fp") != baseGen {
-			t.Fatal("scaling changed the generation, which would replace every healthy runner")
+			t.Fatal("changing the scaling bounds changed the generation, which would replace every healthy runner")
 		}
 	})
 }

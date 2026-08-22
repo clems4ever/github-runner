@@ -57,7 +57,16 @@ export function PoolEditor({
         }
         return null
       },
-      replicas: (value) => ((value ?? 0) >= 0 && (value ?? 0) <= 64 ? null : '0 to 64'),
+      // One, not zero. A pool with no runners has nothing able to accept a
+      // job, so it could never discover that it needs to grow.
+      minReplicas: (value) =>
+        (value ?? 0) >= 1 && (value ?? 0) <= 64
+          ? null
+          : 'At least 1 — use the enabled switch to stop a pool entirely',
+      maxReplicas: (value, values) =>
+        (value ?? 0) >= (values.minReplicas ?? 1) && (value ?? 0) <= 64
+          ? null
+          : 'At least the minimum, and no more than 64',
     },
   })
 
@@ -171,10 +180,33 @@ export function PoolEditor({
           </Alert>
         )}
 
+        <Divider label="Scaling" labelPosition="left" />
+
+        <Group grow align="flex-start">
+          <NumberInput
+            label="Minimum runners"
+            description="Kept up even when nothing is running"
+            min={1}
+            max={64}
+            {...form.getInputProps('minReplicas')}
+          />
+          <NumberInput
+            label="Maximum runners"
+            description="Set it equal to the minimum for a fixed size"
+            min={1}
+            max={64}
+            {...form.getInputProps('maxReplicas')}
+          />
+        </Group>
+        <Text size="xs" c="dimmed" mt={-8}>
+          {(values.maxReplicas ?? 1) > (values.minReplicas ?? 1)
+            ? `The pool sits at ${values.minReplicas} and adds a runner whenever every one of them is busy, up to ${values.maxReplicas}. It returns to ${values.minReplicas} after a few minutes with no work.`
+            : `A fixed ${values.minReplicas} runner${(values.minReplicas ?? 1) === 1 ? '' : 's'}: it never grows, however much work arrives.`}
+        </Text>
+
         <Divider label="Size" labelPosition="left" />
 
         <Group grow>
-          <NumberInput label="Replicas" min={0} max={64} {...form.getInputProps('replicas')} />
           <NumberInput label="vCPUs" min={1} max={64} {...form.getInputProps('cpus')} />
           <NumberInput
             label="Memory (MiB)"
@@ -185,8 +217,8 @@ export function PoolEditor({
           {isVM && <NumberInput label="Disk (GiB)" min={10} {...form.getInputProps('diskGb')} />}
         </Group>
         <Text size="xs" c="dimmed" mt={-8}>
-          Every replica is a machine of this size, and they all run at once:{' '}
-          {(values.replicas ?? 0) * ((values.memoryMb ?? 0) / 1024)} GiB of memory in total.
+          Every runner is a machine of this size, so at its maximum the pool wants{' '}
+          {((values.maxReplicas ?? 0) * (values.memoryMb ?? 0)) / 1024} GiB of memory at once.
         </Text>
 
         <Divider label="Labels" labelPosition="left" />
@@ -238,7 +270,7 @@ export function PoolEditor({
 
         {pool.id && (
           <Text size="xs" c="dimmed">
-            Changing anything but the replica count replaces the pool's runners. They are drained
+            Changing anything but the scaling bounds replaces the pool's runners. They are drained
             first, so no job is lost — a busy runner is replaced when it finishes.
           </Text>
         )}
