@@ -53,8 +53,8 @@ describe('PoolEditor', () => {
     expect(await screen.findByText('A repository is owner/name')).toBeInTheDocument()
   })
 
-  it('says what the replicas will cost in memory', async () => {
-    renderEditor({ ...emptyPool(1), replicas: 3, memoryMb: 4096 })
-    expect(screen.getByText(/12 GiB of memory in total/)).toBeInTheDocument()
+  it('says what the pool will cost in memory at its maximum', async () => {
+    renderEditor({ ...emptyPool(1), minReplicas: 1, maxReplicas: 3, memoryMb: 4096 })
+    expect(screen.getByText(/12 GiB of memory at once/)).toBeInTheDocument()
   })
 })

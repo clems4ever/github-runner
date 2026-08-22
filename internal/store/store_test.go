@@ -2,10 +2,12 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/secrets"
@@ -37,11 +39,11 @@ func credential(t *testing.T, s *Store) model.Credential {
 
 func samplePool(credentialID int64) model.Pool {
 	return model.Pool{
-		Name:         "web",
-		ScopeKind:    model.ScopeRepository,
-		Scope:        "clems4ever/runyard",
-		Runtime:      model.RuntimeVM,
-		Replicas:     2,
+		Name:        "web",
+		ScopeKind:   model.ScopeRepository,
+		Scope:       "clems4ever/runyard",
+		Runtime:     model.RuntimeVM,
+		MinReplicas: 2, MaxReplicas: 2,
 		Labels:       []string{"fast"},
 		CredentialID: credentialID,
 		Enabled:      true,
@@ -201,7 +203,7 @@ func TestPoolRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Name != "web" || got.Scope != "clems4ever/runyard" || got.Replicas != 2 {
+	if got.Name != "web" || got.Scope != "clems4ever/runyard" || got.MinReplicas != 2 || got.MaxReplicas != 2 {
 		t.Fatalf("round trip changed the pool: %+v", got)
 	}
 	if len(got.Labels) != 1 || got.Labels[0] != "fast" {
@@ -278,14 +280,14 @@ func TestUpdatePool(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	created.Replicas = 5
+	created.MinReplicas, created.MaxReplicas = 5, 5
 	created.Nested = true
 	created.Labels = []string{"gpu"}
 	updated, err := s.UpdatePool(ctx, created)
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if updated.Replicas != 5 || !updated.Nested || updated.Labels[0] != "gpu" {
+	if updated.MaxReplicas != 5 || !updated.Nested || updated.Labels[0] != "gpu" {
 		t.Fatalf("update did not stick: %+v", updated)
 	}
 	if !updated.UpdatedAt.After(created.CreatedAt) && !updated.UpdatedAt.Equal(created.CreatedAt) {
@@ -353,5 +355,226 @@ func TestListPoolsIsOrdered(t *testing.T) {
 	}
 	if strings.Join(names, ",") != "api,docs,web" {
 		t.Fatalf("got %v, want them sorted so the UI does not shuffle", names)
+	}
+}
+
+// An existing installation must survive the move to autoscaling. A pool that
+// was a fixed three runners becomes a pool whose minimum and maximum are both
+// three — exactly what it was — so an upgrade changes nothing until someone
+// raises the maximum.
+func TestUpgradingADatabaseFromBeforeAutoscaling(t *testing.T) {
+	dir := t.TempDir()
+	ring, err := secrets.LoadOrCreateKey(filepath.Join(dir, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "fleet.db")
+
+	// Build the schema as it stood before autoscaling: the first three
+	// migrations, and a pool with a fixed replica count.
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range append([]string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
+		`INSERT INTO schema_version (version) VALUES (3)`,
+	}, migrations[:3]...) {
+		if _, err := old.Exec(statement); err != nil {
+			t.Fatalf("building the old schema: %v", err)
+		}
+	}
+	if _, err := old.Exec(
+		`INSERT INTO credentials (name, sealed, hint, created_at) VALUES ('pat', 'x', '…1234', '2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(
+		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, replicas, labels,
+			cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at)
+		 VALUES ('web','repository','o/r','vm',0,1,3,'fast',2,4096,40,'default',1,1,
+			'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	// Now open it with the current code, which is what an upgrade does.
+	s, err := Open(path, ring)
+	if err != nil {
+		t.Fatalf("upgrading: %v", err)
+	}
+	defer s.Close()
+
+	pools, err := s.ListPools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pools) != 1 {
+		t.Fatalf("got %d pools", len(pools))
+	}
+	pool := pools[0]
+	if pool.MinReplicas != 3 || pool.MaxReplicas != 3 {
+		t.Fatalf("the pool became %d..%d, want the fixed 3 it already was", pool.MinReplicas, pool.MaxReplicas)
+	}
+	if pool.Elastic() {
+		t.Fatal("an upgraded pool started scaling on its own, which nobody asked for")
+	}
+	// The rest of it must come through untouched.
+	if pool.Name != "web" || pool.Scope != "o/r" || pool.CPUs != 2 || pool.Labels[0] != "fast" {
+		t.Fatalf("the upgrade changed the pool: %+v", pool)
+	}
+}
+
+func TestActivityBucketsThePeaks(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	// Two pools, sampled every thirty seconds for ten minutes. One of them has
+	// a brief burst: every runner busy for a single sample.
+	for i := 0; i < 20; i++ {
+		at := base.Add(time.Duration(i) * 30 * time.Second)
+		busy := 1
+		if i == 7 {
+			busy = 4 // the burst
+		}
+		if err := s.RecordSamples(ctx, at, []model.Sample{
+			{Pool: "web", Running: 4, Busy: busy, Target: 4},
+			{Pool: "api", Running: 2, Busy: 0, Target: 2},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	points, err := s.Activity(ctx, base, base.Add(10*time.Minute), 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) == 0 {
+		t.Fatal("no history came back")
+	}
+
+	// Each point is the whole fleet, both pools added together.
+	for _, point := range points {
+		if point.Running != 6 {
+			t.Fatalf("a point reports %d runners, want both pools counted: %+v", point.Running, point)
+		}
+	}
+
+	// The burst has to survive bucketing. A mean over a minute would flatten
+	// four busy runners into one and a bit, which is the opposite of what the
+	// chart is for.
+	var peak int
+	for _, point := range points {
+		if point.Busy > peak {
+			peak = point.Busy
+		}
+	}
+	if peak != 4 {
+		t.Fatalf("the peak came back as %d, want the burst preserved", peak)
+	}
+}
+
+// A daemon that was not running should read as a gap, not as a fleet that was
+// switched off.
+func TestActivityLeavesGapsWhereThereIsNoHistory(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	if err := s.RecordSamples(ctx, base, []model.Sample{{Pool: "web", Running: 2, Busy: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	points, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("got %d points, want only the one that was recorded", len(points))
+	}
+}
+
+func TestActivityForgetsOldHistory(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	old := now.Add(-SampleRetention - time.Hour)
+	if err := s.RecordSamples(ctx, old, []model.Sample{{Pool: "web", Running: 9, Busy: 9}}); err != nil {
+		t.Fatal(err)
+	}
+	// Recording again is what prunes: the daemon does it every pass, so nothing
+	// has to remember to tidy up.
+	if err := s.RecordSamples(ctx, now, []model.Sample{{Pool: "web", Running: 1, Busy: 0}}); err != nil {
+		t.Fatal(err)
+	}
+
+	points, err := s.Activity(ctx, old.Add(-time.Hour), now, 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, point := range points {
+		if point.Running == 9 {
+			t.Fatal("history older than the retention window was kept")
+		}
+	}
+}
+
+func TestActivityOnAFreshInstall(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	points, err := s.Activity(context.Background(), now.Add(-time.Hour), now, 60, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Empty, not nil: this is serialised straight to JSON, and null where the
+	// chart expects a list is a crash in the browser.
+	if points == nil {
+		t.Fatal("no history came back as nil rather than an empty list")
+	}
+}
+
+// The UI can narrow the history to one pool, which is how someone looks at a
+// single repository without a chart per pool crowding the page.
+func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 4; i++ {
+		at := base.Add(time.Duration(i) * time.Minute)
+		if err := s.RecordSamples(ctx, at, []model.Sample{
+			{Pool: "web", Running: 4, Busy: 3},
+			{Pool: "api", Running: 2, Busy: 1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	whole, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whole[0].Running != 6 || whole[0].Busy != 4 {
+		t.Fatalf("the fleet-wide view is %+v, want both pools added together", whole[0])
+	}
+
+	just, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if just[0].Running != 2 || just[0].Busy != 1 {
+		t.Fatalf("the api view is %+v, want only that pool", just[0])
+	}
+
+	// A pool with no history is empty, not an error: a pool created a moment
+	// ago honestly has nothing to show.
+	none, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "never-existed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("got %+v", none)
 	}
 }

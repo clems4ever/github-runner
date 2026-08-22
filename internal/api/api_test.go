@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -21,6 +22,7 @@ import (
 type stubFleet struct {
 	status   []reconcile.RunnerStatus
 	warnings []string
+	scaling  map[string]reconcile.Scale
 	passes   int
 }
 
@@ -31,6 +33,7 @@ func (f *stubFleet) Once(ctx context.Context) reconcile.Result {
 	f.passes++
 	return reconcile.Result{}
 }
+func (f *stubFleet) Scaling() map[string]reconcile.Scale { return f.scaling }
 
 type harness struct {
 	t      *testing.T
@@ -110,7 +113,7 @@ func (h *harness) decode(resp *http.Response, into any) {
 func (h *harness) samplePool() map[string]any {
 	return map[string]any{
 		"name": "web", "scopeKind": "repository", "scope": "clems4ever/runyard",
-		"runtime": "vm", "replicas": 2, "labels": []string{"gpu"},
+		"runtime": "vm", "minReplicas": 2, "maxReplicas": 4, "labels": []string{"gpu"},
 		"credentialId": h.credID, "enabled": true,
 	}
 }
@@ -233,7 +236,7 @@ func TestPoolLifecycle(t *testing.T) {
 	}
 	var created model.Pool
 	h.decode(resp, &created)
-	if created.ID == 0 || created.Name != "web" || created.Replicas != 2 {
+	if created.ID == 0 || created.Name != "web" || created.MinReplicas != 2 || created.MaxReplicas != 4 {
 		t.Fatalf("got %+v", created)
 	}
 	// Defaults are filled in server-side, so the UI does not have to know them.
@@ -252,7 +255,7 @@ func TestPoolLifecycle(t *testing.T) {
 	}
 
 	update := h.samplePool()
-	update["replicas"] = 5
+	update["maxReplicas"] = 5
 	update["nested"] = true
 	resp = h.do("PUT", "/api/pools/"+itoa(created.ID), update)
 	if resp.StatusCode != http.StatusOK {
@@ -260,7 +263,7 @@ func TestPoolLifecycle(t *testing.T) {
 	}
 	var updated model.Pool
 	h.decode(resp, &updated)
-	if updated.Replicas != 5 || !updated.Nested {
+	if updated.MaxReplicas != 5 || !updated.Nested {
 		t.Fatalf("got %+v", updated)
 	}
 
@@ -392,6 +395,21 @@ func TestRunners(t *testing.T) {
 	}
 }
 
+// A pool that resized itself has to be able to say why.
+func TestRunnersCarryTheScalingDecisions(t *testing.T) {
+	h := newHarness(t)
+	h.fleet.scaling = map[string]reconcile.Scale{
+		"web": {Target: 3, Floor: 1, Ceiling: 5, Reason: "every runner is busy", ScaledUp: true},
+	}
+
+	payload := readAll(t, h.do("GET", "/api/runners", nil))
+	for _, want := range []string{`"target":3`, `"floor":1`, `"ceiling":5`, "every runner is busy"} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("the response is missing %q: %s", want, payload)
+		}
+	}
+}
+
 func TestReconcileNow(t *testing.T) {
 	h := newHarness(t)
 	resp := h.do("POST", "/api/reconcile", nil)
@@ -480,3 +498,57 @@ func readAll(t *testing.T, resp *http.Response) string {
 }
 
 func itoa(id int64) string { return strconv.FormatInt(id, 10) }
+
+func TestActivity(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now().UTC()
+	if err := h.store.RecordSamples(context.Background(), now.Add(-time.Minute),
+		[]model.Sample{{Pool: "web", Running: 3, Busy: 2, Target: 3}}); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := readAll(t, h.do("GET", "/api/activity?hours=1", nil))
+	for _, want := range []string{`"running":3`, `"busy":2`, `"since"`, `"until"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("the response is missing %q: %s", want, payload)
+		}
+	}
+}
+
+func TestActivityRejectsAnAbsurdWindow(t *testing.T) {
+	h := newHarness(t)
+	for _, query := range []string{"?hours=0", "?hours=1000", "?hours=nonsense"} {
+		resp := h.do("GET", "/api/activity"+query, nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s answered %d, want 400", query, resp.StatusCode)
+		}
+	}
+}
+
+func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now().UTC()
+	if err := h.store.RecordSamples(context.Background(), now.Add(-time.Minute), []model.Sample{
+		{Pool: "web", Running: 3, Busy: 2},
+		{Pool: "api", Running: 7, Busy: 5},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := readAll(t, h.do("GET", "/api/activity?hours=1&pool=api", nil))
+	if !strings.Contains(payload, `"running":7`) {
+		t.Fatalf("want only the api pool: %s", payload)
+	}
+	if strings.Contains(payload, `"running":10`) {
+		t.Fatalf("the pools were added together despite the filter: %s", payload)
+	}
+}
+
+func TestActivityDefaultsToARecentWindow(t *testing.T) {
+	h := newHarness(t)
+	payload := readAll(t, h.do("GET", "/api/activity", nil))
+	if !strings.Contains(payload, `"points"`) {
+		t.Fatalf("got %s", payload)
+	}
+}

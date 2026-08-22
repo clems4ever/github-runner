@@ -220,12 +220,12 @@ func TestActionsCarryTheRuntime(t *testing.T) {
 func TestSpecsForAPool(t *testing.T) {
 	p := model.Pool{
 		ID: 7, Name: "web", ScopeKind: model.ScopeRepository, Scope: "o/r",
-		Runtime: model.RuntimeVM, Replicas: 2, Nested: true, Ephemeral: true,
+		Runtime: model.RuntimeVM, MinReplicas: 2, MaxReplicas: 2, Nested: true, Ephemeral: true,
 		Labels: []string{"gpu"}, CredentialID: 3, Enabled: true,
 	}
 	p.Defaults()
 
-	specs := SpecsFor(p, "fp")
+	specs := SpecsFor(p, "fp", DesiredNames(p, nil, nil, p.Floor()))
 	if len(specs) != 2 {
 		t.Fatalf("got %d specs, want 2", len(specs))
 	}
@@ -247,9 +247,9 @@ func TestSpecsForAPool(t *testing.T) {
 }
 
 func TestSpecsForADisabledPool(t *testing.T) {
-	p := model.Pool{Name: "web", Replicas: 3, Enabled: false}
+	p := model.Pool{Name: "web", MinReplicas: 3, MaxReplicas: 3, Enabled: false}
 	p.Defaults()
-	if specs := SpecsFor(p, "fp"); len(specs) != 0 {
+	if specs := SpecsFor(p, "fp", DesiredNames(p, nil, nil, p.Floor())); len(specs) != 0 {
 		t.Fatalf("a disabled pool asked for %d runners", len(specs))
 	}
 }

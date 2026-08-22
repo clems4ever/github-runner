@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/api"
 	"github.com/clems4ever/github-runner/internal/github"
@@ -149,13 +150,17 @@ type fleet struct {
 	gh         *fakeGitHub
 	reconciler *reconcile.Reconciler
 	dir        string
+	// now is the clock the daemon sees, so a test can let five minutes of quiet
+	// pass without waiting for them.
+	now time.Time
 }
 
 func newFleet(t *testing.T) *fleet {
 	t.Helper()
 	dir := t.TempDir()
 	f := &fleet{t: t, vm: newHost(model.RuntimeVM), containers: newHost(model.RuntimeContainer),
-		gh: &fakeGitHub{states: map[string]github.State{}}, dir: dir}
+		gh: &fakeGitHub{states: map[string]github.State{}}, dir: dir,
+		now: time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)}
 	f.start()
 	return f
 }
@@ -184,7 +189,7 @@ func (f *fleet) start() {
 		[]reconcile.Executor{f.vm, f.containers},
 		func(string) reconcile.GitHubClient { return f.gh },
 		func(int64, string) error { return nil },
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		slog.New(slog.NewTextHandler(io.Discard, nil))).WithClock(func() time.Time { return f.now })
 
 	server := api.New(api.Options{Store: db, Fleet: f.reconciler, Version: "test"})
 	if err := server.Auth().SetPassword(context.Background(), "admin", "correct-horse-battery"); err != nil {
@@ -263,10 +268,16 @@ func (f *fleet) addPool(pool map[string]any) model.Pool {
 	return created
 }
 
+// vmPool is a fixed-size pool unless a test widens it: minimum equal to
+// maximum is how a pool that never scales is expressed.
 func vmPool(credentialID int64, replicas int) map[string]any {
+	return elasticVMPool(credentialID, replicas, replicas)
+}
+
+func elasticVMPool(credentialID int64, min, max int) map[string]any {
 	return map[string]any{
 		"name": "web", "scopeKind": "repository", "scope": "clems4ever/runyard",
-		"runtime": "vm", "replicas": replicas, "ephemeral": true,
+		"runtime": "vm", "minReplicas": min, "maxReplicas": max, "ephemeral": true,
 		"credentialId": credentialID, "enabled": true,
 	}
 }
@@ -428,7 +439,7 @@ func TestDisablingAPoolDrainsItAndKeepsTheConfiguration(t *testing.T) {
 	}
 	// The pool itself is still there, with its settings.
 	payload := f.mustRequest("GET", fmt.Sprintf("/api/pools/%d", pool.ID), nil, http.StatusOK)
-	if !strings.Contains(payload, `"replicas":2`) {
+	if !strings.Contains(payload, `"maxReplicas":2`) {
 		t.Fatalf("the configuration was lost: %s", payload)
 	}
 }
@@ -441,7 +452,7 @@ func TestPoolsOfDifferentRuntimesCoexist(t *testing.T) {
 	f.addPool(vmPool(credential, 1))
 	f.addPool(map[string]any{
 		"name": "api", "scopeKind": "organization", "scope": "runyard-ai",
-		"runtime": "container", "replicas": 2, "nested": true,
+		"runtime": "container", "minReplicas": 2, "maxReplicas": 2, "nested": true,
 		"credentialId": credential, "enabled": true,
 	})
 	f.reconcileNow()
@@ -514,5 +525,256 @@ func TestASettledFleetIsLeftAlone(t *testing.T) {
 		if len(result.Actions) != 0 {
 			t.Fatalf("pass %d wanted to do %+v", i, result.Actions)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Autoscaling
+// ---------------------------------------------------------------------------
+//
+// GitHub does not publish how many jobs are queued for a set of labels, so the
+// daemon infers demand from what its runners are doing: when every one of them
+// is busy, the next job would have nowhere to go. These tests drive that
+// through the real API, with jobs arriving and finishing on the fake GitHub.
+
+// busy marks runners as working, and idle marks them free again.
+func (f *fleet) busy(names ...string) {
+	f.gh.mu.Lock()
+	defer f.gh.mu.Unlock()
+	for _, name := range names {
+		f.gh.states[name] = github.StateBusy
+	}
+}
+
+func (f *fleet) idle(names ...string) {
+	f.gh.mu.Lock()
+	defer f.gh.mu.Unlock()
+	for _, name := range names {
+		f.gh.states[name] = github.StateIdle
+	}
+}
+
+// everyRunnerIdle is what the fake GitHub reports once a burst is over.
+func (f *fleet) everyRunnerIdle() {
+	f.idle(f.vm.names()...)
+}
+
+func TestAPoolGrowsWhenEveryRunnerIsBusy(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(elasticVMPool(credential, 1, 4))
+	f.reconcileNow()
+
+	// The minimum: one runner, idle, ready to accept a job and — crucially —
+	// ready to reveal that more are needed.
+	if got := strings.Join(f.vm.names(), ","); got != "web-1" {
+		t.Fatalf("a quiet pool has %q, want just its minimum", got)
+	}
+	f.idle("web-1")
+
+	// A job lands on it. There is now nothing free, so the pool grows.
+	f.busy("web-1")
+	f.reconcileNow()
+	if got := strings.Join(f.vm.names(), ","); got != "web-1,web-2" {
+		t.Fatalf("got %q, want a second runner for the next job", got)
+	}
+
+	// The new one is idle: there is room again, so nothing more is added.
+	f.idle("web-2")
+	f.reconcileNow()
+	if got := len(f.vm.names()); got != 2 {
+		t.Fatalf("the pool grew to %d with capacity to spare", got)
+	}
+
+	// Both busy: it climbs again, one at a time, up to the ceiling.
+	f.busy("web-1", "web-2")
+	f.reconcileNow()
+	f.busy(f.vm.names()...)
+	f.reconcileNow()
+	f.busy(f.vm.names()...)
+	f.reconcileNow()
+	if got := len(f.vm.names()); got != 4 {
+		t.Fatalf("the pool reached %d, want its maximum of 4", got)
+	}
+
+	// And it stops there, however much work arrives.
+	for i := 0; i < 3; i++ {
+		f.busy(f.vm.names()...)
+		f.reconcileNow()
+	}
+	if got := len(f.vm.names()); got != 4 {
+		t.Fatalf("the pool passed its maximum: %d runners", got)
+	}
+}
+
+func TestAPoolReturnsToItsMinimumWhenTheWorkStops(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(elasticVMPool(credential, 1, 4))
+
+	// Drive it up to four.
+	for i := 0; i < 5; i++ {
+		f.reconcileNow()
+		f.busy(f.vm.names()...)
+	}
+	if got := len(f.vm.names()); got != 4 {
+		t.Fatalf("setup: the pool is %d", got)
+	}
+
+	// The burst ends.
+	f.everyRunnerIdle()
+	f.reconcileNow()
+	if got := len(f.vm.names()); got != 4 {
+		t.Fatalf("the pool shrank the moment the work stopped: %d", got)
+	}
+
+	// Still nothing, but not for long enough. Shrinking is deliberately the
+	// slow direction: a gap between two jobs must not cost the fleet that is
+	// about to be needed again.
+	f.now = f.now.Add(reconcile.ScaleDownAfter - time.Minute)
+	f.reconcileNow()
+	if got := len(f.vm.names()); got != 4 {
+		t.Fatalf("it shrank before the stabilisation window was over: %d", got)
+	}
+
+	// Once the quiet has lasted, it comes back to the minimum — by draining,
+	// like every other shrink.
+	f.now = f.now.Add(2 * time.Minute)
+	f.reconcileNow()
+	f.vm.jobsFinish()
+	f.reconcileNow()
+	if got := strings.Join(f.vm.names(), ","); got != "web-1" {
+		t.Fatalf("got %q, want back to the minimum", got)
+	}
+}
+
+// Scaling down must not pick the runner that has a job on it.
+func TestShrinkingKeepsTheBusyRunners(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(elasticVMPool(credential, 1, 3))
+	for i := 0; i < 3; i++ {
+		f.reconcileNow()
+		f.busy(f.vm.names()...)
+	}
+	if got := len(f.vm.names()); got != 3 {
+		t.Fatalf("setup: %d runners", got)
+	}
+
+	// Everything goes idle except web-2, which picks up a long job.
+	f.everyRunnerIdle()
+	f.busy("web-2")
+	f.reconcileNow()
+
+	// It has been quiet for a while — but web-2 is working, so the pool is not
+	// quiet at all and nothing shrinks.
+	f.now = f.now.Add(reconcile.ScaleDownAfter + time.Minute)
+	f.reconcileNow()
+	if got := len(f.vm.names()); got != 3 {
+		t.Fatalf("a pool with a job running shrank to %d", got)
+	}
+
+	// The job ends. Now it may shrink, and the runner it keeps is the one that
+	// was working, not simply the first by name.
+	f.idle("web-2")
+	f.busy("web-2")
+	f.reconcileNow() // records that it was busy just now
+	f.idle("web-2")
+	f.now = f.now.Add(reconcile.ScaleDownAfter + time.Minute)
+	f.reconcileNow()
+	f.vm.jobsFinish()
+	f.reconcileNow()
+
+	if got := len(f.vm.names()); got != 1 {
+		t.Fatalf("got %d runners, want the minimum", got)
+	}
+}
+
+// A pool whose minimum equals its maximum is the old fixed-size behaviour and
+// must not move at all.
+func TestAFixedPoolNeverScales(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 2))
+	f.reconcileNow()
+
+	for i := 0; i < 5; i++ {
+		f.busy(f.vm.names()...)
+		f.reconcileNow()
+	}
+	if got := strings.Join(f.vm.names(), ","); got != "web-1,web-2" {
+		t.Fatalf("a fixed pool moved to %q", got)
+	}
+
+	f.everyRunnerIdle()
+	f.now = f.now.Add(2 * reconcile.ScaleDownAfter)
+	f.reconcileNow()
+	if got := strings.Join(f.vm.names(), ","); got != "web-1,web-2" {
+		t.Fatalf("a fixed pool shrank to %q", got)
+	}
+}
+
+// A restarted daemon has no memory of when the pool was last busy. That must
+// delay a scale-down rather than cause one.
+func TestARestartedDaemonDoesNotShrinkImmediately(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(elasticVMPool(credential, 1, 3))
+	for i := 0; i < 3; i++ {
+		f.reconcileNow()
+		f.busy(f.vm.names()...)
+	}
+	f.everyRunnerIdle()
+
+	// Upgrade: a new process over the same host and database.
+	f.start()
+	f.reconcileNow()
+	if got := len(f.vm.names()); got != 3 {
+		t.Fatalf("a restarted daemon shrank the fleet to %d before observing it for any length of time", got)
+	}
+
+	// It shrinks once it has watched the pool stay quiet for the window.
+	f.now = f.now.Add(reconcile.ScaleDownAfter + time.Minute)
+	f.reconcileNow()
+	f.vm.jobsFinish()
+	f.reconcileNow()
+	if got := len(f.vm.names()); got != 1 {
+		t.Fatalf("got %d, want the minimum once the quiet was observed", got)
+	}
+}
+
+// The UI shows why a pool is the size it is, so the reason has to reach it.
+func TestScalingDecisionsAreReported(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(elasticVMPool(credential, 1, 3))
+	f.reconcileNow()
+	f.busy("web-1")
+
+	result := f.reconciler.Once(context.Background())
+	scale, ok := result.Scaling["web"]
+	if !ok {
+		t.Fatalf("no decision was reported: %+v", result.Scaling)
+	}
+	if scale.Target != 2 || !scale.ScaledUp {
+		t.Fatalf("got %+v", scale)
+	}
+	if !strings.Contains(scale.Reason, "busy") {
+		t.Fatalf("the reason is %q", scale.Reason)
+	}
+	if scale.Floor != 1 || scale.Ceiling != 3 {
+		t.Fatalf("the bounds are %d..%d", scale.Floor, scale.Ceiling)
 	}
 }

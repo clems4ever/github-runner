@@ -23,7 +23,7 @@ import {
   IconSun,
   IconKey,
 } from '@tabler/icons-react'
-import { api, type Credential, type Health, type Pool, type Runner } from './api'
+import { api, type Credential, type Health, type Pool, type Runner, type Scale } from './api'
 import { FleetPage } from './pages/FleetPage'
 import { PoolsPage } from './pages/PoolsPage'
 import { CredentialsPage } from './pages/CredentialsPage'
@@ -44,6 +44,7 @@ export function App() {
   const [pools, setPools] = useState<Pool[]>([])
   const [runners, setRunners] = useState<Runner[]>([])
   const [warnings, setWarnings] = useState<string[]>([])
+  const [scaling, setScaling] = useState<Record<string, Scale>>({})
   const [credentials, setCredentials] = useState<Credential[]>([])
   const [health, setHealth] = useState<Health | null>(null)
   const [loading, setLoading] = useState(true)
@@ -59,6 +60,7 @@ export function App() {
       setPools(poolList)
       setRunners(runnerList.runners ?? [])
       setWarnings(runnerList.warnings ?? [])
+      setScaling(runnerList.scaling ?? {})
       setCredentials(credentialList)
       setHealth(healthInfo)
     } catch (error) {
@@ -130,10 +132,22 @@ export function App() {
 
       <AppShell.Main>
         {page === 'fleet' && (
-          <FleetPage runners={runners} pools={pools} warnings={warnings} loading={loading} />
+          <FleetPage
+            runners={runners}
+            pools={pools}
+            scaling={scaling}
+            warnings={warnings}
+            loading={loading}
+          />
         )}
         {page === 'pools' && (
-          <PoolsPage pools={pools} credentials={credentials} runners={runners} onChange={refresh} />
+          <PoolsPage
+            pools={pools}
+            credentials={credentials}
+            runners={runners}
+            scaling={scaling}
+            onChange={refresh}
+          />
         )}
         {page === 'credentials' && (
           <CredentialsPage credentials={credentials} pools={pools} onChange={refresh} />

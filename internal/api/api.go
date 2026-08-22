@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -30,6 +31,7 @@ type Store interface {
 	CreatePool(ctx context.Context, p model.Pool) (model.Pool, error)
 	UpdatePool(ctx context.Context, p model.Pool) (model.Pool, error)
 	DeletePool(ctx context.Context, id int64) error
+	Activity(ctx context.Context, since, until time.Time, buckets int, pool string) ([]model.ActivityPoint, error)
 	ListCredentials(ctx context.Context) ([]model.Credential, error)
 	CreateCredential(ctx context.Context, name, token string) (model.Credential, error)
 	ReplaceCredentialToken(ctx context.Context, id int64, token string) error
@@ -40,6 +42,7 @@ type Store interface {
 type Fleet interface {
 	Status(ctx context.Context) ([]reconcile.RunnerStatus, []string)
 	Once(ctx context.Context) reconcile.Result
+	Scaling() map[string]reconcile.Scale
 }
 
 // Server is the HTTP surface.
@@ -93,6 +96,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("DELETE /api/pools/{id}", s.deletePool)
 	api.HandleFunc("GET /api/runners", s.listRunners)
 	api.HandleFunc("POST /api/reconcile", s.reconcileNow)
+	api.HandleFunc("GET /api/activity", s.activity)
 	api.HandleFunc("GET /api/credentials", s.listCredentials)
 	api.HandleFunc("POST /api/credentials", s.createCredential)
 	api.HandleFunc("PUT /api/credentials/{id}/token", s.rotateCredential)
@@ -238,7 +242,49 @@ func (s *Server) deletePool(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) listRunners(w http.ResponseWriter, r *http.Request) {
 	runners, errs := s.fleet.Status(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{"runners": runners, "warnings": errs})
+	// The scaling decisions go with them: a pool that resized itself should
+	// never leave anyone wondering what it reacted to.
+	writeJSON(w, http.StatusOK, map[string]any{
+		"runners":  runners,
+		"warnings": errs,
+		"scaling":  s.fleet.Scaling(),
+	})
+}
+
+// activity is the fleet's history: how many runners existed and how many were
+// working, over a window.
+func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
+	hours := 6
+	if raw := r.URL.Query().Get("hours"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > 48 {
+			writeError(w, errBadRequest("hours must be a whole number from 1 to 48"))
+			return
+		}
+		hours = parsed
+	}
+
+	// Enough points for a chart to have shape, few enough that the browser is
+	// drawing a picture rather than a spreadsheet.
+	const buckets = 180
+	until := time.Now().UTC()
+	since := until.Add(-time.Duration(hours) * time.Hour)
+
+	// An unknown pool is not an error: it comes back empty, which is what a
+	// pool created a moment ago honestly has.
+	pool := r.URL.Query().Get("pool")
+
+	points, err := s.store.Activity(r.Context(), since, until, buckets, pool)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"points": points,
+		"pool":   pool,
+		"since":  since,
+		"until":  until,
+	})
 }
 
 func (s *Server) reconcileNow(w http.ResponseWriter, r *http.Request) {

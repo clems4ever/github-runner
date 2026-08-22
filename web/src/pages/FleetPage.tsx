@@ -13,7 +13,8 @@ import {
   Tooltip,
 } from '@mantine/core'
 import { IconAlertTriangle, IconServerOff } from '@tabler/icons-react'
-import type { JobState, Pool, Runner, RunnerState } from '../api'
+import type { JobState, Pool, Runner, RunnerState, Scale } from '../api'
+import { ActivityChart } from './ActivityChart'
 
 /**
  * The fleet as it actually is.
@@ -26,17 +27,21 @@ import type { JobState, Pool, Runner, RunnerState } from '../api'
 export function FleetPage({
   runners,
   pools,
+  scaling,
   warnings,
   loading,
 }: {
   runners: Runner[]
   pools: Pool[]
+  scaling: Record<string, Scale>
   warnings: string[]
   loading: boolean
 }) {
   const busy = runners.filter((r) => r.job === 'busy').length
-  const capacity = pools.filter((p) => p.enabled).reduce((total, p) => total + p.replicas, 0)
+  const enabled = pools.filter((p) => p.enabled)
+  const ceiling = enabled.reduce((total, p) => total + p.maxReplicas, 0)
   const stale = runners.filter((r) => !r.upToDate).length
+  const elastic = enabled.filter((p) => p.maxReplicas > p.minReplicas)
 
   if (loading) {
     return (
@@ -51,7 +56,7 @@ export function FleetPage({
       <Title order={3}>Fleet</Title>
 
       <SimpleGrid cols={{ base: 1, sm: 2, md: 4 }}>
-        <Stat label="Runners" value={runners.length} hint={`${capacity} configured`} />
+        <Stat label="Runners" value={runners.length} hint={`up to ${ceiling}`} />
         <Stat label="Running a job" value={busy} />
         <Stat label="Idle" value={runners.filter((r) => r.job === 'idle').length} />
         <Stat
@@ -60,6 +65,35 @@ export function FleetPage({
           hint={stale > 0 ? 'finishing their jobs first' : undefined}
         />
       </SimpleGrid>
+
+      <ActivityChart pools={pools} />
+
+      {elastic.length > 0 && (
+        <Card withBorder padding="md">
+          <Text size="xs" c="dimmed" tt="uppercase" fw={600} mb="xs">
+            Scaling
+          </Text>
+          <Stack gap={6}>
+            {elastic.map((pool) => {
+              const decision = scaling[pool.name]
+              const live = runners.filter((r) => r.pool === pool.name).length
+              return (
+                <Group key={pool.id} gap="xs" wrap="nowrap">
+                  <Text size="sm" fw={500} w={140} truncate>
+                    {pool.name}
+                  </Text>
+                  <Badge variant="light" size="sm" color={decision?.scaledUp ? 'blue' : 'gray'}>
+                    {live} of {pool.minReplicas}–{pool.maxReplicas}
+                  </Badge>
+                  <Text size="sm" c="dimmed" truncate>
+                    {decision?.reason ?? 'waiting for the first pass'}
+                  </Text>
+                </Group>
+              )
+            })}
+          </Stack>
+        </Card>
+      )}
 
       {warnings.map((warning) => (
         <Alert key={warning} color="yellow" icon={<IconAlertTriangle size={18} />} variant="light">

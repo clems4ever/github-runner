@@ -25,18 +25,28 @@ import {
   IconStack2,
   IconTrash,
 } from '@tabler/icons-react'
-import { api, effectiveLabels, emptyPool, type Credential, type Pool, type Runner } from '../api'
+import {
+  api,
+  effectiveLabels,
+  emptyPool,
+  type Credential,
+  type Pool,
+  type Runner,
+  type Scale,
+} from '../api'
 import { PoolEditor } from './PoolEditor'
 
 export function PoolsPage({
   pools,
   credentials,
   runners,
+  scaling,
   onChange,
 }: {
   pools: Pool[]
   credentials: Credential[]
   runners: Runner[]
+  scaling: Record<string, Scale>
   onChange: () => Promise<void>
 }) {
   const [editing, setEditing] = useState<Partial<Pool> | null>(null)
@@ -125,9 +135,26 @@ export function PoolsPage({
                       </Group>
                     </Table.Td>
                     <Table.Td>
-                      <Text size="sm">
-                        {live.length} / {pool.replicas}
-                      </Text>
+                      <Tooltip
+                        label={scaling[pool.name]?.reason ?? 'no decision recorded yet'}
+                        disabled={!scaling[pool.name]}
+                      >
+                        <Group gap={6} wrap="nowrap">
+                          <Text size="sm" fw={500}>
+                            {live.length}
+                          </Text>
+                          <Text size="sm" c="dimmed">
+                            {pool.minReplicas === pool.maxReplicas
+                              ? `/ ${pool.maxReplicas}`
+                              : `of ${pool.minReplicas}–${pool.maxReplicas}`}
+                          </Text>
+                          {scaling[pool.name]?.scaledUp && (
+                            <Badge size="xs" color="blue" variant="light">
+                              scaling up
+                            </Badge>
+                          )}
+                        </Group>
+                      </Tooltip>
                     </Table.Td>
                     <Table.Td>
                       <Group gap={4}>

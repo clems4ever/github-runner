@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
@@ -94,6 +95,12 @@ type fakeStore struct {
 	pools       []model.Pool
 	fingerprint string
 	tokenErr    error
+	samples     []model.Sample
+}
+
+func (f *fakeStore) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {
+	f.samples = append(f.samples, samples...)
+	return nil
 }
 
 func (f *fakeStore) ListPools(ctx context.Context) ([]model.Pool, error) { return f.pools, nil }
@@ -133,10 +140,13 @@ func (f *fakeGitHub) Deregister(ctx context.Context, scope github.Scope, name st
 	return nil
 }
 
+// testPool is a fixed-size pool: minimum equal to maximum, so these tests are
+// about the reconciler rather than about the autoscaler.
 func testPool(name string, replicas int) model.Pool {
 	p := model.Pool{
 		ID: 1, Name: name, ScopeKind: model.ScopeRepository, Scope: "o/" + name,
-		Runtime: model.RuntimeVM, Replicas: replicas, CredentialID: 1, Enabled: true,
+		Runtime: model.RuntimeVM, MinReplicas: replicas, MaxReplicas: replicas,
+		CredentialID: 1, Enabled: true,
 	}
 	p.Defaults()
 	return p
@@ -219,7 +229,7 @@ func TestScaleUpAndDown(t *testing.T) {
 	ctx := context.Background()
 	h.rec.Once(ctx)
 
-	pool.Replicas = 3
+	pool.MinReplicas, pool.MaxReplicas = 3, 3
 	h.store.pools = []model.Pool{pool}
 	h.vm.calls = nil
 	h.rec.Once(ctx)
@@ -227,7 +237,7 @@ func TestScaleUpAndDown(t *testing.T) {
 		t.Fatalf("scaling up did %q", got)
 	}
 
-	pool.Replicas = 1
+	pool.MinReplicas, pool.MaxReplicas = 1, 1
 	h.store.pools = []model.Pool{pool}
 	h.vm.calls = nil
 	h.rec.Once(ctx)
@@ -286,7 +296,7 @@ func TestABusyRunnerIsNeverRemoved(t *testing.T) {
 	h.rec.Once(ctx)
 
 	// Scale to nothing while a job is running on web-1.
-	pool.Replicas = 0
+	pool.MinReplicas, pool.MaxReplicas = 0, 0
 	h.store.pools = []model.Pool{pool}
 	h.gh.states["web-1"] = github.StateBusy
 	h.gh.states["web-2"] = github.StateIdle
@@ -409,6 +419,10 @@ func (s *splitStore) Token(ctx context.Context, id int64) (string, error) {
 		return "", errors.New("credential 99: not found")
 	}
 	return s.good.Token(ctx, id)
+}
+
+func (s *splitStore) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {
+	return s.good.RecordSamples(ctx, at, samples)
 }
 
 // Losing GitHub must not make the daemon destructive: without an answer about

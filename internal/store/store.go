@@ -91,7 +91,30 @@ var migrations = []string{
 		key   TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	)`,
+	// Autoscaling. A pool used to be a fixed number of runners; it is now a
+	// range. Existing pools become a fixed size — minimum equal to maximum —
+	// which is exactly what they were, so an upgrade changes nothing until
+	// someone raises the maximum.
+	`ALTER TABLE pools ADD COLUMN min_replicas INTEGER NOT NULL DEFAULT 1`,
+	`ALTER TABLE pools ADD COLUMN max_replicas INTEGER NOT NULL DEFAULT 1`,
+	`UPDATE pools SET min_replicas = MAX(replicas, 1), max_replicas = MAX(replicas, 1)`,
+	// What the fleet was doing, over time. One row per pool per reconcile
+	// pass, pruned to a couple of days: enough to see yesterday's build storm,
+	// small enough that nobody has to think about it.
+	`CREATE TABLE samples (
+		at      TEXT    NOT NULL,
+		pool    TEXT    NOT NULL,
+		running INTEGER NOT NULL,
+		busy    INTEGER NOT NULL,
+		target  INTEGER NOT NULL
+	)`,
+	`CREATE INDEX samples_at ON samples(at)`,
 }
+
+// SampleRetention is how much history the daemon keeps. Two days covers "what
+// happened overnight" without turning the database into something that needs
+// managing.
+const SampleRetention = 48 * time.Hour
 
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); err != nil {
@@ -262,8 +285,8 @@ func (s *Store) DeleteCredential(ctx context.Context, id int64) error {
 // Pools
 // ---------------------------------------------------------------------------
 
-const poolColumns = `id, name, scope_kind, scope, runtime, nested, ephemeral, replicas, labels,
-	cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at`
+const poolColumns = `id, name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
+	labels, cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at`
 
 // CreatePool validates and stores a pool.
 func (s *Store) CreatePool(ctx context.Context, p model.Pool) (model.Pool, error) {
@@ -278,12 +301,17 @@ func (s *Store) CreatePool(ctx context.Context, p model.Pool) (model.Pool, error
 	now := time.Now().UTC()
 	p.CreatedAt, p.UpdatedAt = now, now
 	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, replicas, labels,
-			cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral, p.Replicas,
+		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
+			labels, cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at, replicas)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral,
+		p.MinReplicas, p.MaxReplicas,
 		strings.Join(p.Labels, ","), p.CPUs, p.MemoryMB, p.DiskGB, p.Image, p.CredentialID, p.Enabled,
-		p.CreatedAt.Format(time.RFC3339Nano), p.UpdatedAt.Format(time.RFC3339Nano))
+		p.CreatedAt.Format(time.RFC3339Nano), p.UpdatedAt.Format(time.RFC3339Nano),
+		// The old column is not dropped: SQLite makes that awkward, and a
+		// database that can still be read by the previous release is worth more
+		// than a tidy schema. It is kept in step rather than left to rot.
+		p.MaxReplicas)
 	if err != nil {
 		if isUnique(err) {
 			return model.Pool{}, fmt.Errorf("pool %q: %w", p.Name, ErrConflict)
@@ -306,10 +334,12 @@ func (s *Store) UpdatePool(ctx context.Context, p model.Pool) (model.Pool, error
 
 	p.UpdatedAt = time.Now().UTC()
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE pools SET name=?, scope_kind=?, scope=?, runtime=?, nested=?, ephemeral=?, replicas=?,
+		`UPDATE pools SET name=?, scope_kind=?, scope=?, runtime=?, nested=?, ephemeral=?,
+			min_replicas=?, max_replicas=?, replicas=?,
 			labels=?, cpus=?, memory_mb=?, disk_gb=?, image=?, credential_id=?, enabled=?, updated_at=?
 		 WHERE id = ?`,
-		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral, p.Replicas,
+		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral,
+		p.MinReplicas, p.MaxReplicas, p.MaxReplicas,
 		strings.Join(p.Labels, ","), p.CPUs, p.MemoryMB, p.DiskGB, p.Image, p.CredentialID, p.Enabled,
 		p.UpdatedAt.Format(time.RFC3339Nano), p.ID)
 	if err != nil {
@@ -379,8 +409,8 @@ func scanPool(row scanner) (model.Pool, error) {
 		created, updated   string
 	)
 	err := row.Scan(&p.ID, &p.Name, &scopeKind, &p.Scope, &runtime, &p.Nested, &p.Ephemeral,
-		&p.Replicas, &labels, &p.CPUs, &p.MemoryMB, &p.DiskGB, &p.Image, &p.CredentialID,
-		&p.Enabled, &created, &updated)
+		&p.MinReplicas, &p.MaxReplicas, &labels, &p.CPUs, &p.MemoryMB, &p.DiskGB, &p.Image,
+		&p.CredentialID, &p.Enabled, &created, &updated)
 	if err != nil {
 		return model.Pool{}, err
 	}
@@ -427,6 +457,111 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 		`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		key, value)
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Activity
+// ---------------------------------------------------------------------------
+
+// RecordSamples stores one observation per pool and prunes what has aged out.
+func (s *Store) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {
+	if len(samples) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	for _, sample := range samples {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO samples (at, pool, running, busy, target) VALUES (?,?,?,?,?)`,
+			stamp, sample.Pool, sample.Running, sample.Busy, sample.Target); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM samples WHERE at < ?`,
+		at.Add(-SampleRetention).UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Activity returns a history over a window, in a fixed number of buckets.
+//
+// Bucketed here rather than in the browser, because a day at one pass every
+// thirty seconds is a few thousand rows and a chart wants a couple of hundred
+// points. Each bucket reports the *peak* it saw, not the average: a burst that
+// filled the fleet for two minutes is the thing worth seeing, and a mean over
+// a ten-minute bucket would flatten it into nothing.
+// An empty pool name is the whole fleet; naming one narrows it to that pool,
+// which is how the UI shows a single repository's history without a chart per
+// pool crowding the page.
+func (s *Store) Activity(ctx context.Context, since, until time.Time, buckets int, pool string) ([]model.ActivityPoint, error) {
+	if buckets < 1 {
+		buckets = 1
+	}
+
+	query := `SELECT at, SUM(running), SUM(busy) FROM samples WHERE at >= ? AND at <= ?`
+	args := []any{since.UTC().Format(time.RFC3339Nano), until.UTC().Format(time.RFC3339Nano)}
+	if pool != "" {
+		query += ` AND pool = ?`
+		args = append(args, pool)
+	}
+	query += ` GROUP BY at ORDER BY at`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	width := until.Sub(since) / time.Duration(buckets)
+	if width <= 0 {
+		width = time.Second
+	}
+	peaks := make([]*model.ActivityPoint, buckets)
+
+	for rows.Next() {
+		var stamp string
+		var running, busy int
+		if err := rows.Scan(&stamp, &running, &busy); err != nil {
+			return nil, err
+		}
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil {
+			continue
+		}
+		index := int(at.Sub(since) / width)
+		if index < 0 || index >= buckets {
+			continue
+		}
+		if peaks[index] == nil {
+			peaks[index] = &model.ActivityPoint{At: since.Add(time.Duration(index) * width)}
+		}
+		if running > peaks[index].Running {
+			peaks[index].Running = running
+		}
+		if busy > peaks[index].Busy {
+			peaks[index].Busy = busy
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Empty buckets are left out rather than drawn as zero: a daemon that was
+	// not running should read as a gap in the line, not as a fleet that was
+	// switched off.
+	out := []model.ActivityPoint{}
+	for _, point := range peaks {
+		if point != nil {
+			out = append(out, *point)
+		}
+	}
+	return out, nil
 }
 
 func isUnique(err error) bool {

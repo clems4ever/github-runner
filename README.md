@@ -8,8 +8,8 @@ host, with a web UI to configure it.
 
 Each runner is a throwaway QEMU virtual machine or a Docker container. Per pool
 you choose the repository or organisation, the runtime, whether jobs get
-`/dev/kvm`, whether runners are ephemeral, how many replicas, what labels they
-register with, and how big they are.
+`/dev/kvm`, whether runners are ephemeral, what labels they register with, how
+big they are — and how far the pool may scale itself when work arrives.
 
 **Upgrading the daemon does not touch the runners.** It supervises nothing: the
 runners are systemd units and Docker containers of their own, and the daemon
@@ -46,8 +46,8 @@ ssh -N -L 8080:127.0.0.1:8080 your-host
 2. **Create a pool.** Pick the scope, the runtime, and the number of replicas.
 3. Runners appear within a few seconds, and again after a reboot.
 
-A pool named `web` with three replicas gives you `web-1`, `web-2` and `web-3`.
-Scaling is changing one number.
+A pool named `web` with a maximum of three gives you `web-1`, `web-2` and
+`web-3` when it is busy, and just `web-1` when it is not.
 
 ## What a pool decides
 
@@ -57,7 +57,8 @@ Scaling is changing one number.
 | **Runtime** | a virtual machine per job, or a container |
 | **Nested virtualisation** | whether jobs get `/dev/kvm` and can boot machines of their own |
 | **Ephemeral** | take one job, then be replaced by a clean runner |
-| **Replicas** | how many jobs the pool can run at once |
+| **Minimum runners** | what the pool keeps up when nothing is running, at least one |
+| **Maximum runners** | how far it may grow under load; equal to the minimum for a fixed size |
 | **Labels** | what a workflow targets with `runs-on` |
 | **Size** | vCPUs, memory, and disk for VM pools |
 
@@ -75,6 +76,50 @@ Those follow the settings rather than the name, so a pool cannot claim to be
 something it is not.
 
 ![The pool editor](docs/img/pool-editor.png)
+
+### Autoscaling
+
+Set the minimum to 1 and the maximum to 5, and the pool sits at one idle runner
+until work arrives.
+
+**Growing.** GitHub does not publish how many jobs are queued for a set of
+labels — only what each runner is doing. So demand is inferred: when *every*
+runner in a pool is busy, the next job would have nowhere to go, and one more
+runner is added. That is also why the minimum is never zero. A pool with no
+runners has nothing to observe, so it could never learn that it should grow;
+the idle runner is what makes the pool able to answer the question at all.
+
+It grows one runner at a time, and the daemon comes back within seconds after a
+scale-up rather than waiting for its next tick, so a burst ramps quickly without
+a single long job conjuring a full fleet.
+
+**Shrinking** is deliberately the slow direction. The pool returns to its
+minimum only after five minutes with nothing busy, which rides out the gap
+between one job and the next. Shrinking drains like every other change, and it
+picks idle runners: a runner with a job on it is kept, not stopped and waited
+on.
+
+Minimum equal to maximum is a fixed-size pool that never moves — which is what
+every pool was before this existed, and what an upgraded database keeps.
+
+The fleet view says which pool is at what size and why: *every runner is busy*,
+*quiet for 7m*, *spare capacity available*.
+
+### Activity
+
+The daemon records what it observed on every pass and keeps two days of it, so
+the fleet view can show what has been happening rather than only what is
+happening now. The filled area is work actually running; the line above it is
+how many runners existed to run it — one axis, both counting runners — so a
+pool scaling up reads as the line stepping out to meet the area, and settling
+back when the work stops.
+
+![Activity](docs/img/activity.png)
+
+Each point is the **peak** of its interval, not the mean: a burst that filled
+the fleet for two minutes is the thing worth seeing, and averaging over a
+ten-minute bucket would flatten it into nothing. Narrow it to a single pool
+with the filter, or leave it on the whole fleet.
 
 ### Virtual machines or containers
 
@@ -121,8 +166,9 @@ questions:
 
 Each runner's configuration is hashed into a *generation*. A runner whose
 generation no longer matches its pool is running the wrong configuration and is
-replaced, gracefully. Replicas deliberately are not part of that hash, so
-scaling does not disturb the runners that are already correct.
+replaced, gracefully. The scaling bounds deliberately are not part of that hash:
+the autoscaler moves them many times an hour, and that must never replace a
+runner that is already correct.
 
 ## Security
 
