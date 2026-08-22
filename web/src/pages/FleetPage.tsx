@@ -1,10 +1,13 @@
+import { useState } from 'react'
 import {
   Alert,
+  Anchor,
   Badge,
   Card,
   Center,
   Group,
   Loader,
+  Modal,
   SimpleGrid,
   Stack,
   Table,
@@ -13,8 +16,9 @@ import {
   Tooltip,
 } from '@mantine/core'
 import { IconAlertTriangle, IconServerOff } from '@tabler/icons-react'
-import type { JobState, Pool, Runner, RunnerState, Scale } from '../api'
+import type { Credential, JobState, Pool, Runner, RunnerState, Scale } from '../api'
 import { ActivityChart } from './ActivityChart'
+import { PoolEditor } from './PoolEditor'
 
 /**
  * The fleet as it actually is.
@@ -27,21 +31,30 @@ import { ActivityChart } from './ActivityChart'
 export function FleetPage({
   runners,
   pools,
+  credentials,
   scaling,
   warnings,
   loading,
+  onChange,
 }: {
   runners: Runner[]
   pools: Pool[]
+  credentials: Credential[]
   scaling: Record<string, Scale>
   warnings: string[]
   loading: boolean
+  onChange: () => Promise<void>
 }) {
+  // The question a runner raises is usually about its pool — it is too small,
+  // or it should not exist — so the answer is reachable from here rather than
+  // through the pools page.
+  const [editing, setEditing] = useState<Pool | null>(null)
   const busy = runners.filter((r) => r.job === 'busy').length
   const enabled = pools.filter((p) => p.enabled)
   const ceiling = enabled.reduce((total, p) => total + p.maxReplicas, 0)
   const stale = runners.filter((r) => !r.upToDate).length
   const elastic = enabled.filter((p) => p.maxReplicas > p.minReplicas)
+  const poolsByName = new Map(pools.map((p) => [p.name, p]))
 
   if (loading) {
     return (
@@ -134,7 +147,13 @@ export function FleetPage({
                       {runner.name}
                     </Text>
                   </Table.Td>
-                  <Table.Td>{runner.pool || '—'}</Table.Td>
+                  <Table.Td>
+                    <PoolCell
+                      name={runner.pool}
+                      pool={poolsByName.get(runner.pool)}
+                      onOpen={setEditing}
+                    />
+                  </Table.Td>
                   <Table.Td>
                     <Badge variant="default" size="sm">
                       {runner.runtime}
@@ -178,7 +197,57 @@ export function FleetPage({
           </Table>
         </Card>
       )}
+
+      <Modal
+        opened={editing !== null}
+        onClose={() => setEditing(null)}
+        title={editing ? `Edit ${editing.name}` : ''}
+        size="lg"
+      >
+        {editing && (
+          <PoolEditor
+            pool={editing}
+            credentials={credentials}
+            onCancel={() => setEditing(null)}
+            onSaved={async () => {
+              setEditing(null)
+              await onChange()
+            }}
+          />
+        )}
+      </Modal>
     </Stack>
+  )
+}
+
+/**
+ * A runner's pool, as a way into its definition.
+ *
+ * A runner can name a pool the daemon no longer has — it is being drained
+ * after the pool was deleted — and there is nothing to open for that one, so
+ * it stays plain text.
+ */
+function PoolCell({
+  name,
+  pool,
+  onOpen,
+}: {
+  name: string
+  pool?: Pool
+  onOpen: (pool: Pool) => void
+}) {
+  if (!name) return <>—</>
+  if (!pool) {
+    return (
+      <Text size="sm" c="dimmed">
+        {name}
+      </Text>
+    )
+  }
+  return (
+    <Anchor component="button" type="button" size="sm" onClick={() => onOpen(pool)}>
+      {name}
+    </Anchor>
   )
 }
 
