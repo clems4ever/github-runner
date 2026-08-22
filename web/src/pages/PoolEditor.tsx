@@ -16,8 +16,8 @@ import {
 } from '@mantine/core'
 import { useForm } from '@mantine/form'
 import { notifications } from '@mantine/notifications'
-import { IconAlertTriangle } from '@tabler/icons-react'
-import { api, effectiveLabels, type Credential, type Pool } from '../api'
+import { IconAlertTriangle, IconExternalLink } from '@tabler/icons-react'
+import { api, ApiError, effectiveLabels, type Credential, type Pool } from '../api'
 
 /**
  * The pool editor.
@@ -27,6 +27,12 @@ import { api, effectiveLabels, type Credential, type Pool } from '../api'
  * a different security proposition from a machine with it, and the labels a
  * workflow will target follow from both.
  */
+/** A refusal from GitHub that a person can act on. */
+interface Refusal {
+  message: string
+  grantUrl?: string
+}
+
 export function PoolEditor({
   pool,
   credentials,
@@ -39,6 +45,7 @@ export function PoolEditor({
   onCancel: () => void
 }) {
   const [saving, setSaving] = useState(false)
+  const [refusal, setRefusal] = useState<Refusal | null>(null)
 
   const form = useForm<Partial<Pool>>({
     initialValues: { ...pool },
@@ -77,6 +84,7 @@ export function PoolEditor({
     <form
       onSubmit={form.onSubmit(async (submitted) => {
         setSaving(true)
+        setRefusal(null)
         try {
           if (pool.id) {
             await api.updatePool(pool.id, submitted)
@@ -85,11 +93,17 @@ export function PoolEditor({
           }
           await onSaved()
         } catch (error) {
-          notifications.show({
-            color: 'red',
-            title: 'Could not save the pool',
-            message: error instanceof Error ? error.message : String(error),
-          })
+          // Shown on the form rather than in a corner toast: this is about a
+          // field on this screen, and it usually needs reading twice.
+          if (error instanceof ApiError) {
+            setRefusal({ message: error.message, grantUrl: error.grantUrl })
+          } else {
+            notifications.show({
+              color: 'red',
+              title: 'Could not save the pool',
+              message: error instanceof Error ? error.message : String(error),
+            })
+          }
         } finally {
           setSaving(false)
         }
@@ -251,6 +265,26 @@ export function PoolEditor({
           description="Which image these runners boot. Per-repository images will select one here."
           {...form.getInputProps('image')}
         />
+
+        {refusal && (
+          <Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />} title="GitHub refused this">
+            <Text size="sm">{refusal.message}</Text>
+            {refusal.grantUrl && (
+              <Button
+                component="a"
+                href={refusal.grantUrl}
+                target="_blank"
+                rel="noreferrer"
+                size="xs"
+                variant="light"
+                mt="sm"
+                rightSection={<IconExternalLink size={14} />}
+              >
+                Grant access on GitHub
+              </Button>
+            )}
+          </Alert>
+        )}
 
         <Group justify="space-between" mt="sm">
           <Switch

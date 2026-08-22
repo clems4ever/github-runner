@@ -92,6 +92,12 @@ export class ApiError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    /**
+     * Where a person goes to fix this, when the daemon knows of such a place.
+     * An app cannot widen its own access — GitHub does not allow it — so the
+     * most that can be done is put the right page one click away.
+     */
+    readonly grantUrl?: string,
   ) {
     super(message)
   }
@@ -107,13 +113,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // The daemon puts something worth reading in "error"; anything else means
     // it never got that far.
     let message = response.statusText
+    let grantUrl: string | undefined
     try {
       const body = await response.json()
       if (body?.error) message = body.error
+      if (body?.grantUrl) grantUrl = body.grantUrl
     } catch {
       /* keep the status text */
     }
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, grantUrl)
   }
 
   if (response.status === 204) return undefined as T

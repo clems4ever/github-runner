@@ -10,6 +10,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,6 +69,25 @@ func New(token string, opts ...Option) *Client {
 type Scope struct {
 	Kind model.ScopeKind
 	Path string
+}
+
+// CheckAccess asks whether this credential can do what a pool will need it to,
+// before a pool is created that quietly fails a minute later.
+//
+// Listing runners is the cheapest call that exercises the same permission the
+// daemon actually uses, so a pass here means the pool will work rather than
+// only that the credential exists.
+func (c *Client) CheckAccess(ctx context.Context, scope Scope) error {
+	_, err := c.Runners(ctx, scope)
+	if err == nil {
+		return nil
+	}
+
+	var apiErr *Error
+	if errors.As(err, &apiErr) && c.app != nil && apiErr.Status == http.StatusNotFound {
+		apiErr.GrantURL = c.app.grantURL(ctx, c)
+	}
+	return err
 }
 
 // ScopeOf reads the scope out of a pool.
@@ -231,6 +251,12 @@ type Error struct {
 	Scope   string
 	Message string
 	Advice  string
+	// GrantURL is where a person goes to fix this, when there is such a place.
+	// An app cannot widen its own access — GitHub does not allow it, which is
+	// the point of installing on selected repositories — so the most this can
+	// do is put the right page one click away instead of somewhere to hunt
+	// for.
+	GrantURL string
 }
 
 func (e *Error) Error() string {
