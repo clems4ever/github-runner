@@ -57,6 +57,14 @@ const runner = (over: Partial<Runner> = {}): Runner => ({
 })
 
 describe('FleetPage', () => {
+  // An ephemeral runner deregisters itself after every job and a fresh machine
+  // boots, so "GitHub has never heard of this one" is most of a busy pool's
+  // life. Calling that unknown made a working fleet look broken.
+  it('says a runner is starting rather than unknown while it boots', () => {
+    renderPage([runner({ job: 'starting' })])
+    expect(screen.getByText('starting')).toBeInTheDocument()
+  })
+
   // A runner can be dead and look busy. The dashboard said "running" for a
   // whole afternoon while every machine on the host was crash-looping on a
   // credential it could not read, so a failing runner now says so beside its

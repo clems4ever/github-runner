@@ -522,3 +522,30 @@ func TestAnOrdinaryDrainIsQuiet(t *testing.T) {
 		t.Fatalf("a runner finishing its job was reported as a problem: %q", runners[0].Trouble)
 	}
 }
+
+// The host knows how long a runner has been up, and that is what separates a
+// machine still booting from one GitHub will never hear about.
+func TestListSaysHowLongARunnerHasBeenUp(t *testing.T) {
+	now := time.Date(2026, 8, 22, 17, 0, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=active",
+		"SubState=running",
+		"Result=success",
+		"NRestarts=0",
+		fmt.Sprintf("ActiveEnterTimestamp=@%d", now.Add(-40*time.Second).Unix()),
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runners[0].Up != 40*time.Second {
+		t.Fatalf("up for %s, want 40s", runners[0].Up)
+	}
+}
