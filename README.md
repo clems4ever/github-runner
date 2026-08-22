@@ -158,6 +158,14 @@ every pool was before this existed, and what an upgraded database keeps.
 The fleet view says which pool is at what size and why: *every runner is busy*,
 *quiet for 7m*, *spare capacity available*.
 
+**Resizing without opening the editor.** Each row of **Pools** has a plus and a
+minus next to its runner count. A step moves the pool's maximum, because the
+maximum is the number that says how big the pool may get; on a fixed-size pool
+the minimum comes with it, so the pool stays fixed. Neither button will step a
+pool onto its own floor — turning autoscaling on or off is a decision for the
+editor, not a side effect of a click. Growing applies straight away; shrinking
+asks first, and says how many runners it would drain.
+
 ### Activity
 
 The daemon records what it observed on every pass and keeps two days of it, so

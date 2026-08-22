@@ -313,6 +313,33 @@ export function emptyPool(credentialId: number): Partial<Pool> {
   }
 }
 
+/** The largest a pool may be. The daemon enforces the same number. */
+export const maxReplicas = 64
+
+/** Whether a pool is a fixed size rather than one the autoscaler moves. */
+export function isFixed(pool: Pool): boolean {
+  return pool.maxReplicas <= pool.minReplicas
+}
+
+/**
+ * The same pool, one runner bigger or smaller — or null when it cannot go that
+ * way.
+ *
+ * A step moves the ceiling, because the ceiling is the number that decides how
+ * big a pool is allowed to get; the autoscaler owns everything below it. A
+ * fixed pool has no room underneath, so both bounds move together and it stays
+ * fixed. An autoscaling one stops a step above its minimum for the mirror
+ * reason: nudging a row in a list should never quietly switch a pool's kind.
+ */
+export function scaled(pool: Pool, delta: number): Pool | null {
+  const fixed = isFixed(pool)
+  const max = pool.maxReplicas + delta
+  const min = fixed ? max : pool.minReplicas
+  if (min < 1 || max > maxReplicas) return null
+  if (fixed ? max < min : max <= min) return null
+  return { ...pool, minReplicas: min, maxReplicas: max }
+}
+
 /**
  * The labels a pool's runners will actually register with: what the operator
  * typed, plus the ones describing what the runner is.

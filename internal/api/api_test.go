@@ -294,6 +294,37 @@ func TestPoolLifecycle(t *testing.T) {
 	}
 }
 
+// The pools list can resize a pool without opening its definition, which sends
+// the pool back with new bounds and nothing else touched. Two things have to
+// hold for that to be safe: the rest of the pool survives the round trip, and
+// the daemon acts on it now rather than at whatever the next tick happens to
+// be — a row that sits unchanged after a click reads as a broken button.
+func TestScalingAPoolLeavesTheRestOfItAlone(t *testing.T) {
+	h := newHarness(t)
+
+	var created model.Pool
+	h.decode(h.do("POST", "/api/pools", h.samplePool()), &created)
+
+	nudgesBefore := h.nudges
+	update := h.samplePool()
+	update["minReplicas"] = 3
+	update["maxReplicas"] = 3
+
+	var updated model.Pool
+	h.decode(h.do("PUT", "/api/pools/"+itoa(created.ID), update), &updated)
+
+	if updated.MinReplicas != 3 || updated.MaxReplicas != 3 {
+		t.Fatalf("got %d–%d, want a pool of a fixed three", updated.MinReplicas, updated.MaxReplicas)
+	}
+	if updated.Runtime != created.Runtime || updated.Scope != created.Scope ||
+		updated.CPUs != created.CPUs || updated.MemoryMB != created.MemoryMB {
+		t.Fatalf("scaling changed something it was not asked to: %+v", updated)
+	}
+	if h.nudges == nudgesBefore {
+		t.Error("scaling did not ask for a reconcile, so nothing would happen until the next tick")
+	}
+}
+
 func TestPoolValidationReachesTheOperator(t *testing.T) {
 	h := newHarness(t)
 	bad := h.samplePool()
