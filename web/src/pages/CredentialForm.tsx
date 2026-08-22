@@ -7,6 +7,7 @@ import {
   NumberInput,
   PasswordInput,
   SegmentedControl,
+  SimpleGrid,
   Stack,
   Text,
   Textarea,
@@ -126,7 +127,7 @@ export function CredentialForm({
           )}
 
           {!rotating && (
-            <Group grow align="flex-start">
+            <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="md" verticalSpacing="md">
               <NumberInput
                 label="App ID"
                 description="On the app's settings page"
@@ -142,7 +143,7 @@ export function CredentialForm({
                 value={installationId}
                 onChange={setInstallationId}
               />
-            </Group>
+            </SimpleGrid>
           )}
 
           <Textarea

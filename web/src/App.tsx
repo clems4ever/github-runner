@@ -33,6 +33,7 @@ import {
   type Runner,
   type Scale,
 } from './api'
+import { useCrampedHeader } from './responsive'
 import { Logo } from './Logo'
 import { FleetPage } from './pages/FleetPage'
 import { PoolsPage } from './pages/PoolsPage'
@@ -51,6 +52,7 @@ const pages: { key: Page; label: string; icon: typeof IconServer2 }[] = [
 ]
 
 export function App() {
+  const crampedHeader = useCrampedHeader()
   const [opened, { toggle }] = useDisclosure()
   const [page, setPage] = useState<Page>('fleet')
   const [pools, setPools] = useState<Pool[]>([])
@@ -103,20 +105,42 @@ export function App() {
     <AppShell
       header={{ height: 56 }}
       navbar={{ width: 220, breakpoint: 'sm', collapsed: { mobile: !opened } }}
-      padding="lg"
+      padding={{ base: 'sm', sm: 'lg' }}
     >
       <AppShell.Header>
-        <Group h="100%" px="md" justify="space-between">
-          <Group gap="sm">
+        <Group h="100%" px={{ base: 'sm', sm: 'md' }} justify="space-between" wrap="nowrap">
+          <Group gap="sm" wrap="nowrap" style={{ minWidth: 0 }}>
             <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-            <Title order={4}>runner-fleet</Title>
-            {runners.length > 0 && (
-              <Badge variant="light" color={busy > 0 ? 'blue' : 'gray'}>
-                {busy} of {runners.length} busy
-              </Badge>
+            <Title order={4} style={{ whiteSpace: 'nowrap' }}>
+              runner-fleet
+            </Title>
+            {runners.length > 0 && !crampedHeader && (
+              // The same count twice, because "2 of 5 busy" is what it means and
+              // "2/5" is what fits next to the title on a phone. Neither may
+              // shrink: a squeezed badge is an empty pill, not a shorter one.
+              <>
+                <Badge
+                  variant="light"
+                  color={busy > 0 ? 'blue' : 'gray'}
+                  visibleFrom="xs"
+                  style={{ flexShrink: 0 }}
+                >
+                  {busy} of {runners.length} busy
+                </Badge>
+                <Tooltip label={`${busy} of ${runners.length} runners busy`}>
+                  <Badge
+                    variant="light"
+                    color={busy > 0 ? 'blue' : 'gray'}
+                    hiddenFrom="xs"
+                    style={{ flexShrink: 0 }}
+                  >
+                    {busy}/{runners.length}
+                  </Badge>
+                </Tooltip>
+              </>
             )}
           </Group>
-          <Group gap="xs">
+          <Group gap="xs" wrap="nowrap">
             <ReconcileButton onDone={refresh} />
             <ColorSchemeToggle />
             {/* The mark anchors the corner opposite the wordmark, so the header

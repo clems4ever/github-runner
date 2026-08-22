@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { MantineProvider } from '@mantine/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FleetPage } from './FleetPage'
+import { pretendNarrow } from '../test-setup'
 import { api, type Credential, type Pool, type Runner, type Scale } from '../api'
 
 const credentials: Credential[] = [{ id: 1, name: 'pat', kind: 'pat', hint: '…1234', createdAt: '' }]
@@ -210,5 +211,57 @@ describe('FleetPage', () => {
     // told why the job column is empty.
     await renderPage([runner()], ['pool web: GitHub is unreachable'])
     expect(screen.getByText('pool web: GitHub is unreachable')).toBeInTheDocument()
+  })
+
+  // Six columns do not fit on a phone, and the old table did not scroll: it was
+  // simply cut off after the third, with no sign that there was more.
+  describe('on a phone', () => {
+    let restore = () => {}
+    afterEach(() => restore())
+
+    it('draws a card per runner instead of a table', async () => {
+      restore = pretendNarrow()
+      await renderPage([runner({ name: 'web-1', job: 'busy' })])
+
+      expect(screen.queryByRole('table')).not.toBeInTheDocument()
+      expect(screen.getByText('web-1')).toBeInTheDocument()
+    })
+
+    it('loses none of what the table said', async () => {
+      restore = pretendNarrow()
+      await renderPage([
+        runner({ name: 'web-1', pool: 'web', runtime: 'vm', state: 'stopping', job: 'busy', upToDate: false }),
+      ])
+
+      expect(screen.getByText('web-1')).toBeInTheDocument()
+      expect(screen.getByText('web')).toBeInTheDocument()
+      expect(screen.getByText('vm')).toBeInTheDocument()
+      expect(screen.getByText('stopping')).toBeInTheDocument()
+      expect(screen.getByText('busy')).toBeInTheDocument()
+      expect(screen.getByText('superseded')).toBeInTheDocument()
+    })
+
+    it('still says which runner is failing', async () => {
+      restore = pretendNarrow()
+      await renderPage([runner({ state: 'stopped', job: 'unknown', trouble: 'failing to start' })])
+      expect(screen.getByText('failing')).toBeInTheDocument()
+    })
+
+    // The way into a pool's definition is on the card as well as in the table:
+    // a phone should not be the one place where the runner is a dead end.
+    it('opens the pool definition from a card', async () => {
+      restore = pretendNarrow()
+      await renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })])
+
+      await userEvent.click(screen.getByRole('button', { name: 'web' }))
+
+      expect(await screen.findByText('Edit web')).toBeInTheDocument()
+      expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveValue('web')
+    })
+  })
+
+  it('keeps the table on a wide screen', async () => {
+    await renderPage([runner()])
+    expect(screen.getByRole('table')).toBeInTheDocument()
   })
 })

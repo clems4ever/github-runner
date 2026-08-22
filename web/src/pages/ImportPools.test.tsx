@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { MantineProvider } from '@mantine/core'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ImportPools } from './ImportPools'
+import { pretendNarrow } from '../test-setup'
 import { api, ApiError, type ImportReport, type Pool } from '../api'
 
 const CREDENTIALS = [
@@ -221,5 +222,26 @@ describe('ImportPools', () => {
 
     expect(await screen.findByText(/replaces the pool of this name/)).toBeInTheDocument()
     expect(screen.getByText(/replaced gracefully, as it finishes the job/)).toBeInTheDocument()
+  })
+
+  // The preview is the whole point of the screen: it is read before the button
+  // under it is pressed. A six-column table on a phone is not read.
+  it('previews as a card per pool on a phone', async () => {
+    const restore = pretendNarrow()
+    try {
+      vi.spyOn(api, 'importPools').mockResolvedValue(PREVIEW)
+      renderImport()
+
+      await paste(TEMPLATE)
+      await userEvent.click(screen.getByRole('button', { name: 'Preview' }))
+
+      await screen.findByText('ci-container')
+      expect(screen.queryByRole('table')).not.toBeInTheDocument()
+      expect(screen.getByText('ci-vm')).toBeInTheDocument()
+      expect(screen.getAllByText('new')).toHaveLength(2)
+      expect(screen.getByText('4 vCPU · 8 GiB · 40 GiB')).toBeInTheDocument()
+    } finally {
+      restore()
+    }
   })
 })

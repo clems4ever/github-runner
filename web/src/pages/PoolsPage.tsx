@@ -36,6 +36,7 @@ import {
   type Runner,
   type Scale,
 } from '../api'
+import { Field, useNarrow } from '../responsive'
 import { ImportPools } from './ImportPools'
 import { PoolEditor } from './PoolEditor'
 
@@ -52,6 +53,7 @@ export function PoolsPage({
   scaling: Record<string, Scale>
   onChange: () => Promise<void>
 }) {
+  const narrow = useNarrow()
   const [editing, setEditing] = useState<Partial<Pool> | null>(null)
   const [deleting, setDeleting] = useState<Pool | null>(null)
   const [importing, setImporting] = useState(false)
@@ -80,9 +82,11 @@ export function PoolsPage({
 
   return (
     <Stack gap="lg">
-      <Group justify="space-between">
+      {/* On a phone the three actions take the whole row under the heading
+          rather than being squeezed alongside it. */}
+      <Group justify="space-between" gap="sm" wrap="wrap">
         <Title order={3}>Pools</Title>
-        <Group gap="xs">
+        <Group gap="xs" wrap="wrap" style={narrow ? { flex: '1 1 100%' } : undefined}>
           <Button
             variant="default"
             leftSection={<IconDownload size={16} />}
@@ -129,6 +133,20 @@ export function PoolsPage({
             </Stack>
           </Center>
         </Card>
+      ) : narrow ? (
+        <Stack gap="sm">
+          {pools.map((pool) => (
+            <PoolCard
+              key={pool.id}
+              pool={pool}
+              live={runnersOf(pool).length}
+              decision={scaling[pool.name]}
+              onChange={onChange}
+              onEdit={() => setEditing(pool)}
+              onDelete={() => setDeleting(pool)}
+            />
+          ))}
+        </Stack>
       ) : (
         <Card withBorder padding={0}>
           <Table highlightOnHover verticalSpacing="sm" horizontalSpacing="md">
@@ -153,110 +171,29 @@ export function PoolsPage({
                       <Text fw={500}>{pool.name}</Text>
                     </Table.Td>
                     <Table.Td>
-                      <Group gap={6}>
-                        <Text size="sm">{pool.scope}</Text>
-                        {pool.scopeKind === 'organization' && (
-                          <Badge size="xs" variant="default">
-                            org
-                          </Badge>
-                        )}
-                      </Group>
+                      <ScopeCell pool={pool} />
                     </Table.Td>
                     <Table.Td>
-                      <Group gap={4}>
-                        <Badge variant="default" size="sm">
-                          {pool.runtime}
-                        </Badge>
-                        {pool.nested && (
-                          <Tooltip label="Jobs can boot machines of their own">
-                            <Badge size="sm" color="grape" variant="light">
-                              nestedvirt
-                            </Badge>
-                          </Tooltip>
-                        )}
-                      </Group>
+                      <RuntimeBadges pool={pool} />
                     </Table.Td>
                     <Table.Td>
-                      <Tooltip
-                        label={scaling[pool.name]?.reason ?? 'no decision recorded yet'}
-                        disabled={!scaling[pool.name]}
-                      >
-                        <Group gap={6} wrap="nowrap">
-                          <Text size="sm" fw={500}>
-                            {live.length}
-                          </Text>
-                          <Text size="sm" c="dimmed">
-                            {pool.minReplicas === pool.maxReplicas
-                              ? `/ ${pool.maxReplicas}`
-                              : `of ${pool.minReplicas}–${pool.maxReplicas}`}
-                          </Text>
-                          {scaling[pool.name]?.scaledUp && (
-                            <Badge size="xs" color="blue" variant="light">
-                              scaling up
-                            </Badge>
-                          )}
-                        </Group>
-                      </Tooltip>
+                      <RunnersCell pool={pool} live={live.length} decision={scaling[pool.name]} />
                     </Table.Td>
                     <Table.Td>
-                      <Group gap={4}>
-                        {effectiveLabels(pool).map((label) => (
-                          <Badge key={label} size="xs" variant="dot">
-                            {label}
-                          </Badge>
-                        ))}
-                      </Group>
+                      <LabelBadges pool={pool} />
                     </Table.Td>
                     <Table.Td>
-                      <Text size="sm" c="dimmed">
-                        {pool.cpus} vCPU · {Math.round(pool.memoryMb / 1024)} GiB
-                        {pool.runtime === 'vm' ? ` · ${pool.diskGb} GiB` : ''}
-                      </Text>
+                      <SizeText pool={pool} />
                     </Table.Td>
                     <Table.Td>
-                      <Switch
-                        checked={pool.enabled}
-                        aria-label={`Enable ${pool.name}`}
-                        onChange={async (event) => {
-                          try {
-                            await api.updatePool(pool.id, {
-                              ...pool,
-                              enabled: event.currentTarget.checked,
-                            })
-                            await onChange()
-                          } catch (error) {
-                            notifications.show({
-                              color: 'red',
-                              title: 'Could not change the pool',
-                              message: error instanceof Error ? error.message : String(error),
-                            })
-                          }
-                        }}
+                      <EnabledSwitch pool={pool} onChange={onChange} />
+                    </Table.Td>
+                    <Table.Td>
+                      <RowMenu
+                        pool={pool}
+                        onEdit={() => setEditing(pool)}
+                        onDelete={() => setDeleting(pool)}
                       />
-                    </Table.Td>
-                    <Table.Td>
-                      <Menu position="bottom-end">
-                        <Menu.Target>
-                          <ActionIcon variant="subtle" aria-label={`Actions for ${pool.name}`}>
-                            <IconDots size={16} />
-                          </ActionIcon>
-                        </Menu.Target>
-                        <Menu.Dropdown>
-                          <Menu.Item
-                            leftSection={<IconPencil size={14} />}
-                            onClick={() => setEditing(pool)}
-                          >
-                            Edit
-                          </Menu.Item>
-                          <Menu.Item
-                            color="red"
-                            leftSection={<IconTrash size={14} />}
-                            onClick={() => setDeleting(pool)}
-                          >
-                            Delete
-                          </Menu.Item>
-                        </Menu.Dropdown>
-                      </Menu>
                     </Table.Td>
                   </Table.Tr>
                 )
@@ -271,6 +208,9 @@ export function PoolsPage({
         onClose={() => setEditing(null)}
         title={editing?.id ? `Edit ${editing.name}` : 'New pool'}
         size="lg"
+        // A long form in a floating panel on a phone is a small window inside a
+        // small window; it gets the whole screen instead.
+        fullScreen={narrow}
       >
         {editing && (
           <PoolEditor
@@ -290,6 +230,7 @@ export function PoolsPage({
         onClose={() => setImporting(false)}
         title="Import pools from a template"
         size="xl"
+        fullScreen={narrow}
       >
         <ImportPools
           credentials={credentials}
@@ -334,5 +275,183 @@ export function PoolsPage({
         </Stack>
       </Modal>
     </Stack>
+  )
+}
+
+/**
+ * One pool, as a card.
+ *
+ * The row menu is the thing that most needed rescuing: in a table this narrow
+ * it sits in the eighth column, which is off the edge of a phone, so editing or
+ * deleting a pool was simply not reachable. Here it is beside the name.
+ */
+function PoolCard({
+  pool,
+  live,
+  decision,
+  onChange,
+  onEdit,
+  onDelete,
+}: {
+  pool: Pool
+  live: number
+  decision?: Scale
+  onChange: () => Promise<void>
+  onEdit: () => void
+  onDelete: () => void
+}) {
+  return (
+    <Card withBorder padding="md">
+      <Stack gap="xs">
+        <Group justify="space-between" gap="xs" wrap="nowrap" align="flex-start">
+          <Text fw={500} style={{ wordBreak: 'break-word' }}>
+            {pool.name}
+          </Text>
+          <Group gap="xs" wrap="nowrap" style={{ flexShrink: 0 }}>
+            <EnabledSwitch pool={pool} onChange={onChange} />
+            <RowMenu pool={pool} onEdit={onEdit} onDelete={onDelete} />
+          </Group>
+        </Group>
+        <Field label="Scope">
+          <ScopeCell pool={pool} />
+        </Field>
+        <Field label="Runtime">
+          <RuntimeBadges pool={pool} />
+        </Field>
+        <Field label="Runners">
+          <RunnersCell pool={pool} live={live} decision={decision} />
+        </Field>
+        <Field label="Labels">
+          <LabelBadges pool={pool} />
+        </Field>
+        <Field label="Size">
+          <SizeText pool={pool} />
+        </Field>
+      </Stack>
+    </Card>
+  )
+}
+
+function ScopeCell({ pool }: { pool: Pool }) {
+  return (
+    <Group gap={6} justify="flex-end">
+      <Text size="sm" style={{ wordBreak: 'break-word' }}>
+        {pool.scope}
+      </Text>
+      {pool.scopeKind === 'organization' && (
+        <Badge size="xs" variant="default">
+          org
+        </Badge>
+      )}
+    </Group>
+  )
+}
+
+function RuntimeBadges({ pool }: { pool: Pool }) {
+  return (
+    <Group gap={4} justify="flex-end">
+      <Badge variant="default" size="sm">
+        {pool.runtime}
+      </Badge>
+      {pool.nested && (
+        <Tooltip label="Jobs can boot machines of their own">
+          <Badge size="sm" color="grape" variant="light">
+            nestedvirt
+          </Badge>
+        </Tooltip>
+      )}
+    </Group>
+  )
+}
+
+function RunnersCell({ pool, live, decision }: { pool: Pool; live: number; decision?: Scale }) {
+  return (
+    <Tooltip label={decision?.reason ?? 'no decision recorded yet'} disabled={!decision}>
+      <Group gap={6} wrap="nowrap" justify="flex-end">
+        <Text size="sm" fw={500}>
+          {live}
+        </Text>
+        <Text size="sm" c="dimmed">
+          {pool.minReplicas === pool.maxReplicas
+            ? `/ ${pool.maxReplicas}`
+            : `of ${pool.minReplicas}–${pool.maxReplicas}`}
+        </Text>
+        {decision?.scaledUp && (
+          <Badge size="xs" color="blue" variant="light">
+            scaling up
+          </Badge>
+        )}
+      </Group>
+    </Tooltip>
+  )
+}
+
+function LabelBadges({ pool }: { pool: Pool }) {
+  return (
+    <Group gap={4} justify="flex-end">
+      {effectiveLabels(pool).map((label) => (
+        <Badge key={label} size="xs" variant="dot">
+          {label}
+        </Badge>
+      ))}
+    </Group>
+  )
+}
+
+function SizeText({ pool }: { pool: Pool }) {
+  return (
+    <Text size="sm" c="dimmed">
+      {pool.cpus} vCPU · {Math.round(pool.memoryMb / 1024)} GiB
+      {pool.runtime === 'vm' ? ` · ${pool.diskGb} GiB` : ''}
+    </Text>
+  )
+}
+
+function EnabledSwitch({ pool, onChange }: { pool: Pool; onChange: () => Promise<void> }) {
+  return (
+    <Switch
+      checked={pool.enabled}
+      aria-label={`Enable ${pool.name}`}
+      onChange={async (event) => {
+        try {
+          await api.updatePool(pool.id, { ...pool, enabled: event.currentTarget.checked })
+          await onChange()
+        } catch (error) {
+          notifications.show({
+            color: 'red',
+            title: 'Could not change the pool',
+            message: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }}
+    />
+  )
+}
+
+function RowMenu({
+  pool,
+  onEdit,
+  onDelete,
+}: {
+  pool: Pool
+  onEdit: () => void
+  onDelete: () => void
+}) {
+  return (
+    <Menu position="bottom-end">
+      <Menu.Target>
+        <ActionIcon variant="subtle" aria-label={`Actions for ${pool.name}`}>
+          <IconDots size={16} />
+        </ActionIcon>
+      </Menu.Target>
+      <Menu.Dropdown>
+        <Menu.Item leftSection={<IconPencil size={14} />} onClick={onEdit}>
+          Edit
+        </Menu.Item>
+        <Menu.Item color="red" leftSection={<IconTrash size={14} />} onClick={onDelete}>
+          Delete
+        </Menu.Item>
+      </Menu.Dropdown>
+    </Menu>
   )
 }

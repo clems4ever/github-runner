@@ -11,6 +11,7 @@ import {
 } from '@mantine/core'
 import { CompositeChart } from '@mantine/charts'
 import { api, type HostPoint } from '../api'
+import { useNarrow } from '../responsive'
 
 /**
  * What the host has been using.
@@ -48,6 +49,7 @@ const ranges = [
 export function HostChart() {
   const scheme = useComputedColorScheme('light')
   const palette = colours[scheme]
+  const narrow = useNarrow()
 
   const [hours, setHours] = useState('6')
   const [points, setPoints] = useState<HostPoint[] | null>(null)
@@ -86,15 +88,16 @@ export function HostChart() {
   }))
 
   return (
-    <Card withBorder padding="md">
-      <Group justify="space-between" mb="sm">
+    <Card withBorder p={{ base: 'sm', sm: 'md' }}>
+      <Group justify="space-between" mb="sm" gap="sm" wrap="wrap">
         <div>
           <Text fw={500}>History</Text>
           <Text size="xs" c="dimmed">
             Peak per interval, as a share of what the host has
           </Text>
         </div>
-        <SegmentedControl size="xs" data={ranges} value={hours} onChange={setHours} />
+        <SegmentedControl size="xs" fullWidth={narrow} data={ranges} value={hours} onChange={setHours}
+          style={narrow ? { flex: '1 1 100%' } : undefined} />
       </Group>
 
       {failed ? (
@@ -125,7 +128,7 @@ export function HostChart() {
         </Center>
       ) : (
         <CompositeChart
-          h={220}
+          h={narrow ? 200 : 220}
           data={data}
           dataKey="at"
           withLegend
@@ -144,7 +147,8 @@ export function HostChart() {
           xAxisProps={{
             tickFormatter: (value: string) =>
               new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            minTickGap: 48,
+            // Wide enough apart that two times never touch on a phone.
+            minTickGap: narrow ? 72 : 48,
           }}
           valueFormatter={(value: number) => `${value.toFixed(1)}%`}
           gridColor={palette.grid}

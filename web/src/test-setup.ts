@@ -1,6 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 import { format } from 'node:util'
 import { afterEach, beforeEach, expect } from 'vitest'
+import { narrowQuery } from './responsive'
 
 // A React warning is a bug report the suite prints and then throws away. The
 // release log carried a screenful of "not wrapped in act(...)" while every test
@@ -41,20 +42,36 @@ afterEach(() => {
   expect(seen, `the console was not quiet:\n\n${seen.join('\n\n')}`).toEqual([])
 })
 
+const answering = (matches: (query: string) => boolean) => (query: string) => ({
+  matches: matches(query),
+  media: query,
+  onchange: null,
+  addListener: () => {},
+  removeListener: () => {},
+  addEventListener: () => {},
+  removeEventListener: () => {},
+  dispatchEvent: () => false,
+})
+
 // Mantine components measure the window; jsdom does not implement either of
-// these, and without them every render throws.
-window.matchMedia =
-  window.matchMedia ||
-  ((query: string) => ({
-    matches: false,
-    media: query,
-    onchange: null,
-    addListener: () => {},
-    removeListener: () => {},
-    addEventListener: () => {},
-    removeEventListener: () => {},
-    dispatchEvent: () => false,
-  }))
+// these, and without them every render throws. Answering false to everything is
+// a wide window, which is what most of these tests are written against.
+window.matchMedia = window.matchMedia || answering(() => false)
+
+/**
+ * Render the next component as a phone would see it, and put the window back.
+ *
+ * Which presentation a page uses — a table or a card per row — is decided by a
+ * media query, and jsdom answers false to every query it is asked. A test that
+ * wants the narrow one has to say so.
+ */
+export function pretendNarrow() {
+  const wide = window.matchMedia
+  window.matchMedia = answering((query) => query === narrowQuery) as typeof window.matchMedia
+  return () => {
+    window.matchMedia = wide
+  }
+}
 
 window.ResizeObserver =
   window.ResizeObserver ||

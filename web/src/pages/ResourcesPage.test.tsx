@@ -1,7 +1,8 @@
 import { render, screen } from '@testing-library/react'
 import { MantineProvider } from '@mantine/core'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ResourcesPage, bytes } from './ResourcesPage'
+import { pretendNarrow } from '../test-setup'
 import { api, type ResourceReport } from '../api'
 
 // The page draws the host chart, which asks the daemon for the history as soon
@@ -137,6 +138,54 @@ describe('ResourcesPage', () => {
   it('says when the host has nothing on it', async () => {
     await renderPage(report())
     expect(screen.getByText('Nothing is running on this host yet.')).toBeInTheDocument()
+  })
+
+  // Five columns of usage do not fit on a phone, and the table did not scroll:
+  // memory, the number most worth looking at, was off the right-hand edge.
+  describe('on a phone', () => {
+    let restore = () => {}
+    afterEach(() => restore())
+
+    const busy = report({
+      runners: [
+        { name: 'web-1', pool: 'web', runtime: 'vm', cpuPercent: 12.5, memoryBytes: 2 * 1024 ** 3 },
+      ],
+    })
+
+    it('draws a card per runner instead of a table', async () => {
+      restore = pretendNarrow()
+      await renderPage(busy)
+
+      expect(screen.queryByRole('table')).not.toBeInTheDocument()
+      expect(screen.getByText('web-1')).toBeInTheDocument()
+      expect(screen.getByText('12.5%')).toBeInTheDocument()
+      expect(screen.getByText('2.0 GB')).toBeInTheDocument()
+    })
+
+    it('still says a reading is not in yet rather than calling it zero', async () => {
+      restore = pretendNarrow()
+      await renderPage(
+        report({
+          runners: [
+            { name: 'web-1', pool: 'web', runtime: 'vm', cpuPercent: null, memoryBytes: 1024 ** 3 },
+          ],
+        }),
+      )
+
+      expect(screen.getByText('—')).toBeInTheDocument()
+      expect(screen.queryByText('0.0%')).not.toBeInTheDocument()
+    })
+  })
+
+  it('keeps the table on a wide screen', async () => {
+    await renderPage(
+      report({
+        runners: [
+          { name: 'web-1', pool: 'web', runtime: 'vm', cpuPercent: 12.5, memoryBytes: 1024 ** 3 },
+        ],
+      }),
+    )
+    expect(screen.getByRole('table')).toBeInTheDocument()
   })
 })
 
