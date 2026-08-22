@@ -318,3 +318,75 @@ func TestRunnerIndex(t *testing.T) {
 		t.Errorf("got %d", got)
 	}
 }
+
+// The bug, from a real host. The pool had grown to three because every runner
+// was busy; ten minutes later it threw the third machine away as "no longer
+// wanted", with twelve jobs still queued.
+//
+// An ephemeral runner is invisible between jobs: it deregisters itself the
+// moment one ends, its machine powers off, and the next takes twenty seconds
+// to come back. Sample the pool in that window — which is most of the window
+// for a pool that is working — and nothing is busy and nothing is registered,
+// which is indistinguishable from a pool nobody wants.
+func TestAPoolWhoseMachinesAreRecyclingIsNotQuiet(t *testing.T) {
+	pool := elasticPool(1, 3)
+	now := time.Now()
+
+	// Three machines. One is booting back from a job — running, GitHub has not
+	// seen it yet, seconds old. The others are registered and idle.
+	runners := []Runner{
+		{Name: "web-1", Pool: "web", State: StateRunning, Up: 15 * time.Second},
+		{Name: "web-2", Pool: "web", State: StateRunning, Up: time.Hour},
+		{Name: "web-3", Pool: "web", State: StateRunning, Up: time.Hour},
+	}
+	states := map[string]github.State{
+		"web-2": github.StateIdle,
+		"web-3": github.StateIdle,
+	}
+
+	// Nothing has been seen busy for half an hour, which used to be enough to
+	// shrink the pool to its floor.
+	scale := Autoscale(pool, runners, states, now.Add(-30*time.Minute), now)
+
+	if scale.Target != 3 {
+		t.Fatalf("the pool shrank to %d while a machine was coming back from a job", scale.Target)
+	}
+	if !strings.Contains(scale.Reason, "coming back") {
+		t.Errorf("the reason does not say why it held: %q", scale.Reason)
+	}
+}
+
+// And the opposite, or the pool would never shrink again: machines that are up,
+// registered and doing nothing are exactly what "quiet" means.
+func TestAPoolWhoseMachinesAreAllRegisteredAndIdleStillShrinks(t *testing.T) {
+	pool := elasticPool(1, 3)
+	now := time.Now()
+
+	runners := []Runner{
+		{Name: "web-1", Pool: "web", State: StateRunning, Up: time.Hour},
+		{Name: "web-2", Pool: "web", State: StateRunning, Up: time.Hour},
+	}
+	states := map[string]github.State{"web-1": github.StateIdle, "web-2": github.StateIdle}
+
+	scale := Autoscale(pool, runners, states, now.Add(-30*time.Minute), now)
+	if scale.Target != 1 {
+		t.Fatalf("a genuinely quiet pool stayed at %d", scale.Target)
+	}
+}
+
+// A machine that has been running for an hour without GitHub ever seeing it is
+// broken, not booting, and must not hold a pool up for ever.
+func TestARunnerThatWillNeverRegisterDoesNotHoldThePoolOpen(t *testing.T) {
+	pool := elasticPool(1, 3)
+	now := time.Now()
+
+	runners := []Runner{
+		{Name: "web-1", Pool: "web", State: StateRunning, Up: time.Hour},
+		{Name: "web-2", Pool: "web", State: StateRunning, Up: time.Hour},
+	}
+	// GitHub has never heard of either.
+	scale := Autoscale(pool, runners, map[string]github.State{}, now.Add(-30*time.Minute), now)
+	if scale.Target != 1 {
+		t.Fatalf("a pool of runners that never registered stayed at %d", scale.Target)
+	}
+}
