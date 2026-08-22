@@ -58,9 +58,9 @@ func TestConfigRequiresWhatItCannotInvent(t *testing.T) {
 	}{
 		{"no name", map[string]string{"FLEET_URL": "u", "FLEET_SCOPE": "o/r"}, "runner name"},
 		{"no scope", map[string]string{"FLEET_RUNNER": "web-1"}, "repository or organisation"},
-		{"no credential", map[string]string{
+		{"nothing to register with", map[string]string{
 			"FLEET_RUNNER": "web-1", "FLEET_URL": "u", "FLEET_SCOPE": "o/r",
-		}, "credential"},
+		}, "nothing to register with"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -383,12 +383,25 @@ func TestFindRunnerHomeSaysWhereItLooked(t *testing.T) {
 	}
 }
 
-// A container is handed a token by the daemon rather than a credential of its
-// own, and must not leave it lying in the environment for the job to read.
-func TestTheMintedTokenIsTakenOutOfTheEnvironment(t *testing.T) {
-	t.Setenv("FLEET_REGISTRATION_TOKEN", "AAAA-registration")
-	c := Config{Runner: "api-1"}
+// A container is given a token by the daemon and no credential file, which is
+// the whole point — and it has to be enough on its own. It was not, and a
+// container that reached this point died saying it had no credential.
+func TestAMintedTokenIsEnoughOnItsOwn(t *testing.T) {
+	for key, value := range map[string]string{
+		"FLEET_RUNNER":             "api-1",
+		"FLEET_URL":                "https://github.com/o/r",
+		"FLEET_SCOPE":              "o/r",
+		"FLEET_RUNTIME":            "container",
+		"FLEET_CREDENTIAL_FILE":    "",
+		"FLEET_REGISTRATION_TOKEN": "AAAA-registration",
+	} {
+		t.Setenv(key, value)
+	}
 
+	c, err := ConfigFromEnv("")
+	if err != nil {
+		t.Fatalf("a container with a minted token was refused: %v", err)
+	}
 	if got := c.RegistrationToken(); got != "AAAA-registration" {
 		t.Fatalf("got %q", got)
 	}
@@ -397,16 +410,24 @@ func TestTheMintedTokenIsTakenOutOfTheEnvironment(t *testing.T) {
 	if left := os.Getenv("FLEET_REGISTRATION_TOKEN"); left != "" {
 		t.Fatalf("the token is still in the environment: %q", left)
 	}
-	if again := c.RegistrationToken(); again != "" {
-		t.Fatalf("it came back: %q", again)
-	}
 }
 
 // A machine has no minted token and mints for itself, which is what lets it
 // come back after a reboot with the daemon still down.
 func TestAMachineHasNoMintedToken(t *testing.T) {
-	t.Setenv("FLEET_REGISTRATION_TOKEN", "")
-	c := Config{Runner: "web-1"}
+	for key, value := range map[string]string{
+		"FLEET_RUNNER":             "web-1",
+		"FLEET_URL":                "https://github.com/o/r",
+		"FLEET_SCOPE":              "o/r",
+		"FLEET_CREDENTIAL_FILE":    "/run/runner-fleet/credentials/1",
+		"FLEET_REGISTRATION_TOKEN": "",
+	} {
+		t.Setenv(key, value)
+	}
+	c, err := ConfigFromEnv("")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got := c.RegistrationToken(); got != "" {
 		t.Fatalf("got %q", got)
 	}
