@@ -135,9 +135,11 @@ export function App() {
           <FleetPage
             runners={runners}
             pools={pools}
+            credentials={credentials}
             scaling={scaling}
             warnings={warnings}
             loading={loading}
+            onChange={refresh}
           />
         )}
         {page === 'pools' && (

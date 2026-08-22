@@ -1,27 +1,37 @@
 import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { MantineProvider } from '@mantine/core'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { FleetPage } from './FleetPage'
-import type { Pool, Runner, Scale } from '../api'
+import { api, type Credential, type Pool, type Runner, type Scale } from '../api'
+
+const credentials: Credential[] = [{ id: 1, name: 'pat', kind: 'pat', hint: '…1234', createdAt: '' }]
 
 function renderPage(
   runners: Runner[],
   warnings: string[] = [],
   pools: Pool[] = [],
   scaling: Record<string, Scale> = {},
+  onChange = vi.fn().mockResolvedValue(undefined),
 ) {
   return render(
     <MantineProvider>
       <FleetPage
         runners={runners}
         pools={pools}
+        credentials={credentials}
         scaling={scaling}
         warnings={warnings}
         loading={false}
+        onChange={onChange}
       />
     </MantineProvider>,
   )
 }
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 const pool = (over: Partial<Pool> = {}): Pool => ({
   id: 1,
@@ -129,6 +139,44 @@ describe('FleetPage', () => {
   it('leaves fixed-size pools out of the scaling panel', () => {
     renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })])
     expect(screen.queryByText('Scaling')).not.toBeInTheDocument()
+  })
+
+  // The runner is where the trouble shows up, so the pool that decides what it
+  // is should be one click away rather than a page away.
+  it('opens the definition of the pool a runner belongs to', async () => {
+    renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })])
+
+    await userEvent.click(screen.getByRole('button', { name: 'web' }))
+
+    expect(await screen.findByText('Edit web')).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveValue('web')
+    expect(screen.getByRole('textbox', { name: /Maximum runners/ })).toHaveValue('2')
+  })
+
+  it('saves a change of replicas made from the fleet', async () => {
+    const update = vi.spyOn(api, 'updatePool').mockResolvedValue(pool())
+    const onChange = vi.fn().mockResolvedValue(undefined)
+    renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })], {}, onChange)
+
+    await userEvent.click(screen.getByRole('button', { name: 'web' }))
+    const maximum = await screen.findByRole('textbox', { name: /Maximum runners/ })
+    await userEvent.clear(maximum)
+    await userEvent.type(maximum, '5')
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await vi.waitFor(() => expect(update).toHaveBeenCalled())
+    expect(update.mock.calls[0][0]).toBe(1)
+    expect(update.mock.calls[0][1]).toMatchObject({ minReplicas: 2, maxReplicas: 5 })
+    // The fleet reloads, so the row reflects the new bounds without a refresh.
+    await vi.waitFor(() => expect(onChange).toHaveBeenCalled())
+  })
+
+  // A runner outlives its pool while it drains, and there is no definition
+  // left to open for it.
+  it('leaves a runner whose pool is gone as plain text', () => {
+    renderPage([runner({ pool: 'retired' })], [], [pool()])
+    expect(screen.queryByRole('button', { name: 'retired' })).not.toBeInTheDocument()
+    expect(screen.getByText('retired')).toBeInTheDocument()
   })
 
   it('surfaces warnings rather than swallowing them', () => {
