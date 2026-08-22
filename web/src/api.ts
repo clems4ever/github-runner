@@ -142,6 +142,30 @@ export interface ActivityHistory {
   until: string
 }
 
+/**
+ * What one pool has run over a window.
+ *
+ * Both figures are observed rather than reported by GitHub: the daemon asks
+ * what each runner is doing once a reconcile pass and adds up what it was
+ * told. A job shorter than one pass is never seen. They are close enough to
+ * size a pool from and not exact enough to bill anybody for.
+ */
+export interface PoolJobs {
+  pool: string
+  jobs: number
+  /** Runner-time, not wall-clock: two runners busy for a minute is two minutes. */
+  seconds: number
+}
+
+/** One pool's tally for one UTC day. */
+export interface JobDay {
+  /** YYYY-MM-DD, UTC. */
+  day: string
+  pool: string
+  jobs: number
+  seconds: number
+}
+
 /** What the whole machine is doing. */
 export interface HostResources {
   cpus: number
@@ -286,6 +310,16 @@ export const api = {
       `/api/activity?hours=${hours}` +
         (pool ? `&pool=${encodeURIComponent(pool)}` : '') +
         (scope ? `&scope=${encodeURIComponent(scope)}` : ''),
+    ),
+
+  /**
+   * What each pool has run, over a window of whole UTC days. Kept for a
+   * quarter, unlike the activity history, because sizing is argued about with
+   * weeks of evidence rather than with this afternoon's.
+   */
+  jobs: (days: number) =>
+    request<{ pools: PoolJobs[]; days: JobDay[]; since: string; until: string }>(
+      `/api/jobs?days=${days}`,
     ),
 
   /** What the host and its runners are using, as of the daemon's last reading. */

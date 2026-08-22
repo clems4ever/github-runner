@@ -40,6 +40,7 @@ type Fleet interface {
 	CredentialFingerprint(ctx context.Context, id int64) (string, error)
 	Secret(ctx context.Context, id int64) (model.Secret, error)
 	RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error
+	RecordJobs(ctx context.Context, at time.Time, samples []model.JobSample) error
 }
 
 // GitHubClient is the part of GitHub the reconciler needs.
@@ -85,6 +86,19 @@ type Reconciler struct {
 	// for a few minutes rather than shedding a runner it was about to need.
 	busySince map[string]time.Time
 	scaling   map[string]Scale
+
+	// busyLast is which runners had a job on them at the previous pass, and
+	// lastPass is when that pass looked. Between them they are the whole of
+	// the job accounting's memory: a runner busy now that was not busy then
+	// has picked up a job, and the gap between the two is the time a runner
+	// still busy has been working for.
+	//
+	// In memory like busySince, and lost on a restart for the same reason it
+	// is not worth keeping: the cost is that jobs in flight are counted a
+	// second time when the daemon comes back, which is a handful of jobs
+	// against a tally kept in months.
+	busyLast map[string]bool
+	lastPass time.Time
 
 	// now is the clock, injectable so the autoscaler's timing can be tested
 	// without waiting for it.
@@ -164,6 +178,7 @@ func New(store Fleet, executors []Executor, newClient ClientFactory, writeSecret
 		log:         log,
 		poolOf:      map[string]string{},
 		busySince:   map[string]time.Time{},
+		busyLast:    map[string]bool{},
 		scaling:     map[string]Scale{},
 		now:         time.Now,
 	}
@@ -327,9 +342,12 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	return result
 }
 
-// record keeps one observation per pool for the activity history.
+// record keeps one observation per pool for the activity history, and adds
+// what this pass saw to the per-pool job tally.
 func (r *Reconciler) record(ctx context.Context, pools []model.Pool, byPool map[string][]Runner,
 	states map[string]github.State, scaling map[string]Scale, result *Result) {
+
+	at := r.now()
 
 	samples := make([]model.Sample, 0, len(pools))
 	for _, pool := range pools {
@@ -345,10 +363,82 @@ func (r *Reconciler) record(ctx context.Context, pools []model.Pool, byPool map[
 		}
 		samples = append(samples, sample)
 	}
-	if err := r.store.RecordSamples(ctx, r.now(), samples); err != nil {
+	if err := r.store.RecordSamples(ctx, at, samples); err != nil {
 		// History is worth having, not worth failing a pass over.
 		result.Errors = append(result.Errors, fmt.Sprintf("record what the fleet is doing: %v", err))
 	}
+
+	if err := r.store.RecordJobs(ctx, at, r.tally(at, pools, byPool, states)); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("record what the pools have run: %v", err))
+	}
+}
+
+// MaxGap is the longest interval one pass will account a busy runner's time to.
+//
+// The tally adds up runner-time a pass at a time, and a pass that lands ten
+// minutes after the last one usually means the daemon was not there for most
+// of it — it was stopped, or the host was asleep. Counting the whole gap as
+// work would invent time the fleet may never have spent, and under-reporting a
+// fleet nobody was watching is the honest direction to be wrong in.
+const MaxGap = 10 * time.Minute
+
+// tally is what this pass adds to the per-pool job accounting.
+//
+// A job is a runner seen with work on it that had none last time anybody
+// looked. That is the most a reconcile loop can know: it polls GitHub, so its
+// resolution is the interval between passes. A job shorter than one pass is
+// never seen, and two jobs run back to back on the same runner with no idle
+// pass between them count as one — which ephemeral runners, replaced after
+// every job, cannot do.
+//
+// The time is the same estimate seen from the side: a sum of rectangles one
+// pass wide, not a stopwatch on each job.
+func (r *Reconciler) tally(at time.Time, pools []model.Pool, byPool map[string][]Runner,
+	states map[string]github.State) []model.JobSample {
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var elapsed time.Duration
+	if !r.lastPass.IsZero() && at.After(r.lastPass) {
+		elapsed = min(at.Sub(r.lastPass), MaxGap)
+	}
+	r.lastPass = at
+
+	busy := make(map[string]bool, len(r.busyLast))
+	out := make([]model.JobSample, 0, len(pools))
+	for _, pool := range pools {
+		sample := model.JobSample{Pool: pool.Name}
+		for _, runner := range byPool[pool.Name] {
+			state, answered := states[runner.Name]
+			working := state == github.StateBusy
+			if !answered {
+				// Silence is not an answer. When GitHub could not be asked
+				// about a runner — the pool's credential failed, or the call
+				// errored — the previous reading is carried forward rather
+				// than read as idle: a job does not stop because the daemon
+				// could not ask about it, and reading the outage as idle would
+				// end every job in flight and start them all again when it
+				// cleared.
+				working = r.busyLast[runner.Name]
+			}
+			busy[runner.Name] = working
+			if !working {
+				continue
+			}
+			sample.BusySeconds += elapsed.Seconds()
+			if !r.busyLast[runner.Name] {
+				sample.Started++
+			}
+		}
+		out = append(out, sample)
+	}
+
+	// Rebuilt rather than updated, so a runner that has gone stops being
+	// remembered. An ephemeral pool replaces every runner after every job, and
+	// a map that only ever grew would end up holding the fleet's whole history.
+	r.busyLast = busy
+	return out
 }
 
 // statesForOrphans asks GitHub about runners that no pool claims.

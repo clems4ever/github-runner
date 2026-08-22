@@ -136,12 +136,33 @@ var migrations = []string{
 	// about them.
 	`ALTER TABLE samples ADD COLUMN scope TEXT NOT NULL DEFAULT ''`,
 	`UPDATE samples SET scope = COALESCE((SELECT scope FROM pools WHERE pools.name = samples.pool), '')`,
+	// How much work each pool has actually done, a day at a time.
+	//
+	// Added to in place rather than appended to: a pass every thirty seconds
+	// for a quarter would be a quarter of a million rows per pool, all to
+	// answer a question about days. One row per pool per day is small enough
+	// to keep for months, which is what the question needs — nobody decides a
+	// pool is too small on last night's evidence.
+	`CREATE TABLE pool_jobs (
+		day     TEXT NOT NULL,
+		pool    TEXT NOT NULL,
+		jobs    INTEGER NOT NULL,
+		seconds REAL NOT NULL,
+		PRIMARY KEY (day, pool)
+	)`,
 }
 
 // SampleRetention is how much history the daemon keeps. Two days covers "what
 // happened overnight" without turning the database into something that needs
 // managing.
 const SampleRetention = 48 * time.Hour
+
+// JobRetention is how long the per-pool job tally is kept. Far longer than the
+// samples above, and for a different reason: those are for looking at what the
+// fleet just did, this is the evidence somebody brings to an argument about
+// whether a pool needs to be bigger, and a quarter is about the span such an
+// argument covers.
+const JobRetention = 90 * 24 * time.Hour
 
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); err != nil {
@@ -819,6 +840,79 @@ func (s *Store) ActivityScopes(ctx context.Context, since, until time.Time) ([]s
 		scopes = append(scopes, scope)
 	}
 	return scopes, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Job accounting
+// ---------------------------------------------------------------------------
+
+// dayFormat is the key the job tally is kept under: a UTC date, which sorts
+// and compares as a string, so a window is a plain pair of comparisons and no
+// date arithmetic has to happen in SQLite.
+const dayFormat = "2006-01-02"
+
+// RecordJobs adds one pass's observations to the running per-pool tally and
+// prunes what has aged out.
+func (s *Store) RecordJobs(ctx context.Context, at time.Time, samples []model.JobSample) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	day := at.UTC().Format(dayFormat)
+	for _, sample := range samples {
+		// A pool that did nothing this pass adds nothing. That keeps an idle
+		// fleet from touching every pool's row twice a minute, and keeps a day
+		// out of the history entirely unless something happened on it — which
+		// is what lets a reader tell a pool that was quiet from a pool that
+		// was not there.
+		if sample.Started == 0 && sample.BusySeconds == 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO pool_jobs (day, pool, jobs, seconds) VALUES (?,?,?,?)
+			 ON CONFLICT(day, pool) DO UPDATE SET
+				jobs = jobs + excluded.jobs, seconds = seconds + excluded.seconds`,
+			day, sample.Pool, sample.Started, sample.BusySeconds); err != nil {
+			return err
+		}
+	}
+	// Pruned whether or not anything was written, so a fleet that goes quiet
+	// for a quarter still stops carrying the quarter before it.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pool_jobs WHERE day < ?`,
+		at.Add(-JobRetention).UTC().Format(dayFormat)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// JobHistory returns the tally over a window, one row per pool per day it did
+// something.
+//
+// Days a pool was idle are absent rather than zero, for the same reason an
+// empty bucket is left out of the activity chart: a pool nobody used and a
+// daemon nobody was running should not read the same, and the caller knows
+// which pools exist.
+func (s *Store) JobHistory(ctx context.Context, since, until time.Time) ([]model.JobDay, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT day, pool, jobs, seconds FROM pool_jobs
+		 WHERE day >= ? AND day <= ? ORDER BY day, pool`,
+		since.UTC().Format(dayFormat), until.UTC().Format(dayFormat))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []model.JobDay{}
+	for rows.Next() {
+		var day model.JobDay
+		if err := rows.Scan(&day.Day, &day.Pool, &day.Jobs, &day.Seconds); err != nil {
+			return nil, err
+		}
+		out = append(out, day)
+	}
+	return out, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

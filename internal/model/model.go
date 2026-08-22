@@ -420,6 +420,43 @@ type HostPoint struct {
 	DiskPercent   float64   `json:"diskPercent"`
 }
 
+// JobSample is what one reconcile pass saw of a pool's work.
+//
+// Nothing here is a stopwatch on a job. The daemon does not watch jobs; it asks
+// GitHub once a pass what each runner is doing and adds up what it was told,
+// so both figures are observations bounded by how often it asks.
+type JobSample struct {
+	Pool string
+	// Started counts the runners that have a job on them now and did not at
+	// the previous pass. A job that begins and ends between two passes is
+	// never seen at all.
+	Started int
+	// BusySeconds is runner-time rather than wall-clock: two runners busy for
+	// a minute is two minutes. That is the figure a pool is sized against,
+	// since it is what the pool would have had to be bigger to absorb.
+	BusySeconds float64
+}
+
+// PoolJobs is one pool's total over a window.
+type PoolJobs struct {
+	Pool    string  `json:"pool"`
+	Jobs    int     `json:"jobs"`
+	Seconds float64 `json:"seconds"`
+}
+
+// JobDay is one pool's total for one UTC day.
+//
+// A day rather than something finer, because this history is kept for a
+// quarter and the question it exists to answer — is this pool too small — is
+// argued with weeks of evidence. The activity chart is where a single burst is
+// looked at minute by minute, over a window of hours.
+type JobDay struct {
+	Day     string  `json:"day"`
+	Pool    string  `json:"pool"`
+	Jobs    int     `json:"jobs"`
+	Seconds float64 `json:"seconds"`
+}
+
 // Commitment is what the pools have promised the host, if every one of them
 // grew to its ceiling at once.
 //

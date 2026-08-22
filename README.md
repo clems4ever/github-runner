@@ -182,6 +182,42 @@ the fleet for two minutes is the thing worth seeing, and averaging over a
 ten-minute bucket would flatten it into nothing. Narrow it to a single pool
 with the filter, or leave it on the whole fleet.
 
+### Jobs
+
+Activity shows the last two days minute by minute. The **Jobs** page is the
+other question: how much work each pool has actually done over a quarter, which
+is what you argue about when deciding whether a pool needs to be bigger.
+
+Two numbers per pool. **Jobs** is how many the pool has been asked for. **Time
+on jobs** is what that took in *runner-time* — two runners busy for a minute is
+two minutes — which is the figure a pool would have had to be bigger to absorb.
+A pool sitting at the top of the table with a mean job of six seconds and a
+pool with the same total made of hour-long builds are different problems.
+
+The tally is kept per pool per UTC day and held for ninety days, so it survives
+the two-day activity window by a wide margin. Deleting a pool does not erase
+what it ran; the row stays, marked, because the host paid for that work either
+way.
+
+**These are observations, not GitHub's own accounting, and the page says so.**
+The daemon never sees a job. It asks GitHub what each runner is doing once per
+reconcile pass — every thirty seconds by default, `--interval` moves it — and a
+job is a runner with work on it that had none last time it looked. That has
+consequences worth knowing:
+
+- A job that starts and finishes inside one pass is never counted at all.
+  Shorten `--interval` and fewer are missed.
+- Time is a sum of intervals, not a stopwatch: a job is charged in whole passes.
+- Two jobs run back to back on the same runner with no idle pass between them
+  count as one. Ephemeral runners, replaced after every job, cannot do this.
+- A gap between passes longer than ten minutes is not counted at all. A daemon
+  that was stopped for an hour did not watch an hour of work, and saying it did
+  would be worse than saying nothing.
+- Restarting the daemon loses which runners were busy, so jobs in flight are
+  counted once more when it comes back.
+
+Good enough to size a pool from over weeks. Not an invoice.
+
 ### How quickly a machine comes back
 
 An ephemeral runner is replaced after every job, so the turnaround is paid once

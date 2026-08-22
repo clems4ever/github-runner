@@ -118,11 +118,32 @@ type fakeStore struct {
 	fingerprint string
 	tokenErr    error
 	samples     []model.Sample
+	// tallies is every pass's job accounting, in order, so a test can watch a
+	// job be picked up on one pass and still be running on the next.
+	tallies [][]model.JobSample
 }
 
 func (f *fakeStore) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {
 	f.samples = append(f.samples, samples...)
 	return nil
+}
+
+func (f *fakeStore) RecordJobs(ctx context.Context, at time.Time, samples []model.JobSample) error {
+	f.tallies = append(f.tallies, samples)
+	return nil
+}
+
+// tallyOf is the accounting for one pool on the most recent pass.
+func (f *fakeStore) tallyOf(pool string) model.JobSample {
+	if len(f.tallies) == 0 {
+		return model.JobSample{}
+	}
+	for _, sample := range f.tallies[len(f.tallies)-1] {
+		if sample.Pool == pool {
+			return sample
+		}
+	}
+	return model.JobSample{}
 }
 
 func (f *fakeStore) ListPools(ctx context.Context) ([]model.Pool, error) { return f.pools, nil }
@@ -467,6 +488,10 @@ func (s *splitStore) Secret(ctx context.Context, id int64) (model.Secret, error)
 
 func (s *splitStore) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {
 	return s.good.RecordSamples(ctx, at, samples)
+}
+
+func (s *splitStore) RecordJobs(ctx context.Context, at time.Time, samples []model.JobSample) error {
+	return s.good.RecordJobs(ctx, at, samples)
 }
 
 // Losing GitHub must not make the daemon destructive: without an answer about
