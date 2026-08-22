@@ -131,10 +131,36 @@ jobs:
           # The password the installer was given is the one it set.
           curl -fsS -u "admin:an-install-test-password" http://127.0.0.1:8080/api/pools >/dev/null
 
+      # Everything above installed the latest release, which is what the
+      # installer downloads and what people actually run. Everything below is
+      # about this build, so it goes in here — over the top of the release, which
+      # is also the upgrade every host performs.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      - name: Upgrade the install to this build
+        run: |
+          set -euo pipefail
+          go build -o /tmp/runner-fleet ./cmd/runner-fleet
+          sudo install -m 0755 /tmp/runner-fleet /usr/local/bin/runner-fleet
+          sudo systemctl restart runner-fleetd
+          for _ in $(seq 30); do
+            curl -fsS http://127.0.0.1:8080/api/health >/dev/null && break
+            sleep 1
+          done
+          systemctl is-active --quiet runner-fleetd
+
       # The same handover, on a real install: the daemon is root here, the
       # service user is one the installer created, and the directories a machine
       # agent reads from have to belong to it. Checked by being that user, not
       # by reading modes.
+      #
+      # And checked after an upgrade rather than a fresh install, because that is
+      # the harder case: the release that ran first left these root-owned, and a
+      # daemon that only fixed ownership on directories it created itself would
+      # leave every existing host broken.
       - name: A machine agent can reach what it needs
         run: |
           set -euo pipefail
