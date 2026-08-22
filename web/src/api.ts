@@ -42,6 +42,11 @@ export interface Runner {
   generation: string
   upToDate: boolean
   /**
+   * The host is bringing this runner up right now — launching it, or waiting
+   * out the restart delay between two machines.
+   */
+  coming?: boolean
+  /**
    * What the host says is wrong with this runner, when it says anything.
    *
    * A runner can be dead and look busy: a unit that crashes on startup spends

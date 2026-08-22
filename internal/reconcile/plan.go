@@ -79,6 +79,14 @@ type Runner struct {
 	ScopeKind    model.ScopeKind
 	Scope        string
 	CredentialID int64
+	// Coming says the host is bringing this runner up right now: a unit systemd
+	// is starting, or one waiting out its restart delay between two machines.
+	//
+	// It exists because an ephemeral runner spends the seconds between every
+	// pair of jobs in exactly that state, with no uptime to report because it
+	// is not up — which read as "unknown", the same word used for a runner that
+	// is never coming back.
+	Coming bool
 	// Up is how long this runner has been running, when the host knows. A
 	// machine takes a minute or two to boot and register, and a runner GitHub
 	// has not heard of yet is not the same as one it will never hear of.
