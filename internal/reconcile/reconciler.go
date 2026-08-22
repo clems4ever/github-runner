@@ -553,6 +553,12 @@ const Registering = 4 * time.Minute
 // jobOfARunnerGitHubHasNotSeen distinguishes a runner on its way up from one
 // that should be there and is not.
 func jobOfARunnerGitHubHasNotSeen(runner Runner) string {
+	// The host is bringing it up: between two machines, or launching one. This
+	// covers the seconds an ephemeral runner spends with nothing running at
+	// all, which is otherwise indistinguishable from a runner that has gone.
+	if runner.Coming {
+		return "starting"
+	}
 	if runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
 		return "starting"
 	}

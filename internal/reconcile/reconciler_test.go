@@ -620,8 +620,17 @@ func TestARunnerOnItsWayUpIsNotReportedAsUnknown(t *testing.T) {
 			"unknown",
 		},
 		{
-			// Nothing is starting: it is not running at all.
-			"stopped",
+			// The seconds between two machines: systemd is waiting out the
+			// restart delay, so nothing is running and there is no uptime to
+			// report. This is the window that showed "unknown" after every
+			// single job.
+			"between two machines",
+			Runner{Name: "web-1", State: StateStopped, Coming: true},
+			"starting",
+		},
+		{
+			// Stopped and nobody is bringing it back.
+			"stopped for good",
 			Runner{Name: "web-1", State: StateStopped, Up: 0},
 			"unknown",
 		},

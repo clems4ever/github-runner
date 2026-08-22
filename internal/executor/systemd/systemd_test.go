@@ -588,3 +588,95 @@ func field(t *testing.T, unit, key string) string {
 	t.Fatalf("the unit has no %s", key)
 	return ""
 }
+
+// Reproducing what the fleet page shows between two machines.
+//
+// An ephemeral runner is replaced after every job, and in the seconds between
+// them the unit is not running: systemd is waiting out RestartSec, which it
+// calls activating/auto-restart. The host says nothing about how long the
+// runner has been up, because it is not up, so the fleet calls it unknown —
+// the same word it uses for a runner that will never come back.
+func TestARunnerWaitingToBeRestartedSaysItIsComingBack(t *testing.T) {
+	now := time.Date(2026, 8, 22, 17, 0, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=activating",
+		"SubState=auto-restart",
+		"Result=success",
+		"NRestarts=3",
+		fmt.Sprintf("ActiveExitTimestamp=@%d", now.Add(-2*time.Second).Unix()),
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Still stopped as far as the reconciler is concerned — it is not running,
+	// and pretending otherwise is what hid a crash loop for a week.
+	if runners[0].State != reconcile.StateStopped {
+		t.Fatalf("state is %q", runners[0].State)
+	}
+	if !runners[0].Coming {
+		t.Fatal("a runner waiting out its restart delay is not reported as coming back," +
+			" so the fleet calls it unknown between every pair of jobs")
+	}
+}
+
+// And the first moment of a fresh unit, before systemd has recorded when it
+// became active: running, no uptime to report, and on its way up.
+func TestARunnerThatHasJustBeenStartedIsComingBack(t *testing.T) {
+	now := time.Date(2026, 8, 22, 17, 0, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=activating",
+		"SubState=start",
+		"Result=success",
+		"NRestarts=0",
+		"ActiveEnterTimestamp=",
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !runners[0].Coming {
+		t.Fatal("a unit systemd is still starting is not reported as coming back")
+	}
+}
+
+// A settled runner is not coming back, or every runner would look like it was
+// on its way up for ever.
+func TestASettledRunnerIsNotComingBack(t *testing.T) {
+	now := time.Date(2026, 8, 22, 17, 0, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=active",
+		"SubState=running",
+		"Result=success",
+		"NRestarts=0",
+		fmt.Sprintf("ActiveEnterTimestamp=@%d", now.Add(-time.Hour).Unix()),
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runners[0].Coming {
+		t.Fatal("a runner that has been up for an hour is reported as coming back")
+	}
+}

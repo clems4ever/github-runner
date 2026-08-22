@@ -335,6 +335,7 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 			if unit.state == reconcile.StateRunning {
 				runners[i].Up = unit.running
 			}
+			runners[i].Coming = unit.coming
 		}
 	}
 	sort.Slice(runners, func(i, j int) bool { return runners[i].Name < runners[j].Name })
@@ -352,6 +353,9 @@ type unit struct {
 	// or two to boot and register, and that is not the same thing as a runner
 	// GitHub has never heard of.
 	running time.Duration
+	// coming is systemd bringing it up: starting, or waiting out the restart
+	// delay between two machines.
+	coming bool
 }
 
 // patience is how long a drain can take before it is worth mentioning.
@@ -408,6 +412,11 @@ func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]u
 				restarts: count,
 				draining: e.since(leftActive),
 				running:  e.since(becameActive),
+				// Both sub-states of "activating" are on the way up: "start" is
+				// a unit systemd is launching, "auto-restart" is one waiting out
+				// RestartSec, which for an ephemeral runner is the gap between
+				// two machines.
+				coming: active == "activating",
 			}
 		}
 		id, active, sub, result, restarts, leftActive, becameActive = "", "", "", "", "", "", ""
