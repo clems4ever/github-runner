@@ -1,9 +1,28 @@
 name: release
 
+# Two ways in, one path out.
+#
+#   - push a tag         git tag v0.2.0 && git push origin v0.2.0
+#   - or press the button  Actions → release → Run workflow, pick patch/minor/major
+#
+# The button does the tagging itself rather than pushing a tag and hoping this
+# workflow runs again: a tag pushed by GITHUB_TOKEN deliberately does not
+# trigger other workflows, so a two-step version would create the tag and then
+# quietly release nothing.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to raise
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: Or an exact version, like v1.2.0 (overrides the choice above)
+        type: string
+        required: false
 
 permissions:
   contents: write
@@ -14,7 +33,56 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # goreleaser reads the tag history to work out the version and the
+          # changelog, so a shallow clone is not enough.
           fetch-depth: 0
+
+      # Releases come from main. A release cut from a branch is almost always
+      # a mistake, and it is one that is awkward to take back once the tag is
+      # public.
+      - name: Check the branch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::releases are cut from main; this ran on ${GITHUB_REF#refs/heads/}"
+          exit 1
+
+      - name: Work out the version
+        if: github.event_name == 'workflow_dispatch'
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXPLICIT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$EXPLICIT" ]; then
+            version=$EXPLICIT
+          else
+            latest=$(git tag --list 'v*' --sort=-v:refname | head -1)
+            latest=${latest:-v0.0.0}
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            case "$BUMP" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            version="v${major}.${minor}.${patch}"
+            echo "the last release was ${latest}"
+          fi
+
+          # A tag that already exists means someone released this version
+          # already; moving it would change what people have installed.
+          if git rev-parse "$version" >/dev/null 2>&1; then
+            echo "::error::${version} already exists"
+            exit 1
+          fi
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::${version} is not vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "### Releasing ${version}" >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/setup-go@v6
         with:
@@ -33,6 +101,21 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+          npm --prefix web ci
+          npm --prefix web test
+
+      # Tagged only once the tests have passed, so a failed release leaves no
+      # tag behind to clean up.
+      - name: Tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "runner-fleet ${VERSION}"
+          git push origin "$VERSION"
 
       - uses: goreleaser/goreleaser-action@v6
         with:
@@ -40,3 +123,16 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Say where it went
+        run: |
+          version=${{ steps.version.outputs.version || github.ref_name }}
+          {
+            echo "Released **${version}**."
+            echo
+            echo '```bash'
+            echo 'curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sudo bash'
+            echo '```'
+            echo
+            echo "Rerunning that on a host that already has it is an upgrade, and the runners keep going."
+          } >> "$GITHUB_STEP_SUMMARY"

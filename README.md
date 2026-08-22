@@ -239,6 +239,21 @@ gracefully, as each finishes the job it is on.
 | `gh-runner@NAME.service` | one runner |
 | `runner-fleetd.service` | the daemon |
 
+## Cutting a release
+
+**Actions → release → Run workflow**, and pick `patch`, `minor` or `major` — or
+type an exact version. It runs the suite first and only tags if that passes, so
+a failed release leaves no tag behind, then builds both architectures and
+publishes the archives with their checksums.
+
+A tag pushed by hand does the same thing:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Releases are cut from `main`; the workflow refuses to run anywhere else.
+
 ## Development
 
 ```bash
