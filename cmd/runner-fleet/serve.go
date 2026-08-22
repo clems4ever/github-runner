@@ -87,11 +87,34 @@ func serveCommand(args []string) error {
 	// A buffered channel of one: several changes arriving together collapse
 	// into a single extra pass rather than queueing up.
 	nudge := make(chan struct{}, 1)
+	newGitHub := func(secret model.Secret) (*github.Client, error) {
+		return github.NewFromSecret(github.Secret{
+			IsAppCredential: secret.IsApp(),
+			Token:           secret.Token,
+			AppID:           secret.AppID,
+			InstallationID:  secret.InstallationID,
+		})
+	}
+
 	server := api.New(api.Options{
 		Store:   db,
 		Fleet:   reconciler,
 		UI:      uiAssets(log),
 		Version: version,
+		// Asked when a pool is saved, so a credential that cannot serve it is
+		// caught while someone is looking at the form rather than a minute
+		// later in a log.
+		CheckAccess: func(ctx context.Context, credentialID int64, scope github.Scope) error {
+			secret, err := db.Secret(ctx, credentialID)
+			if err != nil {
+				return err
+			}
+			client, err := newGitHub(secret)
+			if err != nil {
+				return err
+			}
+			return client.CheckAccess(ctx, scope)
+		},
 		Nudge: func() {
 			select {
 			case nudge <- struct{}{}:

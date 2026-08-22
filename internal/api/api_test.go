@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
 	"github.com/clems4ever/github-runner/internal/secrets"
@@ -36,12 +38,13 @@ func (f *stubFleet) Once(ctx context.Context) reconcile.Result {
 func (f *stubFleet) Scaling() map[string]reconcile.Scale { return f.scaling }
 
 type harness struct {
-	t      *testing.T
-	server *httptest.Server
-	store  *store.Store
-	fleet  *stubFleet
-	nudges int
-	credID int64
+	t           *testing.T
+	server      *httptest.Server
+	store       *store.Store
+	fleet       *stubFleet
+	nudges      int
+	credID      int64
+	checkAccess func(context.Context, int64, github.Scope) error
 }
 
 func newHarness(t *testing.T) *harness {
@@ -62,6 +65,12 @@ func newHarness(t *testing.T) *harness {
 		Store: db, Fleet: h.fleet, Version: "test",
 		UI:    fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html>fleet</html>")}},
 		Nudge: func() { h.nudges++ },
+		CheckAccess: func(ctx context.Context, id int64, scope github.Scope) error {
+			if h.checkAccess == nil {
+				return nil
+			}
+			return h.checkAccess(ctx, id, scope)
+		},
 	})
 	if err := srv.Auth().SetPassword(context.Background(), "admin", "correct-horse"); err != nil {
 		t.Fatal(err)
@@ -550,5 +559,74 @@ func TestActivityDefaultsToARecentWindow(t *testing.T) {
 	payload := readAll(t, h.do("GET", "/api/activity", nil))
 	if !strings.Contains(payload, `"points"`) {
 		t.Fatalf("got %s", payload)
+	}
+}
+
+// A pool whose credential cannot serve it is refused while someone is looking
+// at the form, rather than created and left failing in a log a minute later.
+func TestAPoolTheCredentialCannotServeIsRefused(t *testing.T) {
+	h := newHarness(t)
+	h.checkAccess = func(ctx context.Context, credentialID int64, scope github.Scope) error {
+		return &github.Error{
+			Status: http.StatusNotFound, Scope: scope.Path, Message: "Not Found",
+			Advice:   "the app is authenticated but has no installation covering " + scope.Path,
+			GrantURL: "https://github.com/settings/installations/42",
+		}
+	}
+
+	resp := h.do("POST", "/api/pools", h.samplePool())
+	payload := readAll(t, resp)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("answered %d: %s", resp.StatusCode, payload)
+	}
+	// The page that fixes it travels with the refusal: an app cannot widen its
+	// own access, so the most the daemon can do is put that one click away.
+	if !strings.Contains(payload, "settings/installations/42") {
+		t.Fatalf("no way to fix it was offered: %s", payload)
+	}
+	if !strings.Contains(payload, "no installation covering") {
+		t.Fatalf("the reason was lost: %s", payload)
+	}
+
+	// And nothing was stored, so there is no half-working pool to clean up.
+	pools := readAll(t, h.do("GET", "/api/pools", nil))
+	if strings.Contains(pools, `"name":"web"`) {
+		t.Fatalf("the pool was created anyway: %s", pools)
+	}
+}
+
+// A daemon that cannot reach GitHub must not stop someone configuring their
+// fleet: the pool will work when the network does.
+func TestAPoolIsAllowedWhenGitHubCannotBeReached(t *testing.T) {
+	h := newHarness(t)
+	h.checkAccess = func(context.Context, int64, github.Scope) error {
+		return errors.New("dial tcp: no route to host")
+	}
+	resp := h.do("POST", "/api/pools", h.samplePool())
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("a network problem blocked configuration: %d", resp.StatusCode)
+	}
+}
+
+// A pool that is switched off is not going to register anything, so there is
+// nothing to check and no reason to refuse it.
+func TestADisabledPoolIsNotChecked(t *testing.T) {
+	h := newHarness(t)
+	var asked bool
+	h.checkAccess = func(context.Context, int64, github.Scope) error {
+		asked = true
+		return &github.Error{Status: http.StatusNotFound, Message: "Not Found"}
+	}
+	pool := h.samplePool()
+	pool["enabled"] = false
+
+	resp := h.do("POST", "/api/pools", pool)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("answered %d", resp.StatusCode)
+	}
+	if asked {
+		t.Error("it asked GitHub about a pool that is switched off")
 	}
 }

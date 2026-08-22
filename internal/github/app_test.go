@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -428,3 +429,98 @@ func TestUnauthorizedMentionsTheAppSpecificCauses(t *testing.T) {
 }
 
 var _ = model.CredentialApp
+
+// An app cannot widen its own access — GitHub does not allow it, which is the
+// point of installing on selected repositories. The most this can do is put the
+// page that fixes it one click away.
+func TestCheckAccessPointsAtTheInstallationToFix(t *testing.T) {
+	key, encoded := testKey(t)
+	fake := &fakeApp{t: t, key: key, expiresIn: time.Hour, installed: false}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations" {
+			w.Write([]byte(`[{"id":42,"html_url":"https://github.com/settings/installations/42"}]`))
+			return
+		}
+		fake.handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := NewApp(123456, encoded, 0, WithBaseURL(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = client.CheckAccess(context.Background(), repoScope())
+	if err == nil {
+		t.Fatal("a repository the app cannot see was reported as fine")
+	}
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("want a *github.Error, got %T", err)
+	}
+	if apiErr.GrantURL != "https://github.com/settings/installations/42" {
+		t.Fatalf("grant URL is %q, want the installation's own page", apiErr.GrantURL)
+	}
+}
+
+// With more than one installation there is no single right page, so it falls
+// back to the list rather than guessing.
+func TestGrantURLFallsBackToTheList(t *testing.T) {
+	key, encoded := testKey(t)
+	fake := &fakeApp{t: t, key: key, expiresIn: time.Hour, installed: false}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/app/installations" {
+			w.Write([]byte(`[{"id":1,"html_url":"https://github.com/settings/installations/1"},
+			                 {"id":2,"html_url":"https://github.com/settings/installations/2"}]`))
+			return
+		}
+		fake.handler().ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, _ := NewApp(1, encoded, 0, WithBaseURL(srv.URL))
+	err := client.CheckAccess(context.Background(), repoScope())
+	var apiErr *Error
+	errors.As(err, &apiErr)
+	if apiErr.GrantURL != "https://github.com/settings/installations" {
+		t.Fatalf("got %q", apiErr.GrantURL)
+	}
+}
+
+// A credential that works says so, and the check exercises the permission the
+// daemon will actually use rather than merely proving the credential exists.
+func TestCheckAccessPassesWhenTheAppCanSeeTheRepository(t *testing.T) {
+	client, fake := newAppClient(t, 42)
+	if err := client.CheckAccess(context.Background(), repoScope()); err != nil {
+		t.Fatalf("a working credential was refused: %v", err)
+	}
+	var listed bool
+	fake.mu.Lock()
+	for _, request := range fake.requests {
+		if strings.Contains(request, "/actions/runners") {
+			listed = true
+		}
+	}
+	fake.mu.Unlock()
+	if !listed {
+		t.Fatalf("it did not exercise the runners permission: %v", fake.requests)
+	}
+}
+
+// A token has no installation page, so there is nothing to link to — the
+// message stands on its own.
+func TestCheckAccessForATokenHasNoGrantURL(t *testing.T) {
+	client, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(`{"message":"Not Found"}`))
+	})
+	err := client.CheckAccess(context.Background(), repoScope())
+	var apiErr *Error
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("got %T", err)
+	}
+	if apiErr.GrantURL != "" {
+		t.Fatalf("a token was given an installation page: %q", apiErr.GrantURL)
+	}
+}
