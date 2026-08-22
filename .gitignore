@@ -11,3 +11,6 @@ node_modules/
 # failing to compile.
 internal/ui/dist/*
 !internal/ui/dist/.gitkeep
+
+# TypeScript build cache
+*.tsbuildinfo
