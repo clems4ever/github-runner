@@ -48,6 +48,33 @@ jobs:
       - run: npm --prefix web run build
       - run: npm --prefix web test
 
+  # The tests beside the code fake Docker, which checks this code against its
+  # author's assumptions. This job checks the assumptions: it runs a real
+  # container from the real runner image, which is the only thing that can say
+  # the runner is where we think it is, that what the container is given can be
+  # read, and that the agent accepts what the daemon sends it.
+  #
+  # It has been lost once already — added in a commit after a pull request's
+  # last CI run, then dropped by a merge from a branch that predated it — and in
+  # the window where it did not exist, two of the three bugs it covers shipped.
+  # If this job is ever missing from this file again, that is the bug.
+  container-runner:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      # Pulled here rather than inside the test, so a slow pull reads as a slow
+      # step instead of a mysterious timeout.
+      - name: Pull the runner image
+        run: docker pull ghcr.io/actions/actions-runner:latest
+
+      - name: Run a real container runner
+        run: go test -tags docker -v -timeout 15m ./internal/executor/docker/
+
   installer:
     runs-on: ubuntu-latest
     steps:

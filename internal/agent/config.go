@@ -44,6 +44,9 @@ type Config struct {
 	CredentialKind model.CredentialKind
 	AppID          int64
 	InstallationID int64
+	// minted is a registration token the daemon produced for this runner,
+	// which a container gets instead of a credential of its own.
+	minted string
 }
 
 // ConfigFromEnv reads the runner's configuration out of its environment.
@@ -73,14 +76,28 @@ func ConfigFromEnv(name string) (Config, error) {
 		c.Labels = strings.Split(labels, ",")
 	}
 
+	// Read once and removed from the environment here, before anything else
+	// runs: everything this process starts inherits that environment, and the
+	// job is one of them.
+	c.minted = os.Getenv("FLEET_REGISTRATION_TOKEN")
+	if c.minted != "" {
+		_ = os.Unsetenv("FLEET_REGISTRATION_TOKEN")
+	}
+
 	if c.Runner == "" {
 		return c, fmt.Errorf("no runner name: pass --name, or set FLEET_RUNNER")
 	}
 	if c.URL == "" || c.Scope == "" {
 		return c, fmt.Errorf("%s: no repository or organisation to register on", c.Runner)
 	}
-	if c.CredentialFile == "" {
-		return c, fmt.Errorf("%s: no credential file. A runner registers afresh on every start, so it needs a credential that can mint registration tokens", c.Runner)
+	// Either is enough, and which one depends on the runtime. A machine holds
+	// the credential and mints for itself, so it can come back after a reboot
+	// with the daemon still down. A container is handed a token the daemon
+	// minted, because a container shares everything with the job it runs and
+	// must not be given a credential that administers repositories.
+	if c.CredentialFile == "" && c.minted == "" {
+		return c, fmt.Errorf("%s: nothing to register with. A runner needs either a credential that can "+
+			"mint registration tokens, or a token minted for it", c.Runner)
 	}
 	if c.CredentialKind == model.CredentialApp && c.AppID == 0 {
 		return c, fmt.Errorf("%s: an app credential without an app id", c.Runner)
@@ -98,15 +115,7 @@ func ConfigFromEnv(name string) (Config, error) {
 // the job is inside the guest and the credential never is — so a VM keeps the
 // credential and mints for itself, which is what lets it come back after a
 // reboot with the daemon still down.
-func (c Config) RegistrationToken() string {
-	token := os.Getenv("FLEET_REGISTRATION_TOKEN")
-	if token != "" {
-		// Taken out of the environment as it is read: everything this process
-		// starts inherits that environment, and the job is one of them.
-		_ = os.Unsetenv("FLEET_REGISTRATION_TOKEN")
-	}
-	return token
-}
+func (c Config) RegistrationToken() string { return c.minted }
 
 // Token reads the credential the daemon left for this runner.
 //
