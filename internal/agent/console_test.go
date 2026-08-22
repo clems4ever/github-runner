@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/clems4ever/github-runner/internal/model"
 )
 
 // deprecatedConsole is the real thing, from a host where every machine had been
@@ -153,5 +155,39 @@ func TestAMachineRunnerMayUpdateItself(t *testing.T) {
 	// request that prompts it.
 	if RunnerVersion < "2.336.0" {
 		t.Errorf("the image carries runner %s, and GitHub deprecates old ones server-side", RunnerVersion)
+	}
+}
+
+// A workflow written for a GitHub-hosted runner assumes passwordless sudo, and
+// most of them use it: installing a package, writing outside the workspace,
+// starting a service. Without it the job fails with "runner is not in the
+// sudoers file", which reads like the workflow's fault and is not.
+func TestAJobCanSudoInsideTheMachine(t *testing.T) {
+	script := provisionScript()
+
+	if !strings.Contains(script, "runner ALL=(ALL) NOPASSWD:ALL") {
+		t.Fatal("the runner user has no sudo, and every job that needs root fails")
+	}
+	if !strings.Contains(script, "/etc/sudoers.d/runner") {
+		t.Error("the rule is not in sudoers.d, so it will not survive an update of /etc/sudoers")
+	}
+	// 0440, because sudo refuses to read a sudoers file anybody can write.
+	if !strings.Contains(script, "chmod 0440 /etc/sudoers.d/runner") {
+		t.Error("the sudoers file is not 0440 and sudo will refuse it")
+	}
+	// A malformed sudoers file locks sudo for everybody, so the build checks it
+	// rather than every job discovering it.
+	if !strings.Contains(script, "visudo -c -f /etc/sudoers.d/runner") {
+		t.Error("the sudoers file is never validated")
+	}
+}
+
+// Changing what a machine is made of has to replace the machines that were
+// made of the old thing. The generation covers what an operator configured, not
+// what the daemon does with it, so this constant is the only thing that can.
+func TestTheSpecRevisionMovedWithTheImage(t *testing.T) {
+	if model.SpecRevision < 3 {
+		t.Fatalf("spec revision %d: machines built before sudo and the runner bump are still"+
+			" wanted, so nothing replaces them", model.SpecRevision)
 	}
 }

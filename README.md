@@ -170,8 +170,9 @@ with the filter, or leave it on the whole fleet.
 
 ### Virtual machines or containers
 
-A **virtual machine** gives a job its own kernel, its own Docker daemon and a
-disk that is thrown away afterwards. It boots in seconds from a golden image
+A **virtual machine** gives a job its own kernel, its own Docker daemon, a disk
+that is thrown away afterwards, and passwordless `sudo` — a workflow written for
+a GitHub-hosted runner runs unchanged. It boots in seconds from a golden image
 built once per host.
 
 A **container** starts faster and costs less, and is a weaker boundary: a job

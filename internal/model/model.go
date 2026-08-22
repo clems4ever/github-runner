@@ -227,7 +227,10 @@ func (p *Pool) EffectiveLabels() []string {
 //	2  containers take a minted registration token instead of the credential,
 //	   find the runner by looking for config.sh, and are replaced rather than
 //	   restarted
-const SpecRevision = 2
+//	3  machines carry a runner GitHub has not deprecated, may update it
+//	   themselves, and give the job passwordless sudo — a machine built before
+//	   this either cannot take work at all or fails every job that needs root
+const SpecRevision = 3
 
 // Generation is a hash of everything a runner is built from. The reconciler
 // stamps it on each runner it creates and compares it later: a runner whose

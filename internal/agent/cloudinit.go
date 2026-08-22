@@ -126,6 +126,22 @@ set -euo pipefail
 # The runner refuses to run as root, so it gets a user of its own.
 id runner >/dev/null 2>&1 || useradd -m -s /bin/bash runner
 
+# And passwordless sudo, because a workflow written for a GitHub-hosted runner
+# assumes it. Installing a package, writing outside the workspace, starting a
+# service: all of it is "sudo apt-get install ..." in somebody's yaml, and
+# without this every one of those jobs fails with "runner is not in the sudoers
+# file" — which is not a sentence anyone reads as "your runner is misconfigured".
+#
+# The machine is the boundary here, not the user. A job already has a kernel of
+# its own and a disk that is destroyed afterwards, so root inside it buys an
+# attacker nothing they did not already have. That is the whole reason a VM pool
+# exists.
+echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner
+chmod 0440 /etc/sudoers.d/runner
+# A malformed sudoers file locks sudo for everybody, so it is checked here where
+# the failure stops the image build rather than in every job that needs root.
+visudo -c -f /etc/sudoers.d/runner
+
 # Docker for jobs: a daemon inside the machine, so nothing is shared with the
 # host the way a mounted socket would be.
 usermod -aG docker runner
