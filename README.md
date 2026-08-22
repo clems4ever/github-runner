@@ -301,8 +301,28 @@ gracefully, as each finishes the job it is on.
 | `/etc/runner-fleet/runners/` | one environment file per VM runner |
 | `/run/runner-fleet/credentials/` | decrypted tokens, on tmpfs |
 | `/var/lib/runner-fleet/` | golden images and VM disks |
+| `/var/lib/runner-fleet/consoles/` | the last console of each machine, kept after it is gone |
 | `gh-runner@NAME.service` | one runner |
 | `runner-fleetd.service` | the daemon |
+
+## When a runner will not come up
+
+The Fleet page says `failing` beside a runner the host is refusing to keep
+running, with what went wrong and the command that explains it. Two places have
+the detail:
+
+```bash
+sudo journalctl -u gh-runner@web-1 -n 50     # the agent, on the host
+sudo cat /var/lib/runner-fleet/consoles/web-1.log   # inside the machine
+```
+
+A machine is rebuilt from scratch on every start, so its console would go with
+it — the last one is kept there instead, which is the only account of what
+happened inside a machine that has already gone.
+
+A machine that powers off without its runner ever being able to take a job is
+reported as a failure rather than treated as a runner finishing, so a fleet that
+is looping does not look like a fleet that is working.
 
 ## Cutting a release
 
