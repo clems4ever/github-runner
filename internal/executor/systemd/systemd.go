@@ -140,10 +140,13 @@ Documentation=https://github.com/clems4ever/github-runner
 After=network-online.target
 Wants=network-online.target
 
-# A runner that cannot register would otherwise restart every fifteen seconds
-# for ever. Ten starts in five minutes is clear of normal ephemeral churn.
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# A runner that cannot work would otherwise restart for ever. The window is
+# sized for the healthy case rather than against it: an ephemeral machine takes
+# about thirty seconds to come back between jobs, so a busy pool does twenty
+# starts in ten minutes and must not be mistaken for a crash loop. A machine
+# that fails immediately does its thirty in a couple of minutes and is stopped.
+StartLimitIntervalSec=600
+StartLimitBurst=30
 
 [Service]
 Type=simple
@@ -154,7 +157,12 @@ EnvironmentFile=%s/%%i.env
 ExecStart=%s agent --name %%i
 
 Restart=always
-RestartSec=15
+# Two seconds, not fifteen. An ephemeral runner is replaced after every single
+# job, so this delay is paid by every job on the host — it was a third of the
+# gap between one finishing and the next being able to start. The start limiter
+# above is what protects the host from a runner that cannot work, and it does
+# that job better than a long delay does.
+RestartSec=2
 
 # SIGTERM must reach the agent alone. QEMU daemonises itself but stays in the
 # service cgroup, so the default would signal it directly — the equivalent of

@@ -168,6 +168,28 @@ the fleet for two minutes is the thing worth seeing, and averaging over a
 ten-minute bucket would flatten it into nothing. Narrow it to a single pool
 with the filter, or leave it on the whole fleet.
 
+### How quickly a machine comes back
+
+An ephemeral runner is replaced after every job, so the turnaround is paid once
+per job. It is about half a minute, and it is worth knowing what it is made of:
+
+| | |
+| --- | --- |
+| systemd's restart delay | 2s |
+| overlay disk, registration token, seed image | 1–2s |
+| the guest booting to *Listening for Jobs* | ~16s |
+
+The image is built for that: a machine boots for one job and is destroyed, so
+the services a stock cloud image starts and a runner never uses — snapd, modem
+and disk managers, the daily apt timers — are turned off in the golden image.
+
+If half a minute matters for your pool, the lever is **capacity, not speed**.
+A pool whose minimum is two always has a registered machine waiting while the
+other one recycles, so a queue never pays the turnaround at all. Turning
+**ephemeral** off is the other end of that trade: the machine is reused between
+jobs and the boot disappears entirely, at the cost of a job seeing what the
+last one left behind.
+
 ### Virtual machines or containers
 
 A **virtual machine** gives a job its own kernel, its own Docker daemon, a disk
@@ -320,6 +342,16 @@ sudo cat /var/lib/runner-fleet/consoles/web-1.log   # inside the machine
 A machine is rebuilt from scratch on every start, so its console would go with
 it — the last one is kept there instead, which is the only account of what
 happened inside a machine that has already gone.
+
+To look inside a machine that is still up, the daemon keeps a key for exactly
+that. The port is in the agent's log line for that runner:
+
+```bash
+journalctl -u gh-runner@web-1 | grep booting        # ssh_port=43209
+ssh -i /var/lib/runner-fleet/ssh/id_ed25519 -p 43209 ubuntu@127.0.0.1
+systemd-analyze blame | head            # where a boot went
+journalctl -u github-runner              # the runner itself
+```
 
 A machine that powers off without its runner ever being able to take a job is
 reported as a failure rather than treated as a runner finishing, so a fleet that

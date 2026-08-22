@@ -549,3 +549,42 @@ func TestListSaysHowLongARunnerHasBeenUp(t *testing.T) {
 		t.Fatalf("up for %s, want 40s", runners[0].Up)
 	}
 }
+
+// An ephemeral machine is replaced after every job, so the restart delay is
+// paid by every job on the host, and the start limiter has to be sized for a
+// pool that is working rather than one that is broken.
+func TestTheRestartPolicySuitsAFleetThatIsBusy(t *testing.T) {
+	e, _, _ := newExecutor(t)
+	unit := e.renderUnit()
+
+	if !strings.Contains(unit, "RestartSec=2") {
+		t.Error("the restart delay is long enough to be noticed once per job")
+	}
+
+	// Thirty starts in ten minutes: a machine that comes back in ~30s does
+	// twenty and lives; one that fails at once does thirty in a couple of
+	// minutes and is stopped.
+	interval, burst := field(t, unit, "StartLimitIntervalSec="), field(t, unit, "StartLimitBurst=")
+	if interval != "600" || burst != "30" {
+		t.Fatalf("start limiter is %s starts per %ss", burst, interval)
+	}
+
+	// The healthy case has to fit inside the window with room to spare, or a
+	// busy pool stops itself.
+	const secondsPerJob = 30
+	if starts := 600 / secondsPerJob; starts >= 30 {
+		t.Fatalf("a pool doing a job every %ds does %d starts per window and would be"+
+			" mistaken for a crash loop", secondsPerJob, starts)
+	}
+}
+
+func field(t *testing.T, unit, key string) string {
+	t.Helper()
+	for _, line := range strings.Split(unit, "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), key); ok {
+			return value
+		}
+	}
+	t.Fatalf("the unit has no %s", key)
+	return ""
+}

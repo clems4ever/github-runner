@@ -182,6 +182,24 @@ chown -R runner:runner /home/runner
 # Unattended upgrades would fight the job for the package lock and reboot the
 # machine underneath it. The machine is replaced rather than patched.
 systemctl disable --now unattended-upgrades.service 2>/dev/null || true
+
+# A machine boots for one job and is destroyed, and every second of that boot is
+# paid by every job on the host. These are the services a cloud image starts by
+# default that a runner has no use for: hardware managers for hardware that does
+# not exist, a snap daemon for packages nobody installs, a boot splash on a
+# machine with no screen, and timers whose whole purpose is to do work later on
+# a machine that will not exist later.
+#
+# Disabled rather than masked, so a job that genuinely wants one can start it.
+for unit in \
+  snapd.service snapd.seeded.service snapd.socket snapd.apparmor.service \
+  ModemManager.service udisks2.service multipathd.service multipathd.socket \
+  lvm2-monitor.service ubuntu-fan.service plymouth-quit-wait.service \
+  apt-daily.timer apt-daily-upgrade.timer motd-news.timer fwupd-refresh.timer \
+  e2scrub_all.timer man-db.timer dpkg-db-backup.timer update-notifier-download.timer
+do
+  systemctl disable "$unit" 2>/dev/null || true
+done
 apt-get clean
 
 touch /var/lib/runner-fleet-image-ready
