@@ -131,43 +131,153 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 
-	select {
-	case err := <-exited:
-		// The machine powered itself off. Usually that is the runner finishing
-		// — the job did, on an ephemeral runner — and this agent is done.
-		//
-		// But it is also what a machine does when its runner cannot work at
-		// all: the runner exits, the guest's unit powers the machine off, and
-		// systemd here starts another one. That loop is indistinguishable from
-		// healthy churn from the outside, and it ran for hours on a real host
-		// while the fleet showed a runner in perfect health. So the console is
-		// kept and asked whether the runner ever got as far as being able to
-		// accept a job.
-		kept := keepConsole(c.StateDir, c.Runner, options.Console)
-		if problem := whyItCouldNotWork(options.Console); problem != "" {
-			return fmt.Errorf("the machine powered off without the runner ever listening for jobs: %s"+
-				" (its console is at %s)", problem, kept)
+	press := func() error {
+		if err := powerDown(options.QMPSocket); err != nil {
+			// The monitor is the polite route. Without it the only thing left
+			// is a signal to QEMU, which is a power cut.
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			return err
 		}
-		log.Info("the machine powered off", "runner", c.Runner)
-		return ignoreCleanExit(err)
+		return nil
+	}
 
-	case <-ctx.Done():
-		log.Info("stopping: asking the machine to shut down and waiting for the job in flight", "runner", c.Runner)
-		return drain(exited, drainOptions{
-			press: func() error {
-				if err := powerDown(options.QMPSocket); err != nil {
-					// The monitor is the polite route. Without it the only
-					// thing left is a signal to QEMU, which is a power cut.
-					_ = cmd.Process.Signal(syscall.SIGTERM)
-					return err
-				}
-				return nil
-			},
-			kill:   func() { _ = cmd.Process.Kill() },
-			runner: c.Runner,
-			log:    log,
+	stopped, err := waitForMachine(ctx, exited, watchOptions{
+		console: options.Console,
+		press:   press,
+		kill:    func() { _ = cmd.Process.Kill() },
+		runner:  c.Runner,
+		log:     log,
+	})
+
+	// Stopped on purpose — drained by the fleet, or because it outlived its
+	// runner. Either way the reason is already logged and the console is not
+	// evidence of anything.
+	if stopped {
+		keepConsole(c.StateDir, c.Runner, options.Console)
+		return err
+	}
+
+	// It went by itself. Usually that is the runner finishing — the job did, on
+	// an ephemeral runner — and this agent is done. But it is also what a
+	// machine does when its runner cannot work at all, and that loop is
+	// indistinguishable from healthy churn from the outside. So the console is
+	// kept and asked which it was.
+	kept := keepConsole(c.StateDir, c.Runner, options.Console)
+	if problem := whyItCouldNotWork(options.Console); problem != "" {
+		return fmt.Errorf("the machine powered off without the runner ever listening for jobs: %s"+
+			" (its console is at %s)", problem, kept)
+	}
+	log.Info("the machine powered off", "runner", c.Runner)
+	return ignoreCleanExit(err)
+}
+
+// watchOptions is what watching a running machine needs, injected so the
+// watching can be tested without QEMU.
+type watchOptions struct {
+	console string
+	press   func() error
+	kill    func()
+	runner  string
+	log     *slog.Logger
+	// check and linger default to consoleCheck and lingerGrace.
+	check  time.Duration
+	linger time.Duration
+	// interval and grace are passed on to the drain.
+	interval, grace time.Duration
+}
+
+// waitForMachine waits for a machine to go, and stops it when it should have
+// gone and has not.
+//
+// It reports whether the machine had to be stopped, because that changes what
+// its console means: a machine that went by itself may have gone for a bad
+// reason worth reading, and one that was stopped went because it was told to.
+func waitForMachine(ctx context.Context, exited <-chan error, o watchOptions) (stopped bool, err error) {
+	check, linger := o.check, o.linger
+	if check == 0 {
+		check = consoleCheck
+	}
+	if linger == 0 {
+		linger = lingerGrace
+	}
+	stop := func() (bool, error) {
+		return true, drain(exited, drainOptions{
+			press: o.press, kill: o.kill, runner: o.runner, log: o.log,
+			interval: o.interval, grace: o.grace,
 		})
 	}
+
+	watching := time.NewTicker(check)
+	defer watching.Stop()
+	var finishedAt time.Time
+
+	for {
+		select {
+		case err := <-exited:
+			return false, err
+
+		case <-watching.C:
+			// The guest says when its runner is done, on the console, and its
+			// own unit then powers the machine off. When that does not happen —
+			// and on a real host it did not, for eighteen minutes — nothing else
+			// notices: the runner has deregistered itself so GitHub cannot give
+			// it work, this agent is alive so systemd will not replace it, and
+			// the fleet shows a healthy runner doing nothing at all.
+			if finishedAt.IsZero() {
+				if !runnerFinished(o.console) {
+					continue
+				}
+				finishedAt = time.Now()
+				o.log.Info("the runner has finished; the machine should be powering off", "runner", o.runner)
+				continue
+			}
+			if time.Since(finishedAt) < linger {
+				continue
+			}
+			o.log.Warn("the runner finished but the machine is still running; stopping it",
+				"runner", o.runner, "waited", time.Since(finishedAt).Round(time.Second).String())
+			return stop()
+
+		case <-ctx.Done():
+			o.log.Info("stopping: asking the machine to shut down and waiting for the job in flight",
+				"runner", o.runner)
+			return stop()
+		}
+	}
+}
+
+// consoleCheck is how often the machine's console is read while it runs.
+const consoleCheck = 10 * time.Second
+
+// lingerGrace is how long a machine may take to power itself off after its
+// runner has finished.
+//
+// Generous, because the guest is stopping docker and unmounting filesystems in
+// that window and none of that should be cut short. But bounded: a machine
+// whose runner has gone is a slot with nothing in it, and eighteen minutes of
+// that took a whole pool out of service.
+const lingerGrace = 90 * time.Second
+
+// finished are the runner's last words, from the guest's console.
+//
+//	Runner listener exit with 0 return code, stop the service, no retry needed.
+//	Exiting runner...
+var finished = []string{"Runner listener exit with", "Exiting runner"}
+
+// runnerFinished reports whether the console shows the runner has stopped for
+// good, which is the point at which the machine has nothing left to do.
+func runnerFinished(console string) bool {
+	raw, err := os.ReadFile(console)
+	if err != nil {
+		return false
+	}
+	text := string(raw)
+	for _, last := range finished {
+		if strings.Contains(text, last) {
+			return true
+		}
+	}
+	return false
 }
 
 // pressInterval is how often the power button is pressed again while a machine
