@@ -230,7 +230,9 @@ func (p *Pool) EffectiveLabels() []string {
 //	3  machines carry a runner GitHub has not deprecated, may update it
 //	   themselves, and give the job passwordless sudo — a machine built before
 //	   this either cannot take work at all or fails every job that needs root
-const SpecRevision = 3
+//	4  the golden image's name covers the script that builds it, so revision 3
+//	   was installed on hosts that went on reusing an image built without it
+const SpecRevision = 4
 
 // Generation is a hash of everything a runner is built from. The reconciler
 // stamps it on each runner it creates and compares it later: a runner whose
