@@ -177,7 +177,7 @@ func (p *Pool) Ceiling() int {
 // the pool plus the ones describing what it actually is.
 //
 // The automatic ones exist so a workflow can ask for what it needs —
-// runs-on: [self-hosted, nested] — without every pool having to remember to
+// runs-on: [self-hosted, nestedvirt] — without every pool having to remember to
 // spell it out, and without the label and the reality drifting apart.
 func (p *Pool) EffectiveLabels() []string {
 	seen := map[string]bool{}
@@ -197,7 +197,10 @@ func (p *Pool) EffectiveLabels() []string {
 		add("vm")
 	}
 	if p.Nested {
-		add("nested")
+		// "nested" on its own says nothing about what is nested; a workflow
+		// author reading runs-on has to guess. The label spells out the
+		// capability it is really asking for.
+		add("nestedvirt")
 	}
 	if p.Ephemeral {
 		add("ephemeral")
@@ -232,6 +235,10 @@ func (p *Pool) EffectiveLabels() []string {
 //	   this either cannot take work at all or fails every job that needs root
 //	4  the golden image's name covers the script that builds it, so revision 3
 //	   was installed on hosts that went on reusing an image built without it
+//
+// It should need bumping less often now. The recipe is in the generation above,
+// so a release that changes how runners are built says so by itself; this is
+// for the changes no recipe can express.
 const SpecRevision = 4
 
 // Generation is a hash of everything a runner is built from. The reconciler
@@ -242,7 +249,13 @@ const SpecRevision = 4
 // The scaling bounds are deliberately not in it. Scaling a pool — by hand or
 // by the autoscaler, many times an hour — must not replace the runners that
 // are already right.
-func (p *Pool) Generation(credentialFingerprint string) string {
+//
+// The recipe is how the daemon builds this pool's runners — a golden image's
+// name, a container image reference — and it is in here because twice now a
+// release changed that and left every existing runner looking current. The
+// spec revision below is the manual version of this, for changes a recipe
+// cannot express.
+func (p *Pool) Generation(credentialFingerprint, recipe string) string {
 	h := sha256.New()
 	write := func(parts ...string) {
 		for _, part := range parts {
@@ -263,6 +276,7 @@ func (p *Pool) Generation(credentialFingerprint string) string {
 		fmt.Sprint(p.MemoryMB),
 		fmt.Sprint(p.DiskGB),
 		p.Image,
+		recipe,
 		credentialFingerprint,
 	)
 	return hex.EncodeToString(h.Sum(nil))[:12]

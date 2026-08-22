@@ -225,7 +225,7 @@ func TestSpecsForAPool(t *testing.T) {
 	}
 	p.Defaults()
 
-	specs := SpecsFor(p, "fp", DesiredNames(p, nil, nil, p.Floor()))
+	specs := SpecsFor(p, "fp", "image", DesiredNames(p, nil, nil, p.Floor()))
 	if len(specs) != 2 {
 		t.Fatalf("got %d specs, want 2", len(specs))
 	}
@@ -235,13 +235,13 @@ func TestSpecsForAPool(t *testing.T) {
 	if specs[0].Generation != specs[1].Generation {
 		t.Fatal("replicas of one pool must share a generation, or they would replace each other for ever")
 	}
-	if specs[0].Generation != p.Generation("fp") {
+	if specs[0].Generation != p.Generation("fp", "image") {
 		t.Fatal("the spec's generation must be the pool's, or a restart would see every runner as stale")
 	}
 	if specs[0].URL != "https://github.com/o/r" || specs[0].CredentialID != 3 {
 		t.Fatalf("got %+v", specs[0])
 	}
-	if strings.Join(specs[0].Labels, ",") != "vm,nested,ephemeral,gpu" {
+	if strings.Join(specs[0].Labels, ",") != "vm,nestedvirt,ephemeral,gpu" {
 		t.Fatalf("labels are %v", specs[0].Labels)
 	}
 }
@@ -249,7 +249,7 @@ func TestSpecsForAPool(t *testing.T) {
 func TestSpecsForADisabledPool(t *testing.T) {
 	p := model.Pool{Name: "web", MinReplicas: 3, MaxReplicas: 3, Enabled: false}
 	p.Defaults()
-	if specs := SpecsFor(p, "fp", DesiredNames(p, nil, nil, p.Floor())); len(specs) != 0 {
+	if specs := SpecsFor(p, "fp", "image", DesiredNames(p, nil, nil, p.Floor())); len(specs) != 0 {
 		t.Fatalf("a disabled pool asked for %d runners", len(specs))
 	}
 }

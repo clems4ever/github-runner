@@ -219,3 +219,65 @@ func TestTheSameRecipeIsTheSameImage(t *testing.T) {
 		t.Fatal("the same spec named two images")
 	}
 }
+
+// A machine boots for one job and is destroyed, so every second of the boot is
+// paid by every job on the host. These are the services a stock cloud image
+// starts that a runner has no use for.
+func TestTheImageDoesNotBootThingsARunnerWillNeverUse(t *testing.T) {
+	script := provisionScript()
+
+	for _, useless := range []string{"snapd.service", "ModemManager.service", "multipathd.service", "apt-daily.timer"} {
+		if !strings.Contains(script, useless) {
+			t.Errorf("%s still starts on every boot, and no job will ever ask for it", useless)
+		}
+	}
+	// Disabled, not masked: a job that genuinely wants one can start it.
+	if strings.Contains(script, "systemctl mask") {
+		t.Error("services are masked rather than disabled, so a job cannot start one if it needs it")
+	}
+	// And the things a job does need are untouched.
+	for _, needed := range []string{"systemctl enable docker"} {
+		if !strings.Contains(script, needed) {
+			t.Errorf("%q is missing from the image", needed)
+		}
+	}
+}
+
+// The runner's last words, which are the point at which its machine has nothing
+// left to do. Taken from the console of a machine that then sat for eighteen
+// minutes with no runner on it, holding a slot in a pool with twelve jobs
+// queued.
+func TestARunnerThatHasFinishedIsRecognised(t *testing.T) {
+	done := writeConsole(t, strings.Join([]string{
+		"[   54.7] run-runner.sh[1431]: 2026-08-22 15:04:38Z: Job installer completed with result: Succeeded",
+		"[   55.1] run-runner.sh[1431]: √ Removed .credentials",
+		"[   55.1] run-runner.sh[1431]: √ Removed .runner",
+		"[   55.2] run-runner.sh[1427]: Runner listener exit with 0 return code, stop the service, no retry needed.",
+		"[   55.2] run-runner.sh[1339]: Exiting runner...",
+	}, "\n"))
+	if !runnerFinished(done) {
+		t.Fatal("a machine whose runner has gone is not recognised, so nothing will ever stop it")
+	}
+
+	// A runner waiting for work has not finished, and its machine must not be
+	// stopped underneath it.
+	waiting := writeConsole(t, "[   16.0] run-runner.sh[1436]: 2026-08-22 13:46:17Z: Listening for Jobs")
+	if runnerFinished(waiting) {
+		t.Fatal("an idle runner was taken for a finished one")
+	}
+
+	// Nor mid-job.
+	working := writeConsole(t, strings.Join([]string{
+		"[   16.0] run-runner.sh[1436]: Listening for Jobs",
+		"[   18.1] run-runner.sh[1436]: Running job: installer",
+	}, "\n"))
+	if runnerFinished(working) {
+		t.Fatal("a runner with a job on it was taken for a finished one")
+	}
+
+	// A console that cannot be read says nothing rather than stopping a machine
+	// on a guess.
+	if runnerFinished(filepath.Join(t.TempDir(), "missing")) {
+		t.Fatal("a missing console was taken as proof the runner had finished")
+	}
+}

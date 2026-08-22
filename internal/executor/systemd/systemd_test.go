@@ -2,9 +2,11 @@ package systemd
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
@@ -54,12 +56,27 @@ func newExecutor(t *testing.T) (*Executor, *fakeCommander, paths.Layout) {
 	return e, cmd, layout
 }
 
+// newExecutorAt is newExecutor with a clock that does not move, for the tests
+// that ask how long something has been happening.
+func newExecutorAt(t *testing.T, now time.Time) (*Executor, *fakeCommander, paths.Layout) {
+	t.Helper()
+	layout := paths.Under(t.TempDir())
+	if err := layout.EnsureDirs(paths.CurrentOwner()); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &fakeCommander{output: map[string]string{}}
+	e := New(layout, "/usr/local/bin/runner-fleet", "runner-fleet",
+		WithCommander(cmd), WithUnitPath(layout.Etc+"/gh-runner@.service"),
+		WithClock(func() time.Time { return now }))
+	return e, cmd, layout
+}
+
 func testSpec(name string) reconcile.Spec {
 	return reconcile.Spec{
 		Name: name, Pool: "web", PoolID: 1, Generation: "abc123def456",
 		Runtime: model.RuntimeVM, URL: "https://github.com/o/r",
 		ScopeKind: model.ScopeRepository, Scope: "o/r",
-		Labels: []string{"vm", "nested"}, Ephemeral: true, Nested: true,
+		Labels: []string{"vm", "nestedvirt"}, Ephemeral: true, Nested: true,
 		CPUs: 4, MemoryMB: 8192, DiskGB: 60, Image: "default", CredentialID: 7,
 	}
 }
@@ -80,7 +97,7 @@ func TestCreateWritesTheConfigurationThenStarts(t *testing.T) {
 		"FLEET_POOL=web",
 		"FLEET_GENERATION=abc123def456",
 		"FLEET_URL=https://github.com/o/r",
-		"FLEET_LABELS=vm,nested",
+		"FLEET_LABELS=vm,nestedvirt",
 		"FLEET_EPHEMERAL=true",
 		"FLEET_NESTED=true",
 		"FLEET_CPUS=4",
@@ -438,4 +455,136 @@ func TestAnUnknownInstallationIsLeftOut(t *testing.T) {
 	if strings.Contains(env, "FLEET_INSTALLATION_ID") {
 		t.Fatalf("an unknown installation was written anyway:\n%s", env)
 	}
+}
+
+// A machine that missed the power button looks exactly like one finishing a
+// long job: the unit says "deactivating" and nothing says for how long. This
+// one had been stopping for forty-eight minutes, holding four cpus, with the
+// fleet showing STOPPING and no clock on it.
+func TestALongDrainSaysHowLongItHasBeen(t *testing.T) {
+	now := time.Date(2026, 8, 22, 16, 58, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// It left active at 16:10, which is where this began.
+	leftActive := now.Add(-48 * time.Minute).Unix()
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=deactivating",
+		"SubState=stop-sigterm",
+		"Result=success",
+		"NRestarts=0",
+		fmt.Sprintf("ActiveExitTimestamp=@%d", leftActive),
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Still stopping, not failed: a drain is not a failure, and the reconciler
+	// must not treat it as a runner it can delete.
+	if runners[0].State != reconcile.StateStopping {
+		t.Fatalf("state is %q", runners[0].State)
+	}
+	if !strings.Contains(runners[0].Trouble, "48m") {
+		t.Errorf("the fleet does not say how long it has been draining: %q", runners[0].Trouble)
+	}
+	if !strings.Contains(runners[0].Trouble, "journalctl -u gh-runner@web-1.service") {
+		t.Errorf("no way to look into it: %q", runners[0].Trouble)
+	}
+}
+
+// A drain of a few minutes is a job finishing, and says nothing.
+func TestAnOrdinaryDrainIsQuiet(t *testing.T) {
+	now := time.Date(2026, 8, 22, 16, 58, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=deactivating",
+		"SubState=stop-sigterm",
+		"Result=success",
+		"NRestarts=0",
+		fmt.Sprintf("ActiveExitTimestamp=@%d", now.Add(-90*time.Second).Unix()),
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runners[0].Trouble != "" {
+		t.Fatalf("a runner finishing its job was reported as a problem: %q", runners[0].Trouble)
+	}
+}
+
+// The host knows how long a runner has been up, and that is what separates a
+// machine still booting from one GitHub will never hear about.
+func TestListSaysHowLongARunnerHasBeenUp(t *testing.T) {
+	now := time.Date(2026, 8, 22, 17, 0, 0, 0, time.UTC)
+	e, cmd, layout := newExecutorAt(t, now)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=active",
+		"SubState=running",
+		"Result=success",
+		"NRestarts=0",
+		fmt.Sprintf("ActiveEnterTimestamp=@%d", now.Add(-40*time.Second).Unix()),
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runners[0].Up != 40*time.Second {
+		t.Fatalf("up for %s, want 40s", runners[0].Up)
+	}
+}
+
+// An ephemeral machine is replaced after every job, so the restart delay is
+// paid by every job on the host, and the start limiter has to be sized for a
+// pool that is working rather than one that is broken.
+func TestTheRestartPolicySuitsAFleetThatIsBusy(t *testing.T) {
+	e, _, _ := newExecutor(t)
+	unit := e.renderUnit()
+
+	if !strings.Contains(unit, "RestartSec=2") {
+		t.Error("the restart delay is long enough to be noticed once per job")
+	}
+
+	// Thirty starts in ten minutes: a machine that comes back in ~30s does
+	// twenty and lives; one that fails at once does thirty in a couple of
+	// minutes and is stopped.
+	interval, burst := field(t, unit, "StartLimitIntervalSec="), field(t, unit, "StartLimitBurst=")
+	if interval != "600" || burst != "30" {
+		t.Fatalf("start limiter is %s starts per %ss", burst, interval)
+	}
+
+	// The healthy case has to fit inside the window with room to spare, or a
+	// busy pool stops itself.
+	const secondsPerJob = 30
+	if starts := 600 / secondsPerJob; starts >= 30 {
+		t.Fatalf("a pool doing a job every %ds does %d starts per window and would be"+
+			" mistaken for a crash loop", secondsPerJob, starts)
+	}
+}
+
+func field(t *testing.T, unit, key string) string {
+	t.Helper()
+	for _, line := range strings.Split(unit, "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), key); ok {
+			return value
+		}
+	}
+	t.Fatalf("the unit has no %s", key)
+	return ""
 }

@@ -1,20 +1,34 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MantineProvider } from '@mantine/core'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FleetPage } from './FleetPage'
 import { api, type Credential, type Pool, type Runner, type Scale } from '../api'
 
 const credentials: Credential[] = [{ id: 1, name: 'pat', kind: 'pat', hint: '…1234', createdAt: '' }]
 
-function renderPage(
+// The page draws the activity chart, which asks the daemon for the history as
+// soon as it mounts. Left alone that request goes out for real, and lands
+// after the test that started it has finished — which is where a run's worth
+// of "not wrapped in act(...)" came from. The chart has its own tests; here it
+// only has to be quiet.
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api')
+  return { ...actual, api: { ...actual.api, activity: vi.fn() } }
+})
+
+beforeEach(() => {
+  vi.mocked(api.activity).mockResolvedValue({ points: [], pool: '', since: '', until: '' })
+})
+
+async function renderPage(
   runners: Runner[],
   warnings: string[] = [],
   pools: Pool[] = [],
   scaling: Record<string, Scale> = {},
   onChange = vi.fn().mockResolvedValue(undefined),
 ) {
-  return render(
+  const result = render(
     <MantineProvider>
       <FleetPage
         runners={runners}
@@ -27,6 +41,10 @@ function renderPage(
       />
     </MantineProvider>,
   )
+  // Settled before the test asserts anything: the chart's own state update has
+  // to happen while React is still watching, not after the test returns.
+  await screen.findByText('No history yet')
+  return result
 }
 
 afterEach(() => {
@@ -67,12 +85,20 @@ const runner = (over: Partial<Runner> = {}): Runner => ({
 })
 
 describe('FleetPage', () => {
+  // An ephemeral runner deregisters itself after every job and a fresh machine
+  // boots, so "GitHub has never heard of this one" is most of a busy pool's
+  // life. Calling that unknown made a working fleet look broken.
+  it('says a runner is starting rather than unknown while it boots', () => {
+    renderPage([runner({ job: 'starting' })])
+    expect(screen.getByText('starting')).toBeInTheDocument()
+  })
+
   // A runner can be dead and look busy. The dashboard said "running" for a
   // whole afternoon while every machine on the host was crash-looping on a
   // credential it could not read, so a failing runner now says so beside its
   // state, with the command that explains why.
   it('shows a runner that is failing to start, and where to look', async () => {
-    renderPage([
+    await renderPage([
       runner({
         state: 'stopped',
         job: 'unknown',
@@ -83,21 +109,21 @@ describe('FleetPage', () => {
     expect(screen.getByText('failing')).toBeInTheDocument()
   })
 
-  it('says nothing about a runner that is fine', () => {
-    renderPage([runner()])
+  it('says nothing about a runner that is fine', async () => {
+    await renderPage([runner()])
     expect(screen.queryByText('failing')).not.toBeInTheDocument()
   })
 
-  it('says what to do when there is nothing yet', () => {
-    renderPage([])
+  it('says what to do when there is nothing yet', async () => {
+    await renderPage([])
     expect(screen.getByText('No runners yet')).toBeInTheDocument()
     expect(screen.getByText(/Add a credential, then a pool/)).toBeInTheDocument()
   })
 
-  it('shows what the host says and what GitHub says as separate facts', () => {
+  it('shows what the host says and what GitHub says as separate facts', async () => {
     // A machine that is up with a job on it, and one that is up with nothing:
     // the state column cannot answer the second question.
-    renderPage([
+    await renderPage([
       runner({ name: 'web-1', job: 'busy' }),
       runner({ name: 'web-2', job: 'idle' }),
     ])
@@ -107,25 +133,25 @@ describe('FleetPage', () => {
     expect(screen.getAllByText('running')).toHaveLength(2)
   })
 
-  it('counts the busy runners', () => {
-    renderPage([runner({ name: 'web-1', job: 'busy' }), runner({ name: 'web-2', job: 'busy' })])
+  it('counts the busy runners', async () => {
+    await renderPage([runner({ name: 'web-1', job: 'busy' }), runner({ name: 'web-2', job: 'busy' })])
     expect(screen.getByText('Running a job').parentElement).toHaveTextContent('2')
   })
 
-  it('marks a runner that is waiting to be replaced', () => {
-    renderPage([runner({ upToDate: false })])
+  it('marks a runner that is waiting to be replaced', async () => {
+    await renderPage([runner({ upToDate: false })])
     expect(screen.getByText('superseded')).toBeInTheDocument()
   })
 
-  it('shows a draining runner as stopping rather than failed', () => {
-    renderPage([runner({ state: 'stopping', job: 'busy' })])
+  it('shows a draining runner as stopping rather than failed', async () => {
+    await renderPage([runner({ state: 'stopping', job: 'busy' })])
     expect(screen.getByText('stopping')).toBeInTheDocument()
   })
 
-  it('says why an elastic pool is the size it is', () => {
+  it('says why an elastic pool is the size it is', async () => {
     // A fleet that resizes itself should never leave anyone guessing what it
     // reacted to.
-    renderPage(
+    await renderPage(
       [runner({ job: 'busy' })],
       [],
       [pool()],
@@ -136,15 +162,15 @@ describe('FleetPage', () => {
     expect(screen.getByText('1 of 1–4')).toBeInTheDocument()
   })
 
-  it('leaves fixed-size pools out of the scaling panel', () => {
-    renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })])
+  it('leaves fixed-size pools out of the scaling panel', async () => {
+    await renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })])
     expect(screen.queryByText('Scaling')).not.toBeInTheDocument()
   })
 
   // The runner is where the trouble shows up, so the pool that decides what it
   // is should be one click away rather than a page away.
   it('opens the definition of the pool a runner belongs to', async () => {
-    renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })])
+    await renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })])
 
     await userEvent.click(screen.getByRole('button', { name: 'web' }))
 
@@ -156,7 +182,7 @@ describe('FleetPage', () => {
   it('saves a change of replicas made from the fleet', async () => {
     const update = vi.spyOn(api, 'updatePool').mockResolvedValue(pool())
     const onChange = vi.fn().mockResolvedValue(undefined)
-    renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })], {}, onChange)
+    await renderPage([runner()], [], [pool({ minReplicas: 2, maxReplicas: 2 })], {}, onChange)
 
     await userEvent.click(screen.getByRole('button', { name: 'web' }))
     const maximum = await screen.findByRole('textbox', { name: /Maximum runners/ })
@@ -173,16 +199,16 @@ describe('FleetPage', () => {
 
   // A runner outlives its pool while it drains, and there is no definition
   // left to open for it.
-  it('leaves a runner whose pool is gone as plain text', () => {
-    renderPage([runner({ pool: 'retired' })], [], [pool()])
+  it('leaves a runner whose pool is gone as plain text', async () => {
+    await renderPage([runner({ pool: 'retired' })], [], [pool()])
     expect(screen.queryByRole('button', { name: 'retired' })).not.toBeInTheDocument()
     expect(screen.getByText('retired')).toBeInTheDocument()
   })
 
-  it('surfaces warnings rather than swallowing them', () => {
+  it('surfaces warnings rather than swallowing them', async () => {
     // A fleet that cannot reach GitHub still works, and the operator should be
     // told why the job column is empty.
-    renderPage([runner()], ['pool web: GitHub is unreachable'])
+    await renderPage([runner()], ['pool web: GitHub is unreachable'])
     expect(screen.getByText('pool web: GitHub is unreachable')).toBeInTheDocument()
   })
 })

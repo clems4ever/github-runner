@@ -1,0 +1,27 @@
+<!--
+  The browser tab's copy of the mark in src/Logo.tsx. A link element cannot
+  point at a React component, so the artwork exists twice; Logo.test.tsx fails
+  if the two ever drift apart.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <title>runner-fleet</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7C86FF"/>
+      <stop offset="0.5" stop-color="#5A54F0"/>
+      <stop offset="1" stop-color="#3A2FC2"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="0.6" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8" fill="url(#tile)"/>
+  <rect width="32" height="32" rx="8" fill="url(#sheen)"/>
+  <g fill="none" stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6.2 10.2 11.2 16 6.2 21.8" stroke-width="2.6" stroke-opacity="0.3"/>
+    <path d="M12.2 9 18.3 16 12.2 23" stroke-width="3" stroke-opacity="0.58"/>
+    <path d="M18.3 7.9 25.3 16 18.3 24.1" stroke-width="3.6" stroke-opacity="1"/>
+  </g>
+  <rect x="0.5" y="0.5" width="31" height="31" rx="7.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.18"/>
+</svg>

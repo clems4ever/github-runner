@@ -24,6 +24,7 @@ import {
   IconKey,
 } from '@tabler/icons-react'
 import { api, type Credential, type Health, type Pool, type Runner, type Scale } from './api'
+import { Logo } from './Logo'
 import { FleetPage } from './pages/FleetPage'
 import { PoolsPage } from './pages/PoolsPage'
 import { CredentialsPage } from './pages/CredentialsPage'
@@ -104,6 +105,10 @@ export function App() {
           <Group gap="xs">
             <ReconcileButton onDone={refresh} />
             <ColorSchemeToggle />
+            {/* The mark anchors the corner opposite the wordmark, so the header
+                is bracketed by the product rather than by two grey buttons.
+                The extra margin keeps it from reading as a third one. */}
+            <Logo size={30} title="" style={{ marginInlineStart: 6 }} />
           </Group>
         </Group>
       </AppShell.Header>

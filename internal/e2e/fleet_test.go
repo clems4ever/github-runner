@@ -40,6 +40,7 @@ import (
 type host struct {
 	mu      sync.Mutex
 	runtime model.Runtime
+	recipe  string
 	runners map[string]*reconcile.Runner
 	created []string
 	specs   []reconcile.Spec
@@ -51,6 +52,16 @@ func newHost(runtime model.Runtime) *host {
 }
 
 func (h *host) Runtime() model.Runtime { return h.runtime }
+
+// Recipe is what this host would build a runner from — a golden image, a
+// container image. A test changes it to stand for a daemon that has changed how
+// it builds them, which is a release, not a configuration change.
+func (h *host) Recipe(model.Pool) string {
+	if h.recipe == "" {
+		return "image"
+	}
+	return h.recipe
+}
 
 func (h *host) List(context.Context) ([]reconcile.Runner, error) {
 	h.mu.Lock()
@@ -574,6 +585,22 @@ func (f *fleet) idle(names ...string) {
 // everyRunnerIdle is what the fake GitHub reports once a burst is over.
 func (f *fleet) everyRunnerIdle() {
 	f.idle(f.vm.names()...)
+}
+
+// recycling is what a pool between jobs looks like: every ephemeral runner has
+// deregistered itself and its machine is seconds into a fresh boot, so GitHub
+// knows nothing about any of them and the host reports them all as young.
+func (f *fleet) recycling() {
+	f.gh.mu.Lock()
+	f.gh.states = map[string]github.State{}
+	f.gh.mu.Unlock()
+
+	f.vm.mu.Lock()
+	defer f.vm.mu.Unlock()
+	for _, runner := range f.vm.runners {
+		runner.State = reconcile.StateRunning
+		runner.Up = 15 * time.Second
+	}
 }
 
 func TestAPoolGrowsWhenEveryRunnerIsBusy(t *testing.T) {
@@ -1113,4 +1140,100 @@ func (f *fleet) importTemplate(t *testing.T, name string, options map[string]any
 		body[key] = value
 	}
 	f.mustRequest("POST", "/api/pools/import", body, http.StatusOK)
+}
+
+// A release that changes how a runner is built replaces the runners built the
+// old way — without anybody remembering to bump a constant.
+//
+// This is the failure that cost two upgrades in one afternoon. A release gave
+// jobs passwordless sudo; the golden image's name did not depend on the script
+// that installs it, so hosts reused the image they already had. The next
+// release fixed the name, and the machines still running the old image looked
+// current to the reconciler, because a generation covered what an operator had
+// configured and not what the daemon does with it.
+func TestARecipeChangeReplacesTheRunnersItWasBuiltFor(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(vmPool(credential, 2))
+	f.reconcileNow()
+	if got := strings.Join(f.vm.names(), ","); got != "web-1,web-2" {
+		t.Fatalf("got %q", got)
+	}
+	f.vm.created = nil
+
+	// The daemon is upgraded and now builds machines from a different image —
+	// a new runner version, a package added, a change to the provisioning. The
+	// pool's configuration has not changed at all.
+	f.vm.recipe = "runner-noble-default-1886661f732b.qcow2"
+	f.reconcileNow()
+
+	// Drained, not killed: a machine mid-job finishes it first.
+	if len(f.vm.created) != 0 {
+		t.Fatalf("runners were rebuilt before the old ones stopped: %v", f.vm.created)
+	}
+	f.vm.jobsFinish()
+	f.reconcileNow()
+
+	if got := strings.Join(f.vm.created, ","); got != "web-1,web-2" {
+		t.Fatalf("the machines were left on the image the daemon no longer builds: %v", f.vm.created)
+	}
+}
+
+// And a fleet the daemon has not changed is left alone, which is the other half
+// of the promise: a recipe in the generation must not mean churn on every pass.
+func TestTheSameRecipeChangesNothing(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	f.addPool(vmPool(f.addCredential(), 2))
+	f.reconcileNow()
+	f.vm.created = nil
+
+	f.reconcileNow()
+	f.reconcileNow()
+	if len(f.vm.created) != 0 {
+		t.Fatalf("a settled fleet rebuilt %v", f.vm.created)
+	}
+}
+
+// A pool working through a queue must not shrink itself.
+//
+// From a real host: the pool grew to three because every runner was busy, and
+// ten minutes later threw the third machine away as "no longer wanted" while
+// twelve jobs were still queued. Between jobs an ephemeral runner is
+// deregistered and its machine is rebooting, so a pool that is working looks
+// exactly like a pool nobody wants.
+func TestAPoolChurningThroughJobsKeepsItsRunners(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(elasticVMPool(credential, 1, 3))
+
+	// Every runner busy: the pool climbs to its ceiling.
+	for i := 0; i < 3; i++ {
+		f.reconcileNow()
+		f.busy(f.vm.names()...)
+	}
+	if got := len(f.vm.names()); got != 3 {
+		t.Fatalf("the pool grew to %d, want 3", got)
+	}
+
+	// Now they are between jobs: nothing busy, nothing registered, machines
+	// seconds old — which is what recycling looks like from out here.
+	f.recycling()
+
+	// Well past the point where a genuinely quiet pool would have shrunk. Two
+	// passes and a drain in between, because shrinking asks a runner to stop
+	// and removes it once it has — one pass would show three either way.
+	f.now = f.now.Add(reconcile.ScaleDownAfter + time.Minute)
+	f.reconcileNow()
+	f.vm.jobsFinish()
+	f.reconcileNow()
+
+	if got := len(f.vm.names()); got != 3 {
+		t.Fatalf("the pool shrank to %d while its machines were coming back from jobs", got)
+	}
 }

@@ -159,8 +159,15 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
               new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
             minTickGap: 48,
           }}
-          gridColor={palette.grid}
-          textColor={palette.muted}
+          // The colours go in as CSS variables rather than through the
+          // `gridColor` and `textColor` props. Those are still in the type,
+          // but @mantine/charts 9.5.1 stopped taking them out of the props it
+          // forwards, so they reach the root div and React reports two unknown
+          // attributes per render. These are the same two variables the props
+          // would have set.
+          vars={() => ({
+            root: { '--chart-grid-color': palette.grid, '--chart-text-color': palette.muted },
+          })}
           tooltipAnimationDuration={120}
           tooltipProps={{
             // Without this the crosshair label is the raw timestamp, which is

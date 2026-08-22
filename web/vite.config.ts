@@ -21,7 +21,16 @@ const keepTheEmbedDirectoryNonEmpty = {
 // copying one binary, so the UI has to be inside it.
 export default defineConfig({
   plugins: [react(), keepTheEmbedDirectoryNonEmpty],
-  build: { outDir: '../internal/ui/dist', emptyOutDir: true },
+  build: {
+    outDir: '../internal/ui/dist',
+    emptyOutDir: true,
+    // Vite's default 500 kB warning is advice about a page fetched over the
+    // internet. This one is fetched from the daemon that embeds it, usually
+    // over a LAN, and splitting it would buy an operator nothing. So the limit
+    // is a budget instead: about a fifth above the bundle as it stands, which
+    // leaves room for a page but not for a heavy dependency arriving unnoticed.
+    chunkSizeWarningLimit: 1250,
+  },
   server: {
     // In development the UI runs on its own port and the daemon on 8080.
     proxy: { '/api': 'http://127.0.0.1:8080' },

@@ -31,7 +31,7 @@ export interface Pool {
 }
 
 export type RunnerState = 'running' | 'stopping' | 'stopped'
-export type JobState = 'busy' | 'idle' | 'offline' | 'unknown'
+export type JobState = 'busy' | 'idle' | 'starting' | 'offline' | 'unknown'
 
 export interface Runner {
   name: string
@@ -254,7 +254,7 @@ export function effectiveLabels(pool: Partial<Pool>): string[] {
   }
 
   add(pool.runtime === 'container' ? 'container' : 'vm')
-  if (pool.nested) add('nested')
+  if (pool.nested) add('nestedvirt')
   if (pool.ephemeral) add('ephemeral')
   ;(pool.labels ?? []).forEach(add)
   return out

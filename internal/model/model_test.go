@@ -123,20 +123,33 @@ func TestEffectiveLabelsDescribeTheRunner(t *testing.T) {
 	p.Labels = []string{"gpu", "eu-west"}
 
 	got := strings.Join(p.EffectiveLabels(), ",")
-	want := "container,nested,ephemeral,gpu,eu-west"
+	want := "container,nestedvirt,ephemeral,gpu,eu-west"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-// A workflow asking for "nested" must not reach a pool that only calls itself
-// that, so the automatic labels follow the settings rather than the name.
+// A workflow asking for "nestedvirt" must not reach a pool that only calls
+// itself that, so the automatic labels follow the settings rather than the name.
 func TestEffectiveLabelsFollowTheConfiguration(t *testing.T) {
 	p := validPool()
 	p.Nested = false
 	for _, label := range p.EffectiveLabels() {
+		if label == "nestedvirt" {
+			t.Fatal("a pool without nested virtualisation labelled itself nestedvirt")
+		}
+	}
+}
+
+// The label was "nested" until it was found to say nothing about what is
+// nested. Nobody should reintroduce it as a second spelling: two labels for one
+// capability is how a workflow ends up on a runner that cannot do the work.
+func TestNestedIsNoLongerALabel(t *testing.T) {
+	p := validPool()
+	p.Nested = true
+	for _, label := range p.EffectiveLabels() {
 		if label == "nested" {
-			t.Fatal("a pool without nested virtualisation labelled itself nested")
+			t.Fatal("the old label is back; workflows must target nestedvirt")
 		}
 	}
 }
@@ -153,7 +166,7 @@ func TestEffectiveLabelsDeduplicate(t *testing.T) {
 
 func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 	base := validPool()
-	baseGen := base.Generation("fp")
+	baseGen := base.Generation("fp", "image")
 
 	tests := []struct {
 		name   string
@@ -173,14 +186,14 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p := validPool()
 			tt.mutate(&p)
-			if p.Generation("fp") == baseGen {
+			if p.Generation("fp", "image") == baseGen {
 				t.Fatalf("changing %s left the generation alone, so runners would keep the old configuration", tt.name)
 			}
 		})
 	}
 
 	t.Run("credential", func(t *testing.T) {
-		if base.Generation("other-fingerprint") == baseGen {
+		if base.Generation("other-fingerprint", "image") == baseGen {
 			t.Fatal("replacing the credential left the generation alone")
 		}
 	})
@@ -190,7 +203,7 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 	t.Run("the scaling bounds do not", func(t *testing.T) {
 		p := validPool()
 		p.MinReplicas, p.MaxReplicas = 2, 10
-		if p.Generation("fp") != baseGen {
+		if p.Generation("fp", "image") != baseGen {
 			t.Fatal("changing the scaling bounds changed the generation, which would replace every healthy runner")
 		}
 	})
@@ -201,7 +214,7 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 // the pool is identical before and after — so the revision is part of it.
 func TestGenerationCoversHowRunnersAreBuilt(t *testing.T) {
 	p := validPool()
-	generation := p.Generation("fp")
+	generation := p.Generation("fp", "image")
 
 	// What the hash would be if the revision had not moved: if these are ever
 	// equal, an upgrade that fixes the recipe leaves every runner on the old
@@ -235,11 +248,11 @@ func poolGenerationAtRevision(p Pool, fingerprint string, revision int) string {
 
 func TestGenerationIsStable(t *testing.T) {
 	p := validPool()
-	if p.Generation("fp") != p.Generation("fp") {
+	if p.Generation("fp", "image") != p.Generation("fp", "image") {
 		t.Fatal("the same pool hashed differently twice")
 	}
-	if len(p.Generation("fp")) != 12 {
-		t.Fatalf("want a short readable hash, got %q", p.Generation("fp"))
+	if len(p.Generation("fp", "image")) != 12 {
+		t.Fatalf("want a short readable hash, got %q", p.Generation("fp", "image"))
 	}
 }
 

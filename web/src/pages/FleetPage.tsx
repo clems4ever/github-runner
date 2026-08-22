@@ -289,6 +289,10 @@ function StateBadge({ state }: { state: RunnerState }) {
 const jobColours: Record<JobState, string> = {
   busy: 'blue',
   idle: 'gray',
+  // On its way up. An ephemeral runner is in this state after every job — it
+  // deregisters itself the moment the job ends and a fresh machine boots — so
+  // for a busy pool it is most of what anybody sees.
+  starting: 'cyan',
   // A runner GitHub cannot see is a problem; one it has never heard of is
   // merely not registered yet.
   offline: 'red',
@@ -298,6 +302,7 @@ const jobColours: Record<JobState, string> = {
 const jobHints: Record<JobState, string> = {
   busy: 'A job is running on it right now',
   idle: 'Registered and waiting for work',
+  starting: 'Booting. It registers with GitHub when it is ready, which takes a minute or two',
   offline: 'Registered but not connected to GitHub',
   unknown: 'GitHub has no runner by this name yet',
 }

@@ -22,6 +22,11 @@ import (
 // stall every other pool on the host.
 type Executor interface {
 	Runtime() model.Runtime
+	// Recipe describes how this executor builds a runner for a pool — the
+	// golden image it would boot, the container image it would run. When it
+	// changes, the runners built from the old one are no longer what the pool
+	// asked for, and the generation says so without anybody having to remember.
+	Recipe(pool model.Pool) string
 	List(ctx context.Context) ([]Runner, error)
 	Create(ctx context.Context, spec Spec) error
 	Start(ctx context.Context, spec Spec) error
@@ -61,6 +66,14 @@ type Reconciler struct {
 	writeSecret CredentialWriter
 	log         *slog.Logger
 
+	// pass serialises whole reconcile passes. The daemon's loop is not the
+	// only caller: the UI reconciles when somebody presses refresh, and saving
+	// a pool asks for one too. A pass reads the host and then acts on what it
+	// read, so two at once both see a runner missing and both create it — a
+	// container name conflict, and a fleet where each pass undoes what the
+	// other just did.
+	pass sync.Mutex
+
 	mu     sync.Mutex
 	last   Result
 	poolOf map[string]string // runner name -> pool, for reporting
@@ -81,9 +94,18 @@ type Reconciler struct {
 // lastBusy is when the pool last had a runner with a job on it. A pool that is
 // busy right now is busy as of now.
 func (r *Reconciler) lastBusy(pool string, runners []Runner, states map[string]github.State) time.Time {
+	// Working, or just finished working. An ephemeral runner that is on its way
+	// back has by definition just completed a job, and that is as good a proof
+	// of demand as catching it mid-job — better, in fact, since a job shorter
+	// than the gap between two passes is never seen busy at all.
 	busy := false
 	for _, runner := range runners {
 		if states[runner.Name] == github.StateBusy {
+			busy = true
+			break
+		}
+		if _, known := states[runner.Name]; !known &&
+			runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
 			busy = true
 			break
 		}
@@ -164,6 +186,11 @@ type Result struct {
 // token has expired must not stop the other pools on the host from being
 // maintained. The error is surfaced in the result, which the UI shows.
 func (r *Reconciler) Once(ctx context.Context) Result {
+	// One at a time. Waiting rather than skipping: whoever asked for a pass
+	// wants the fleet reconciled after they asked, not before.
+	r.pass.Lock()
+	defer r.pass.Unlock()
+
 	var result Result
 
 	pools, err := r.store.ListPools(ctx)
@@ -265,7 +292,8 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			result.ScaledUp = true
 		}
 		desired = append(desired,
-			SpecsForCredential(pool, fingerprint, DesiredNames(pool, mine, states, scale.Target), secrets[pool.Name])...)
+			SpecsForCredential(pool, fingerprint, r.recipeFor(pool),
+				DesiredNames(pool, mine, states, scale.Target), secrets[pool.Name])...)
 	}
 	result.Scaling = scaling
 	r.rememberScaling(scaling)
@@ -476,6 +504,17 @@ func (r *Reconciler) listAll(ctx context.Context) ([]Runner, []string) {
 	return all, errs
 }
 
+// recipeFor asks the executor that would build this pool's runners how it would
+// build them. A pool whose runtime has no executor on this host gets nothing,
+// which is right: there is no recipe, and there are no runners either.
+func (r *Reconciler) recipeFor(pool model.Pool) string {
+	executor, ok := r.executors[pool.Runtime]
+	if !ok {
+		return ""
+	}
+	return executor.Recipe(pool)
+}
+
 func sortedRuntimes(executors map[model.Runtime]Executor) []model.Runtime {
 	out := make([]model.Runtime, 0, len(executors))
 	for runtime := range executors {
@@ -501,6 +540,25 @@ type RunnerStatus struct {
 	Trouble string `json:"trouble,omitempty"`
 }
 
+// Registering is how long a runner is given to appear on GitHub before its
+// absence is worth remarking on.
+//
+// A machine boots, runs cloud-init and registers, which is a minute or two; an
+// ephemeral one does that after every job, so for a busy pool this state is
+// most of what anybody sees. Reporting it as "unknown" the whole time made a
+// working fleet look broken — three times in one day, to the person who built
+// it.
+const Registering = 4 * time.Minute
+
+// jobOfARunnerGitHubHasNotSeen distinguishes a runner on its way up from one
+// that should be there and is not.
+func jobOfARunnerGitHubHasNotSeen(runner Runner) string {
+	if runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
+		return "starting"
+	}
+	return "unknown"
+}
+
 // Status reports the fleet for the UI.
 func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 	actual, errs := r.listAll(ctx)
@@ -518,7 +576,7 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 		if err != nil {
 			continue
 		}
-		generations[pool.Name] = pool.Generation(fingerprint)
+		generations[pool.Name] = pool.Generation(fingerprint, r.recipeFor(pool))
 
 		scope := github.ScopeOf(pool)
 		key := string(scope.Kind) + ":" + scope.Path
@@ -551,7 +609,7 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 	for _, runner := range sortedRunners(actual) {
 		job := string(states[runner.Name])
 		if job == "" {
-			job = "unknown"
+			job = jobOfARunnerGitHubHasNotSeen(runner)
 		}
 		want, known := generations[runner.Pool]
 		out = append(out, RunnerStatus{
