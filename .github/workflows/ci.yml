@@ -73,6 +73,11 @@ jobs:
         run: docker pull ghcr.io/actions/actions-runner:latest
 
       - name: Run a real container runner
+        # REQUIRE_DOCKER turns a skip into a failure. Without it, a runner
+        # without Docker would report a green tick for a test that never ran,
+        # which is the exact shape of the problem this job exists to catch.
+        env:
+          REQUIRE_DOCKER: '1'
         run: go test -tags docker -v -timeout 15m ./internal/executor/docker/
 
   installer:
