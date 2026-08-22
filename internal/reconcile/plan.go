@@ -241,14 +241,14 @@ func sortedRunners(in []Runner) []Runner {
 // SpecsFor turns a pool and the names the autoscaler chose into the runners it
 // should have. The names are decided elsewhere, because how many a pool needs
 // depends on what its runners are doing and this does not.
-func SpecsFor(p model.Pool, credentialFingerprint string, names []string) []Spec {
-	return SpecsForCredential(p, credentialFingerprint, names, model.Secret{Kind: model.CredentialPAT})
+func SpecsFor(p model.Pool, credentialFingerprint, recipe string, names []string) []Spec {
+	return SpecsForCredential(p, credentialFingerprint, recipe, names, model.Secret{Kind: model.CredentialPAT})
 }
 
 // SpecsForCredential is SpecsFor with the credential's shape, which the agent
 // needs in order to authenticate without the daemon.
-func SpecsForCredential(p model.Pool, credentialFingerprint string, names []string, secret model.Secret) []Spec {
-	generation := p.Generation(credentialFingerprint)
+func SpecsForCredential(p model.Pool, credentialFingerprint, recipe string, names []string, secret model.Secret) []Spec {
+	generation := p.Generation(credentialFingerprint, recipe)
 	labels := p.EffectiveLabels()
 
 	var specs []Spec

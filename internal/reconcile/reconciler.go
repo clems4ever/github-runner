@@ -22,6 +22,11 @@ import (
 // stall every other pool on the host.
 type Executor interface {
 	Runtime() model.Runtime
+	// Recipe describes how this executor builds a runner for a pool — the
+	// golden image it would boot, the container image it would run. When it
+	// changes, the runners built from the old one are no longer what the pool
+	// asked for, and the generation says so without anybody having to remember.
+	Recipe(pool model.Pool) string
 	List(ctx context.Context) ([]Runner, error)
 	Create(ctx context.Context, spec Spec) error
 	Start(ctx context.Context, spec Spec) error
@@ -265,7 +270,8 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			result.ScaledUp = true
 		}
 		desired = append(desired,
-			SpecsForCredential(pool, fingerprint, DesiredNames(pool, mine, states, scale.Target), secrets[pool.Name])...)
+			SpecsForCredential(pool, fingerprint, r.recipeFor(pool),
+				DesiredNames(pool, mine, states, scale.Target), secrets[pool.Name])...)
 	}
 	result.Scaling = scaling
 	r.rememberScaling(scaling)
@@ -476,6 +482,17 @@ func (r *Reconciler) listAll(ctx context.Context) ([]Runner, []string) {
 	return all, errs
 }
 
+// recipeFor asks the executor that would build this pool's runners how it would
+// build them. A pool whose runtime has no executor on this host gets nothing,
+// which is right: there is no recipe, and there are no runners either.
+func (r *Reconciler) recipeFor(pool model.Pool) string {
+	executor, ok := r.executors[pool.Runtime]
+	if !ok {
+		return ""
+	}
+	return executor.Recipe(pool)
+}
+
 func sortedRuntimes(executors map[model.Runtime]Executor) []model.Runtime {
 	out := make([]model.Runtime, 0, len(executors))
 	for runtime := range executors {
@@ -518,7 +535,7 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 		if err != nil {
 			continue
 		}
-		generations[pool.Name] = pool.Generation(fingerprint)
+		generations[pool.Name] = pool.Generation(fingerprint, r.recipeFor(pool))
 
 		scope := github.ScopeOf(pool)
 		key := string(scope.Kind) + ":" + scope.Path

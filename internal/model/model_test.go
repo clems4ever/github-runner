@@ -153,7 +153,7 @@ func TestEffectiveLabelsDeduplicate(t *testing.T) {
 
 func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 	base := validPool()
-	baseGen := base.Generation("fp")
+	baseGen := base.Generation("fp", "image")
 
 	tests := []struct {
 		name   string
@@ -173,14 +173,14 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p := validPool()
 			tt.mutate(&p)
-			if p.Generation("fp") == baseGen {
+			if p.Generation("fp", "image") == baseGen {
 				t.Fatalf("changing %s left the generation alone, so runners would keep the old configuration", tt.name)
 			}
 		})
 	}
 
 	t.Run("credential", func(t *testing.T) {
-		if base.Generation("other-fingerprint") == baseGen {
+		if base.Generation("other-fingerprint", "image") == baseGen {
 			t.Fatal("replacing the credential left the generation alone")
 		}
 	})
@@ -190,7 +190,7 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 	t.Run("the scaling bounds do not", func(t *testing.T) {
 		p := validPool()
 		p.MinReplicas, p.MaxReplicas = 2, 10
-		if p.Generation("fp") != baseGen {
+		if p.Generation("fp", "image") != baseGen {
 			t.Fatal("changing the scaling bounds changed the generation, which would replace every healthy runner")
 		}
 	})
@@ -201,7 +201,7 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 // the pool is identical before and after — so the revision is part of it.
 func TestGenerationCoversHowRunnersAreBuilt(t *testing.T) {
 	p := validPool()
-	generation := p.Generation("fp")
+	generation := p.Generation("fp", "image")
 
 	// What the hash would be if the revision had not moved: if these are ever
 	// equal, an upgrade that fixes the recipe leaves every runner on the old
@@ -235,11 +235,11 @@ func poolGenerationAtRevision(p Pool, fingerprint string, revision int) string {
 
 func TestGenerationIsStable(t *testing.T) {
 	p := validPool()
-	if p.Generation("fp") != p.Generation("fp") {
+	if p.Generation("fp", "image") != p.Generation("fp", "image") {
 		t.Fatal("the same pool hashed differently twice")
 	}
-	if len(p.Generation("fp")) != 12 {
-		t.Fatalf("want a short readable hash, got %q", p.Generation("fp"))
+	if len(p.Generation("fp", "image")) != 12 {
+		t.Fatalf("want a short readable hash, got %q", p.Generation("fp", "image"))
 	}
 }
 
