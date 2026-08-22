@@ -186,8 +186,36 @@ func TestAJobCanSudoInsideTheMachine(t *testing.T) {
 // made of the old thing. The generation covers what an operator configured, not
 // what the daemon does with it, so this constant is the only thing that can.
 func TestTheSpecRevisionMovedWithTheImage(t *testing.T) {
-	if model.SpecRevision < 3 {
+	if model.SpecRevision < 4 {
 		t.Fatalf("spec revision %d: machines built before sudo and the runner bump are still"+
 			" wanted, so nothing replaces them", model.SpecRevision)
+	}
+}
+
+// The bug this pair of tests exists for: revision 3 gave jobs passwordless sudo
+// and was installed on a host that went on booting machines without it, because
+// the change was to the build script and the image's name did not depend on the
+// build script. The fix shipped, and did nothing.
+func TestTheImageNameCoversTheScriptThatBuildsIt(t *testing.T) {
+	spec := ImageSpec{Variant: "default"}
+	before := spec.Name()
+
+	original := provision
+	t.Cleanup(func() { provision = original })
+	provision = func() string { return original() + "\necho 'something new at build time'\n" }
+
+	if after := spec.Name(); after == before {
+		t.Fatalf("changing what the build does left the image called %s, so every host"+
+			" would keep the image it already has", after)
+	}
+}
+
+// And the other half: the same recipe has to produce the same name, or every
+// daemon restart would build an image nobody asked for.
+func TestTheSameRecipeIsTheSameImage(t *testing.T) {
+	one := ImageSpec{Variant: "default"}
+	same := ImageSpec{Variant: "default"}
+	if one.Name() != same.Name() {
+		t.Fatal("the same spec named two images")
 	}
 }

@@ -51,13 +51,27 @@ type ImageSpec struct {
 	Packages []string
 }
 
+// provision is the script an image is built with, as a variable so that a test
+// can prove the image's name depends on it.
+var provision = provisionScript
+
 // Name is the file name for an image, and is a hash of everything that goes
-// into it: two images with the same name are the same image, and changing the
-// package list builds a new one rather than silently reusing the old.
+// into it: two images with the same name are the same image, and changing any
+// part of how one is built produces a new name rather than silently reusing the
+// old image.
+//
+// "Everything" has to include the script, and once did not. The list of
+// packages and the runner version were hashed and the provisioning was not, so
+// a release that changed what the build *does* — giving the job passwordless
+// sudo — produced the same name as the release before it, found that image
+// already on disk, and reused it. The change shipped, was installed, and did
+// nothing at all; the only symptom was jobs still failing on the thing that had
+// just been fixed.
 func (s ImageSpec) Name() string {
 	h := sha256.New()
 	h.Write([]byte(UbuntuRelease))
 	h.Write([]byte(RunnerVersion))
+	h.Write([]byte(provision()))
 	for _, pkg := range s.EffectivePackages() {
 		h.Write([]byte(pkg))
 		h.Write([]byte{0})
