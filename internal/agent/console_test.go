@@ -219,3 +219,26 @@ func TestTheSameRecipeIsTheSameImage(t *testing.T) {
 		t.Fatal("the same spec named two images")
 	}
 }
+
+// A machine boots for one job and is destroyed, so every second of the boot is
+// paid by every job on the host. These are the services a stock cloud image
+// starts that a runner has no use for.
+func TestTheImageDoesNotBootThingsARunnerWillNeverUse(t *testing.T) {
+	script := provisionScript()
+
+	for _, useless := range []string{"snapd.service", "ModemManager.service", "multipathd.service", "apt-daily.timer"} {
+		if !strings.Contains(script, useless) {
+			t.Errorf("%s still starts on every boot, and no job will ever ask for it", useless)
+		}
+	}
+	// Disabled, not masked: a job that genuinely wants one can start it.
+	if strings.Contains(script, "systemctl mask") {
+		t.Error("services are masked rather than disabled, so a job cannot start one if it needs it")
+	}
+	// And the things a job does need are untouched.
+	for _, needed := range []string{"systemctl enable docker"} {
+		if !strings.Contains(script, needed) {
+			t.Errorf("%q is missing from the image", needed)
+		}
+	}
+}
