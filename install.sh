@@ -47,9 +47,25 @@ esac
 
 if [[ "$VERSION" == "latest" ]]; then
   log "finding the latest release"
-  VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
-  [[ -n "$VERSION" ]] || die "could not find a release; set VERSION=vX.Y.Z"
+  # Asked of github.com rather than api.github.com, because the API allows
+  # sixty unauthenticated calls an hour per address and this is the one call
+  # every install makes. Anyone behind a shared address — an office, a NAT, a
+  # CI fleet — spends that budget between them, and the sixty-first install of
+  # the hour fails with a 403 and no clue as to why. This repository hit it
+  # with its own CI: the installer test runs on the fleet this builds, so a
+  # busy afternoon of pull requests is one address making the call over and
+  # over.
+  #
+  # /releases/latest redirects to the tag, so the answer is in the URL curl
+  # ends up at and no body has to be parsed.
+  LATEST=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${REPO}/releases/latest") || LATEST=""
+  case "$LATEST" in
+    */releases/tag/*) VERSION=${LATEST##*/} ;;
+    # No releases yet, or the repository is private to whoever is asking: both
+    # land somewhere that is not a tag.
+    *) die "could not find a release; set VERSION=vX.Y.Z" ;;
+  esac
 fi
 NUMBER=${VERSION#v}
 
