@@ -324,6 +324,9 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 		if unit, ok := states[unitName(runners[i].Name)]; ok {
 			runners[i].State = unit.state
 			runners[i].Trouble = unit.trouble(runners[i].Name)
+			if unit.state == reconcile.StateRunning {
+				runners[i].Up = unit.running
+			}
 		}
 	}
 	sort.Slice(runners, func(i, j int) bool { return runners[i].Name < runners[j].Name })
@@ -337,6 +340,10 @@ type unit struct {
 	restarts int
 	// draining is how long the unit has been stopping, when it is.
 	draining time.Duration
+	// running is how long it has been up, when it is. A machine takes a minute
+	// or two to boot and register, and that is not the same thing as a runner
+	// GitHub has never heard of.
+	running time.Duration
 }
 
 // patience is how long a drain can take before it is worth mentioning.
@@ -376,14 +383,14 @@ func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]u
 	// --timestamp=unix so the timestamps are numbers rather than a locale's
 	// idea of a date.
 	args := append([]string{"show", "--timestamp=unix",
-		"--property=Id,ActiveState,SubState,Result,NRestarts,ActiveExitTimestamp"}, units...)
+		"--property=Id,ActiveState,SubState,Result,NRestarts,ActiveExitTimestamp,ActiveEnterTimestamp"}, units...)
 	out, err := e.cmd.Run(ctx, "systemctl", args...)
 	if err != nil {
 		return nil, err
 	}
 
 	states := map[string]unit{}
-	var id, active, sub, result, restarts, leftActive string
+	var id, active, sub, result, restarts, leftActive, becameActive string
 	flush := func() {
 		if id != "" {
 			count, _ := strconv.Atoi(restarts)
@@ -392,9 +399,10 @@ func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]u
 				result:   result,
 				restarts: count,
 				draining: e.since(leftActive),
+				running:  e.since(becameActive),
 			}
 		}
-		id, active, sub, result, restarts, leftActive = "", "", "", "", "", ""
+		id, active, sub, result, restarts, leftActive, becameActive = "", "", "", "", "", "", ""
 	}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
@@ -415,6 +423,8 @@ func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]u
 			restarts = value
 		case key == "ActiveExitTimestamp":
 			leftActive = value
+		case key == "ActiveEnterTimestamp":
+			becameActive = value
 		}
 	}
 	flush()

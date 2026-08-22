@@ -531,6 +531,25 @@ type RunnerStatus struct {
 	Trouble string `json:"trouble,omitempty"`
 }
 
+// registering is how long a runner is given to appear on GitHub before its
+// absence is worth remarking on.
+//
+// A machine boots, runs cloud-init and registers, which is a minute or two; an
+// ephemeral one does that after every job, so for a busy pool this state is
+// most of what anybody sees. Reporting it as "unknown" the whole time made a
+// working fleet look broken — three times in one day, to the person who built
+// it.
+const registering = 4 * time.Minute
+
+// jobOfARunnerGitHubHasNotSeen distinguishes a runner on its way up from one
+// that should be there and is not.
+func jobOfARunnerGitHubHasNotSeen(runner Runner) string {
+	if runner.State == StateRunning && runner.Up > 0 && runner.Up < registering {
+		return "starting"
+	}
+	return "unknown"
+}
+
 // Status reports the fleet for the UI.
 func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 	actual, errs := r.listAll(ctx)
@@ -581,7 +600,7 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 	for _, runner := range sortedRunners(actual) {
 		job := string(states[runner.Name])
 		if job == "" {
-			job = "unknown"
+			job = jobOfARunnerGitHubHasNotSeen(runner)
 		}
 		want, known := generations[runner.Pool]
 		out = append(out, RunnerStatus{

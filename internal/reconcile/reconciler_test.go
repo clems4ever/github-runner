@@ -598,3 +598,45 @@ func TestOnlyOnePassRunsAtATime(t *testing.T) {
 			" is changing underneath it", overlap)
 	}
 }
+
+// A machine takes a minute or two to boot and register, and an ephemeral one
+// does that after every job, so for a busy pool "GitHub has never heard of
+// this runner" is most of what anybody sees. Reporting it as unknown made a
+// working fleet look broken.
+func TestARunnerOnItsWayUpIsNotReportedAsUnknown(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		runner Runner
+		want   string
+	}{
+		{
+			"just booted",
+			Runner{Name: "web-1", State: StateRunning, Up: 20 * time.Second},
+			"starting",
+		},
+		{
+			"up long enough that GitHub should know it",
+			Runner{Name: "web-1", State: StateRunning, Up: 30 * time.Minute},
+			"unknown",
+		},
+		{
+			// Nothing is starting: it is not running at all.
+			"stopped",
+			Runner{Name: "web-1", State: StateStopped, Up: 0},
+			"unknown",
+		},
+		{
+			// A host that cannot say how long it has been up says nothing, and
+			// the answer stays what it was.
+			"no uptime from the host",
+			Runner{Name: "web-1", State: StateRunning},
+			"unknown",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := jobOfARunnerGitHubHasNotSeen(tt.runner); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
