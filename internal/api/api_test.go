@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -497,3 +498,57 @@ func readAll(t *testing.T, resp *http.Response) string {
 }
 
 func itoa(id int64) string { return strconv.FormatInt(id, 10) }
+
+func TestActivity(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now().UTC()
+	if err := h.store.RecordSamples(context.Background(), now.Add(-time.Minute),
+		[]model.Sample{{Pool: "web", Running: 3, Busy: 2, Target: 3}}); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := readAll(t, h.do("GET", "/api/activity?hours=1", nil))
+	for _, want := range []string{`"running":3`, `"busy":2`, `"since"`, `"until"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("the response is missing %q: %s", want, payload)
+		}
+	}
+}
+
+func TestActivityRejectsAnAbsurdWindow(t *testing.T) {
+	h := newHarness(t)
+	for _, query := range []string{"?hours=0", "?hours=1000", "?hours=nonsense"} {
+		resp := h.do("GET", "/api/activity"+query, nil)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s answered %d, want 400", query, resp.StatusCode)
+		}
+	}
+}
+
+func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now().UTC()
+	if err := h.store.RecordSamples(context.Background(), now.Add(-time.Minute), []model.Sample{
+		{Pool: "web", Running: 3, Busy: 2},
+		{Pool: "api", Running: 7, Busy: 5},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := readAll(t, h.do("GET", "/api/activity?hours=1&pool=api", nil))
+	if !strings.Contains(payload, `"running":7`) {
+		t.Fatalf("want only the api pool: %s", payload)
+	}
+	if strings.Contains(payload, `"running":10`) {
+		t.Fatalf("the pools were added together despite the filter: %s", payload)
+	}
+}
+
+func TestActivityDefaultsToARecentWindow(t *testing.T) {
+	h := newHarness(t)
+	payload := readAll(t, h.do("GET", "/api/activity", nil))
+	if !strings.Contains(payload, `"points"`) {
+		t.Fatalf("got %s", payload)
+	}
+}

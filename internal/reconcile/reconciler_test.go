@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
@@ -94,6 +95,12 @@ type fakeStore struct {
 	pools       []model.Pool
 	fingerprint string
 	tokenErr    error
+	samples     []model.Sample
+}
+
+func (f *fakeStore) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {
+	f.samples = append(f.samples, samples...)
+	return nil
 }
 
 func (f *fakeStore) ListPools(ctx context.Context) ([]model.Pool, error) { return f.pools, nil }
@@ -412,6 +419,10 @@ func (s *splitStore) Token(ctx context.Context, id int64) (string, error) {
 		return "", errors.New("credential 99: not found")
 	}
 	return s.good.Token(ctx, id)
+}
+
+func (s *splitStore) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {
+	return s.good.RecordSamples(ctx, at, samples)
 }
 
 // Losing GitHub must not make the daemon destructive: without an answer about

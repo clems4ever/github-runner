@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/secrets"
@@ -422,5 +423,158 @@ func TestUpgradingADatabaseFromBeforeAutoscaling(t *testing.T) {
 	// The rest of it must come through untouched.
 	if pool.Name != "web" || pool.Scope != "o/r" || pool.CPUs != 2 || pool.Labels[0] != "fast" {
 		t.Fatalf("the upgrade changed the pool: %+v", pool)
+	}
+}
+
+func TestActivityBucketsThePeaks(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	// Two pools, sampled every thirty seconds for ten minutes. One of them has
+	// a brief burst: every runner busy for a single sample.
+	for i := 0; i < 20; i++ {
+		at := base.Add(time.Duration(i) * 30 * time.Second)
+		busy := 1
+		if i == 7 {
+			busy = 4 // the burst
+		}
+		if err := s.RecordSamples(ctx, at, []model.Sample{
+			{Pool: "web", Running: 4, Busy: busy, Target: 4},
+			{Pool: "api", Running: 2, Busy: 0, Target: 2},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	points, err := s.Activity(ctx, base, base.Add(10*time.Minute), 10, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) == 0 {
+		t.Fatal("no history came back")
+	}
+
+	// Each point is the whole fleet, both pools added together.
+	for _, point := range points {
+		if point.Running != 6 {
+			t.Fatalf("a point reports %d runners, want both pools counted: %+v", point.Running, point)
+		}
+	}
+
+	// The burst has to survive bucketing. A mean over a minute would flatten
+	// four busy runners into one and a bit, which is the opposite of what the
+	// chart is for.
+	var peak int
+	for _, point := range points {
+		if point.Busy > peak {
+			peak = point.Busy
+		}
+	}
+	if peak != 4 {
+		t.Fatalf("the peak came back as %d, want the burst preserved", peak)
+	}
+}
+
+// A daemon that was not running should read as a gap, not as a fleet that was
+// switched off.
+func TestActivityLeavesGapsWhereThereIsNoHistory(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	if err := s.RecordSamples(ctx, base, []model.Sample{{Pool: "web", Running: 2, Busy: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	points, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 {
+		t.Fatalf("got %d points, want only the one that was recorded", len(points))
+	}
+}
+
+func TestActivityForgetsOldHistory(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	old := now.Add(-SampleRetention - time.Hour)
+	if err := s.RecordSamples(ctx, old, []model.Sample{{Pool: "web", Running: 9, Busy: 9}}); err != nil {
+		t.Fatal(err)
+	}
+	// Recording again is what prunes: the daemon does it every pass, so nothing
+	// has to remember to tidy up.
+	if err := s.RecordSamples(ctx, now, []model.Sample{{Pool: "web", Running: 1, Busy: 0}}); err != nil {
+		t.Fatal(err)
+	}
+
+	points, err := s.Activity(ctx, old.Add(-time.Hour), now, 100, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, point := range points {
+		if point.Running == 9 {
+			t.Fatal("history older than the retention window was kept")
+		}
+	}
+}
+
+func TestActivityOnAFreshInstall(t *testing.T) {
+	s := newStore(t)
+	now := time.Now()
+	points, err := s.Activity(context.Background(), now.Add(-time.Hour), now, 60, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Empty, not nil: this is serialised straight to JSON, and null where the
+	// chart expects a list is a crash in the browser.
+	if points == nil {
+		t.Fatal("no history came back as nil rather than an empty list")
+	}
+}
+
+// The UI can narrow the history to one pool, which is how someone looks at a
+// single repository without a chart per pool crowding the page.
+func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 4; i++ {
+		at := base.Add(time.Duration(i) * time.Minute)
+		if err := s.RecordSamples(ctx, at, []model.Sample{
+			{Pool: "web", Running: 4, Busy: 3},
+			{Pool: "api", Running: 2, Busy: 1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	whole, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if whole[0].Running != 6 || whole[0].Busy != 4 {
+		t.Fatalf("the fleet-wide view is %+v, want both pools added together", whole[0])
+	}
+
+	just, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if just[0].Running != 2 || just[0].Busy != 1 {
+		t.Fatalf("the api view is %+v, want only that pool", just[0])
+	}
+
+	// A pool with no history is empty, not an error: a pool created a moment
+	// ago honestly has nothing to show.
+	none, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "never-existed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("got %+v", none)
 	}
 }

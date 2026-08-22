@@ -14,6 +14,7 @@ import {
 } from '@mantine/core'
 import { IconAlertTriangle, IconServerOff } from '@tabler/icons-react'
 import type { JobState, Pool, Runner, RunnerState, Scale } from '../api'
+import { ActivityChart } from './ActivityChart'
 
 /**
  * The fleet as it actually is.
@@ -64,6 +65,8 @@ export function FleetPage({
           hint={stale > 0 ? 'finishing their jobs first' : undefined}
         />
       </SimpleGrid>
+
+      <ActivityChart pools={pools} />
 
       {elastic.length > 0 && (
         <Card withBorder padding="md">

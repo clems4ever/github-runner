@@ -98,7 +98,23 @@ var migrations = []string{
 	`ALTER TABLE pools ADD COLUMN min_replicas INTEGER NOT NULL DEFAULT 1`,
 	`ALTER TABLE pools ADD COLUMN max_replicas INTEGER NOT NULL DEFAULT 1`,
 	`UPDATE pools SET min_replicas = MAX(replicas, 1), max_replicas = MAX(replicas, 1)`,
+	// What the fleet was doing, over time. One row per pool per reconcile
+	// pass, pruned to a couple of days: enough to see yesterday's build storm,
+	// small enough that nobody has to think about it.
+	`CREATE TABLE samples (
+		at      TEXT    NOT NULL,
+		pool    TEXT    NOT NULL,
+		running INTEGER NOT NULL,
+		busy    INTEGER NOT NULL,
+		target  INTEGER NOT NULL
+	)`,
+	`CREATE INDEX samples_at ON samples(at)`,
 }
+
+// SampleRetention is how much history the daemon keeps. Two days covers "what
+// happened overnight" without turning the database into something that needs
+// managing.
+const SampleRetention = 48 * time.Hour
 
 func (s *Store) migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)`); err != nil {
@@ -441,6 +457,111 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 		`INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
 		key, value)
 	return err
+}
+
+// ---------------------------------------------------------------------------
+// Activity
+// ---------------------------------------------------------------------------
+
+// RecordSamples stores one observation per pool and prunes what has aged out.
+func (s *Store) RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error {
+	if len(samples) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	stamp := at.UTC().Format(time.RFC3339Nano)
+	for _, sample := range samples {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO samples (at, pool, running, busy, target) VALUES (?,?,?,?,?)`,
+			stamp, sample.Pool, sample.Running, sample.Busy, sample.Target); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM samples WHERE at < ?`,
+		at.Add(-SampleRetention).UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Activity returns a history over a window, in a fixed number of buckets.
+//
+// Bucketed here rather than in the browser, because a day at one pass every
+// thirty seconds is a few thousand rows and a chart wants a couple of hundred
+// points. Each bucket reports the *peak* it saw, not the average: a burst that
+// filled the fleet for two minutes is the thing worth seeing, and a mean over
+// a ten-minute bucket would flatten it into nothing.
+// An empty pool name is the whole fleet; naming one narrows it to that pool,
+// which is how the UI shows a single repository's history without a chart per
+// pool crowding the page.
+func (s *Store) Activity(ctx context.Context, since, until time.Time, buckets int, pool string) ([]model.ActivityPoint, error) {
+	if buckets < 1 {
+		buckets = 1
+	}
+
+	query := `SELECT at, SUM(running), SUM(busy) FROM samples WHERE at >= ? AND at <= ?`
+	args := []any{since.UTC().Format(time.RFC3339Nano), until.UTC().Format(time.RFC3339Nano)}
+	if pool != "" {
+		query += ` AND pool = ?`
+		args = append(args, pool)
+	}
+	query += ` GROUP BY at ORDER BY at`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	width := until.Sub(since) / time.Duration(buckets)
+	if width <= 0 {
+		width = time.Second
+	}
+	peaks := make([]*model.ActivityPoint, buckets)
+
+	for rows.Next() {
+		var stamp string
+		var running, busy int
+		if err := rows.Scan(&stamp, &running, &busy); err != nil {
+			return nil, err
+		}
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil {
+			continue
+		}
+		index := int(at.Sub(since) / width)
+		if index < 0 || index >= buckets {
+			continue
+		}
+		if peaks[index] == nil {
+			peaks[index] = &model.ActivityPoint{At: since.Add(time.Duration(index) * width)}
+		}
+		if running > peaks[index].Running {
+			peaks[index].Running = running
+		}
+		if busy > peaks[index].Busy {
+			peaks[index].Busy = busy
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Empty buckets are left out rather than drawn as zero: a daemon that was
+	// not running should read as a gap in the line, not as a fleet that was
+	// switched off.
+	out := []model.ActivityPoint{}
+	for _, point := range peaks {
+		if point != nil {
+			out = append(out, *point)
+		}
+	}
+	return out, nil
 }
 
 func isUnique(err error) bool {

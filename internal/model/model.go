@@ -296,6 +296,23 @@ func (p *Pool) Defaults() {
 	sort.Strings(p.Labels)
 }
 
+// Sample is one observation of a pool: how many runners it had and how many
+// were working. Kept over time, these are what the activity chart draws.
+type Sample struct {
+	Pool    string
+	Running int
+	Busy    int
+	Target  int
+}
+
+// ActivityPoint is one point on the activity chart: the whole fleet at a
+// moment, bucketed.
+type ActivityPoint struct {
+	At      time.Time `json:"at"`
+	Running int       `json:"running"`
+	Busy    int       `json:"busy"`
+}
+
 // DefaultImage is what a pool runs when nothing else is asked for.
 //
 // The value is a variant key rather than a path: pools will grow per-repository

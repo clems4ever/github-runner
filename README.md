@@ -105,6 +105,22 @@ every pool was before this existed, and what an upgraded database keeps.
 The fleet view says which pool is at what size and why: *every runner is busy*,
 *quiet for 7m*, *spare capacity available*.
 
+### Activity
+
+The daemon records what it observed on every pass and keeps two days of it, so
+the fleet view can show what has been happening rather than only what is
+happening now. The filled area is work actually running; the line above it is
+how many runners existed to run it — one axis, both counting runners — so a
+pool scaling up reads as the line stepping out to meet the area, and settling
+back when the work stops.
+
+![Activity](docs/img/activity.png)
+
+Each point is the **peak** of its interval, not the mean: a burst that filled
+the fleet for two minutes is the thing worth seeing, and averaging over a
+ten-minute bucket would flatten it into nothing. Narrow it to a single pool
+with the filter, or leave it on the whole fleet.
+
 ### Virtual machines or containers
 
 A **virtual machine** gives a job its own kernel, its own Docker daemon and a

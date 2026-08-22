@@ -35,6 +35,7 @@ type Fleet interface {
 	ListPools(ctx context.Context) ([]model.Pool, error)
 	CredentialFingerprint(ctx context.Context, id int64) (string, error)
 	Token(ctx context.Context, id int64) (string, error)
+	RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error
 }
 
 // GitHubClient is the part of GitHub the reconciler needs.
@@ -258,6 +259,11 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	result.Scaling = scaling
 	r.rememberScaling(scaling)
 
+	// What was observed is kept, so the UI can show what the fleet has been
+	// doing rather than only what it is doing this second. Recorded before the
+	// actions are applied: this is an observation, not a prediction.
+	r.record(ctx, pools, byPool, states, scaling, &result)
+
 	actions := Plan(desired, actual, states)
 	result.Actions = actions
 
@@ -280,6 +286,30 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	r.last = result
 	r.mu.Unlock()
 	return result
+}
+
+// record keeps one observation per pool for the activity history.
+func (r *Reconciler) record(ctx context.Context, pools []model.Pool, byPool map[string][]Runner,
+	states map[string]github.State, scaling map[string]Scale, result *Result) {
+
+	samples := make([]model.Sample, 0, len(pools))
+	for _, pool := range pools {
+		sample := model.Sample{Pool: pool.Name, Target: scaling[pool.Name].Target}
+		for _, runner := range byPool[pool.Name] {
+			if runner.State == StateStopping {
+				continue
+			}
+			sample.Running++
+			if states[runner.Name] == github.StateBusy {
+				sample.Busy++
+			}
+		}
+		samples = append(samples, sample)
+	}
+	if err := r.store.RecordSamples(ctx, r.now(), samples); err != nil {
+		// History is worth having, not worth failing a pass over.
+		result.Errors = append(result.Errors, fmt.Sprintf("record what the fleet is doing: %v", err))
+	}
 }
 
 // statesForOrphans asks GitHub about runners that no pool claims.
