@@ -108,6 +108,22 @@ describe('ActivityChart', () => {
     expect(await screen.findByText(/Peak per interval/)).toBeInTheDocument()
   })
 
+  // The grid and the axis labels are coloured through CSS variables rather
+  // than the `gridColor` and `textColor` props, which @mantine/charts now
+  // forwards to the DOM. Worth pinning: the difference between the two routes
+  // is invisible on screen, so a change back to the props would show up only
+  // as console noise.
+  it('colours the grid and the labels from the palette', async () => {
+    activity.mockResolvedValue({ points: points(5), pool: '', since: '', until: '' })
+    const { container } = renderChart()
+    await screen.findByText('Runners')
+
+    const root = container.querySelector<HTMLElement>('.mantine-CompositeChart-root')
+    expect(root?.style.getPropertyValue('--chart-grid-color')).toBe('#e1e0d9')
+    expect(root?.style.getPropertyValue('--chart-text-color')).toBe('#898781')
+    expect(root).not.toHaveAttribute('gridcolor')
+  })
+
   it('does not pretend the fleet is empty when it cannot read the history', async () => {
     activity.mockRejectedValue(new Error('unreachable'))
     renderChart()

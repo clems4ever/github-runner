@@ -51,6 +51,15 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # The release job runs this too, but it runs it on the day of a release,
+      # which is the worst day to find out that a key in .goreleaser.yaml is on
+      # its way out. Here it costs a pull request instead.
+      - name: The release config is still current
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          args: check
+
       # The daemon runs as root and the runners' agents do not, so half of what
       # the daemon writes is written for somebody else to read. A test running
       # as one user cannot check that, and while there was no test that could,
