@@ -13,6 +13,7 @@ VERSION=${VERSION:-latest}
 INSTALL_BIN=${INSTALL_BIN:-/usr/local/bin/runner-fleet}
 SERVICE_USER=${SERVICE_USER:-runner-fleet}
 UNIT=/etc/systemd/system/runner-fleetd.service
+ETC_DIR=/etc/runner-fleet
 # Where the UI listens. An upgrade keeps whatever the last install chose: a
 # rerun must not move the UI to a different port because nobody remembered to
 # repeat the flag.
@@ -105,7 +106,7 @@ else
   warn "/dev/kvm is missing, so this host cannot run VM pools (container pools are unaffected)"
 fi
 
-install -d -m 0700 /etc/runner-fleet /var/lib/runner-fleet
+install -d -m 0700 "$ETC_DIR" /var/lib/runner-fleet
 chown -R "${SERVICE_USER}:${SERVICE_USER}" /var/lib/runner-fleet
 
 # Written beside the destination and renamed into place: the destination may be
@@ -145,18 +146,21 @@ systemctl daemon-reload
 # The web UI's password
 # ---------------------------------------------------------------------------
 
-# Only asked for on a first install, or when there is still no password: an
-# upgrade must not stop to ask anything.
+# Only asked for on a first install: an upgrade must not stop to ask anything.
+#
+# Nothing here may read standard input. This script is meant to be piped into
+# bash, and when it is, bash reads it from standard input as it goes — so a
+# command that consumes stdin eats the rest of the script, and bash then
+# reports a syntax error in the middle of nowhere. An earlier version probed
+# for an existing password by running "passwd" with an empty one, which reads
+# the password from stdin, which ate everything below this line.
 NEEDS_PASSWORD=true
-if [[ "$UPGRADE" == "true" ]] && "$INSTALL_BIN" passwd --user "" --password "" >/dev/null 2>&1; then
-  NEEDS_PASSWORD=false
-fi
-if [[ -f /etc/runner-fleet/fleet.db ]] && [[ "$UPGRADE" == "true" ]]; then
+if [[ "$UPGRADE" == "true" && -f "${ETC_DIR}/fleet.db" ]]; then
   NEEDS_PASSWORD=false
 fi
 
 if [[ -n "$FLEET_PASSWORD" ]]; then
-  "$INSTALL_BIN" passwd --user "${FLEET_USER:-admin}" --password "$FLEET_PASSWORD"
+  "$INSTALL_BIN" passwd --user "${FLEET_USER:-admin}" --password "$FLEET_PASSWORD" < /dev/null
 elif [[ "$NEEDS_PASSWORD" == "true" ]]; then
   # The daemon serves nothing until a password is set, so this is not optional
   # — but it can be done later by hand if there is no terminal here.
@@ -192,7 +196,7 @@ fi
 # Start
 # ---------------------------------------------------------------------------
 
-systemctl enable runner-fleetd >/dev/null 2>&1 || true
+systemctl enable runner-fleetd >/dev/null 2>&1 < /dev/null || true
 if [[ "$UPGRADE" == "true" ]]; then
   # Restarting the daemon does not touch the runners: they are units and
   # containers of their own, and this is the whole reason for that design.
