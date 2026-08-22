@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -434,6 +435,72 @@ func TestUpgradingADatabaseFromBeforeAutoscaling(t *testing.T) {
 	}
 }
 
+// History recorded before scopes were kept is backfilled from the pools that
+// are still there, so an upgraded installation can be read by scope straight
+// away rather than after the old samples have aged out.
+func TestUpgradingADatabaseFromBeforeScopedHistory(t *testing.T) {
+	dir := t.TempDir()
+	ring, err := secrets.LoadOrCreateKey(filepath.Join(dir, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "fleet.db")
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	// Every migration up to but not including the scope column: the schema as
+	// it stood when samples knew only which pool they came from.
+	before := len(migrations) - 2
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range append([]string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
+		fmt.Sprintf(`INSERT INTO schema_version (version) VALUES (%d)`, before),
+	}, migrations[:before]...) {
+		if _, err := old.Exec(statement); err != nil {
+			t.Fatalf("building the old schema: %v", err)
+		}
+	}
+	if _, err := old.Exec(
+		`INSERT INTO credentials (name, sealed, hint, created_at) VALUES ('pat', 'x', '…1234', '2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(
+		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, replicas, labels,
+			cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at,
+			min_replicas, max_replicas)
+		 VALUES ('web','repository','acme/site','vm',0,1,3,'fast',2,4096,40,'default',1,1,
+			'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',3,3)`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(
+		`INSERT INTO samples (at, pool, running, busy, target) VALUES (?, 'web', 3, 2, 3)`,
+		base.Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	s, err := Open(path, ring)
+	if err != nil {
+		t.Fatalf("upgrading: %v", err)
+	}
+	defer s.Close()
+
+	ctx := context.Background()
+	points, err := s.Activity(ctx, base.Add(-time.Hour), base.Add(time.Hour), 60,
+		ActivityFilter{Scope: "acme/site"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Busy != 2 {
+		t.Fatalf("got %+v, want the old sample attributed to its pool's scope", points)
+	}
+}
+
 func TestActivityBucketsThePeaks(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()
@@ -455,7 +522,7 @@ func TestActivityBucketsThePeaks(t *testing.T) {
 		}
 	}
 
-	points, err := s.Activity(ctx, base, base.Add(10*time.Minute), 10, "")
+	points, err := s.Activity(ctx, base, base.Add(10*time.Minute), 10, ActivityFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +561,7 @@ func TestActivityLeavesGapsWhereThereIsNoHistory(t *testing.T) {
 	if err := s.RecordSamples(ctx, base, []model.Sample{{Pool: "web", Running: 2, Busy: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	points, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "")
+	points, err := s.Activity(ctx, base, base.Add(time.Hour), 60, ActivityFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +585,7 @@ func TestActivityForgetsOldHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	points, err := s.Activity(ctx, old.Add(-time.Hour), now, 100, "")
+	points, err := s.Activity(ctx, old.Add(-time.Hour), now, 100, ActivityFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +599,7 @@ func TestActivityForgetsOldHistory(t *testing.T) {
 func TestActivityOnAFreshInstall(t *testing.T) {
 	s := newStore(t)
 	now := time.Now()
-	points, err := s.Activity(context.Background(), now.Add(-time.Hour), now, 60, "")
+	points, err := s.Activity(context.Background(), now.Add(-time.Hour), now, 60, ActivityFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -560,7 +627,7 @@ func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
 		}
 	}
 
-	whole, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "")
+	whole, err := s.Activity(ctx, base, base.Add(time.Hour), 60, ActivityFilter{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +635,7 @@ func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
 		t.Fatalf("the fleet-wide view is %+v, want both pools added together", whole[0])
 	}
 
-	just, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "api")
+	just, err := s.Activity(ctx, base, base.Add(time.Hour), 60, ActivityFilter{Pool: "api"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,12 +645,131 @@ func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
 
 	// A pool with no history is empty, not an error: a pool created a moment
 	// ago honestly has nothing to show.
-	none, err := s.Activity(ctx, base, base.Add(time.Hour), 60, "never-existed")
+	none, err := s.Activity(ctx, base, base.Add(time.Hour), 60, ActivityFilter{Pool: "never-existed"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(none) != 0 {
 		t.Fatalf("got %+v", none)
+	}
+}
+
+// Several pools can point at the same repository or organisation, and asking
+// by scope is asking about the repository, not about whichever pool happens to
+// be serving it.
+func TestActivityCanBeNarrowedToOneScope(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 4; i++ {
+		at := base.Add(time.Duration(i) * time.Minute)
+		if err := s.RecordSamples(ctx, at, []model.Sample{
+			{Pool: "web", Scope: "acme/site", Running: 4, Busy: 3},
+			{Pool: "web-arm", Scope: "acme/site", Running: 1, Busy: 1},
+			{Pool: "api", Scope: "acme/api", Running: 2, Busy: 1},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	site, err := s.Activity(ctx, base, base.Add(time.Hour), 60, ActivityFilter{Scope: "acme/site"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if site[0].Running != 5 || site[0].Busy != 4 {
+		t.Fatalf("the acme/site view is %+v, want both of its pools added together", site[0])
+	}
+
+	// Both together is one pool checked against its own scope, which is what
+	// the two filters in the UI compose to.
+	both, err := s.Activity(ctx, base, base.Add(time.Hour), 60,
+		ActivityFilter{Pool: "web", Scope: "acme/site"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if both[0].Running != 4 {
+		t.Fatalf("pool and scope together gave %+v, want just the one pool", both[0])
+	}
+
+	scopes, err := s.ActivityScopes(ctx, base, base.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(scopes, ",") != "acme/api,acme/site" {
+		t.Fatalf("got %v, want both scopes, sorted so the UI does not shuffle", scopes)
+	}
+}
+
+// A pool can be deleted; the hours it worked still happened. The history keeps
+// the scope it was recorded against, so the work stays attributed to the
+// repository until it ages out of the retention window.
+func TestActivityKeepsTheScopeOfADeletedPool(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	cred := credential(t, s)
+	pool, err := s.CreatePool(ctx, samplePool(cred.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordSamples(ctx, base, []model.Sample{
+		{Pool: pool.Name, Scope: pool.Scope, Running: 3, Busy: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeletePool(ctx, pool.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	points, err := s.Activity(ctx, base, base.Add(time.Hour), 60, ActivityFilter{Scope: pool.Scope})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(points) != 1 || points[0].Busy != 2 {
+		t.Fatalf("got %+v, want the deleted pool's work still counted against its scope", points)
+	}
+
+	// And the scope stays on offer for as long as there is something to show.
+	scopes, err := s.ActivityScopes(ctx, base, base.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scopes) != 1 || scopes[0] != pool.Scope {
+		t.Fatalf("got %v, want %q", scopes, pool.Scope)
+	}
+}
+
+// Samples recorded before scopes were kept have none. They still count towards
+// the fleet, and they are not offered as a scope with no name.
+func TestActivityScopesIgnoresHistoryFromBeforeScopesWereRecorded(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	base := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)
+
+	if err := s.RecordSamples(ctx, base, []model.Sample{{Pool: "web", Running: 2, Busy: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	scopes, err := s.ActivityScopes(ctx, base, base.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Empty, not nil: this is serialised straight to JSON, and null where the
+	// UI expects a list is a crash in the browser.
+	if scopes == nil {
+		t.Fatal("no scopes came back as nil rather than an empty list")
+	}
+	if len(scopes) != 0 {
+		t.Fatalf("got %v, want nothing offered for history with no scope", scopes)
+	}
+
+	fleet, err := s.Activity(ctx, base, base.Add(time.Hour), 60, ActivityFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fleet) != 1 || fleet[0].Running != 2 {
+		t.Fatalf("got %+v, want the unscoped history still counted", fleet)
 	}
 }
 

@@ -375,7 +375,11 @@ func (p *Pool) Defaults() {
 // Sample is one observation of a pool: how many runners it had and how many
 // were working. Kept over time, these are what the activity chart draws.
 type Sample struct {
-	Pool    string
+	Pool string
+	// Scope is the repository or organisation the pool was targeting when the
+	// observation was taken, kept alongside the pool name so the history can
+	// be read by scope after the pool itself is gone.
+	Scope   string
 	Running int
 	Busy    int
 	Target  int

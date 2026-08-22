@@ -228,6 +228,22 @@ func TestReconcileCreatesAndThenSettles(t *testing.T) {
 	}
 }
 
+// Every observation carries the repository or organisation it was for, so the
+// history can still be read by scope once the pool that made it is gone.
+func TestWhatIsRecordedSaysWhichScopeItWasFor(t *testing.T) {
+	h := newHarness(testPool("web", 2))
+	h.rec.Once(context.Background())
+
+	if len(h.store.samples) == 0 {
+		t.Fatal("the pass recorded nothing")
+	}
+	for _, sample := range h.store.samples {
+		if sample.Scope != "o/web" {
+			t.Fatalf("recorded %+v, want the pool's scope with it", sample)
+		}
+	}
+}
+
 // The property the architecture exists for: the daemon can be replaced without
 // the runners noticing.
 func TestANewDaemonAdoptsTheRunningFleet(t *testing.T) {
