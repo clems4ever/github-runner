@@ -13,7 +13,10 @@ VERSION=${VERSION:-latest}
 INSTALL_BIN=${INSTALL_BIN:-/usr/local/bin/runner-fleet}
 SERVICE_USER=${SERVICE_USER:-runner-fleet}
 UNIT=/etc/systemd/system/runner-fleetd.service
-ADDR=${ADDR:-127.0.0.1:8080}
+# Where the UI listens. An upgrade keeps whatever the last install chose: a
+# rerun must not move the UI to a different port because nobody remembered to
+# repeat the flag.
+ADDR=${ADDR:-}
 
 # Set these to install without being asked anything, which is what a
 # configuration management tool wants.
@@ -78,6 +81,12 @@ tar -xzf "${WORK}/${ARCHIVE}" -C "$WORK"
 
 UPGRADE=false
 [[ -x "$INSTALL_BIN" ]] && UPGRADE=true
+
+if [[ -z "$ADDR" && -f "$UNIT" ]]; then
+  ADDR=$(sed -n 's/.*--addr \([^ ]*\).*/\1/p' "$UNIT" | head -1)
+  [[ -n "$ADDR" ]] && log "keeping the address this host already uses: ${ADDR}"
+fi
+ADDR=${ADDR:-127.0.0.1:8080}
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
@@ -209,6 +218,6 @@ runner-fleet ${VERSION} is running.
 If the UI is on a remote host, reach it over an ssh tunnel rather than opening
 the port: it holds a credential that administers your repositories.
 
-  ssh -N -L 8080:${ADDR} $(hostname -s)
+  ssh -N -L ${ADDR##*:}:${ADDR} $(hostname -s)
 
 DONE

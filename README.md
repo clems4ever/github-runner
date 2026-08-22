@@ -30,6 +30,14 @@ unit, and asks for the user name and password the web UI will use. Then open
 
 Rerunning it is how you upgrade, and it is deliberately uneventful.
 
+If something else on the host already has port 8080, pick another — the
+installer writes it into the unit, and later upgrades keep it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/clems4ever/github-runner/main/install.sh \
+  | sudo ADDR=127.0.0.1:8181 bash
+```
+
 The UI binds to the loopback address. If the host is remote, tunnel to it rather
 than opening the port — the daemon holds a credential that administers your
 repositories:

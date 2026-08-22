@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -105,23 +107,45 @@ func serveCommand(args []string) error {
 		log.Warn("no password is set, so nothing can log in yet. Set one with: runner-fleet passwd")
 	}
 
+	// Bound before anything else starts, and reported as a failure if it
+	// cannot be. A daemon that logs "address already in use" and then exits
+	// zero tells systemd it finished successfully, which is how a service that
+	// never came up ends up reading as "Deactivated successfully" — and it is
+	// what the unit's restart policy sees, so it never retries either.
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		return fmt.Errorf("cannot listen on %s: %w\n"+
+			"  Something else on this host has that address. Pick another with --addr,\n"+
+			"  or reinstall with ADDR=127.0.0.1:8181 to write it into the unit.\n"+
+			"  To see what has it:  sudo ss -ltnp | grep %s", *addr, err, portOf(*addr))
+	}
+
 	httpServer := &http.Server{
-		Addr:              *addr,
 		Handler:           server.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	serving := make(chan error, 1)
 	go func() {
 		log.Info("listening", "addr", *addr, "version", version)
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("the web server stopped", "error", err)
-			stop()
+		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serving <- err
+			return
 		}
+		serving <- nil
 	}()
 
 	go reconcileLoop(ctx, reconciler, *interval, nudge, log)
 
-	<-ctx.Done()
+	select {
+	case err := <-serving:
+		// The listener was taken away underneath it. Failing loudly is the
+		// point: the runners are fine, but nobody can see or change anything.
+		if err != nil {
+			return fmt.Errorf("the web server stopped: %w", err)
+		}
+	case <-ctx.Done():
+	}
 
 	// Stopping the daemon stops the daemon. The runners are units and
 	// containers of their own and are deliberately left exactly as they are:
@@ -130,6 +154,15 @@ func serveCommand(args []string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
+}
+
+// portOf is the last colon-separated part of a listen address, for a message
+// that tells someone what to grep for.
+func portOf(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return addr[i+1:]
+	}
+	return addr
 }
 
 func reconcileLoop(ctx context.Context, reconciler *reconcile.Reconciler, interval time.Duration, nudge <-chan struct{}, log *slog.Logger) {
