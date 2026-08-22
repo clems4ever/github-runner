@@ -41,6 +41,14 @@ export interface Runner {
   job: JobState
   generation: string
   upToDate: boolean
+  /**
+   * What the host says is wrong with this runner, when it says anything.
+   *
+   * A runner can be dead and look busy: a unit that crashes on startup spends
+   * most of its life in systemd's "activating" state, which read as running.
+   * This is where the fleet admits it.
+   */
+  trouble?: string
 }
 
 export type CredentialKind = 'pat' | 'app'

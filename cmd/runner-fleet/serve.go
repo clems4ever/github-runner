@@ -41,7 +41,17 @@ func serveCommand(args []string) error {
 
 	log := logger()
 	layout := layoutFor(*root)
-	if err := layout.EnsureDirs(); err != nil {
+
+	// The runners run as somebody else, and everything they read is written
+	// here. Resolving that account is the first thing done, and failing to
+	// resolve it is a warning rather than an error: container pools do not need
+	// it, and a developer running the daemon as themselves has nobody to hand
+	// anything to.
+	owner, err := paths.LookupOwner(*user)
+	if err != nil {
+		log.Warn("machine pools will not be able to read their credential", "error", err)
+	}
+	if err := layout.EnsureDirs(owner); err != nil {
 		return err
 	}
 
@@ -81,7 +91,7 @@ func serveCommand(args []string) error {
 				InstallationID:  secret.InstallationID,
 			})
 		},
-		credentialWriter(layout),
+		credentialWriter(layout, owner),
 		log)
 
 	// A buffered channel of one: several changes arriving together collapse
@@ -238,24 +248,41 @@ func reconcileLoop(ctx context.Context, reconciler *reconcile.Reconciler, interv
 
 // credentialWriter hands a decrypted token to the runners.
 //
-// On tmpfs, 0600: the database keeps credentials encrypted, but a runner has
-// to be able to mint a registration token on its own — after a reboot, with
-// the daemon still starting — so the clear copy has to exist somewhere. /run
-// is the one place it can that never reaches a disk.
-func credentialWriter(layout paths.Layout) reconcile.CredentialWriter {
+// On tmpfs, 0600, owned by the account the runners run as: the database keeps
+// credentials encrypted, but a machine has to be able to mint a registration
+// token on its own — after a reboot, with the daemon still starting — so the
+// clear copy has to exist somewhere. /run is the one place it can that never
+// reaches a disk.
+//
+// The ownership is the part that was missing, and it broke every machine
+// runner on a packaged install: the daemon is root, the agents are not, and
+// 0600 root-owned is unreadable to them. "Written where a runner can read it"
+// is the whole job of this function, so the handover happens here rather than
+// being left to whoever creates the directory.
+func credentialWriter(layout paths.Layout, owner paths.Owner) reconcile.CredentialWriter {
 	return func(id int64, token string) error {
 		if err := os.MkdirAll(layout.CredentialsDir(), 0o700); err != nil {
 			return err
 		}
+		if err := owner.Give(layout.CredentialsDir()); err != nil {
+			return err
+		}
 		path := layout.Credential(id)
 		if current, err := os.ReadFile(path); err == nil && string(current) == token {
-			return nil
+			// Unchanged, but the owner may not be: a daemon upgraded from a
+			// version that wrote these as root finds them already correct and
+			// would otherwise leave them unreadable for ever.
+			return owner.Give(path)
 		}
 		// Written beside and renamed into place, so a runner reading it never
-		// sees a half-written file.
+		// sees a half-written file — and handed over before the rename, so it
+		// is never briefly there and unreadable.
 		staged := path + ".new"
 		if err := os.WriteFile(staged, []byte(token), 0o600); err != nil {
 			return fmt.Errorf("write the credential: %w", err)
+		}
+		if err := owner.Give(staged); err != nil {
+			return err
 		}
 		return os.Rename(staged, path)
 	}

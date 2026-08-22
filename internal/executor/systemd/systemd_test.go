@@ -45,7 +45,7 @@ func (f *fakeCommander) called(substr string) bool {
 func newExecutor(t *testing.T) (*Executor, *fakeCommander, paths.Layout) {
 	t.Helper()
 	layout := paths.Under(t.TempDir())
-	if err := layout.EnsureDirs(); err != nil {
+	if err := layout.EnsureDirs(paths.CurrentOwner()); err != nil {
 		t.Fatal(err)
 	}
 	cmd := &fakeCommander{output: map[string]string{}}
@@ -325,9 +325,77 @@ func TestMapActiveState(t *testing.T) {
 		"failed":       reconcile.StateStopped,
 		"":             reconcile.StateStopped,
 	} {
-		if got := mapActiveState(active); got != want {
+		if got := mapActiveState(active, ""); got != want {
 			t.Errorf("%q maps to %q, want %q", active, got, want)
 		}
+	}
+}
+
+// The state that lied. A unit that crashes on startup and is waiting out its
+// RestartSec is "activating", and reading only that made a runner which had
+// never once registered report as running — to the dashboard and to the
+// reconciler, which then had no reason to touch it.
+func TestAUnitWaitingToBeRetriedIsNotRunning(t *testing.T) {
+	if got := mapActiveState("activating", "auto-restart"); got != reconcile.StateStopped {
+		t.Fatalf("a crash-looping runner reports as %q", got)
+	}
+	// A unit on its way up for the first time still is.
+	if got := mapActiveState("activating", "start"); got != reconcile.StateRunning {
+		t.Fatalf("a starting runner reports as %q", got)
+	}
+}
+
+// What a person is told, and what they can do about it.
+func TestTroubleSaysHowBadItIsAndWhereToLook(t *testing.T) {
+	if got := (unit{result: "success"}).trouble("web-1"); got != "" {
+		t.Errorf("a healthy runner reports trouble: %q", got)
+	}
+	if got := (unit{}).trouble("web-1"); got != "" {
+		t.Errorf("a unit systemd said nothing about reports trouble: %q", got)
+	}
+
+	once := unit{result: "exit-code", restarts: 1}.trouble("web-1")
+	if !strings.Contains(once, "exit-code") || !strings.Contains(once, "journalctl -u gh-runner@web-1.service") {
+		t.Errorf("got %q", once)
+	}
+
+	// The count is what separates a runner coming back from one that has never
+	// worked.
+	many := unit{result: "exit-code", restarts: 9}.trouble("web-1")
+	if !strings.Contains(many, "9 times") {
+		t.Errorf("got %q", many)
+	}
+}
+
+// The whole path: what systemctl prints, through to what the fleet says about
+// the runner. This is the shape the daemon actually saw while every machine
+// runner on the host was failing to read its credential.
+func TestACrashLoopingRunnerIsReportedAsStoppedAndTroubled(t *testing.T) {
+	e, cmd, layout := newExecutor(t)
+	if err := os.WriteFile(layout.RunnerEnv("web-1"), []byte(RenderEnv(testSpec("web-1"), layout)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show"] = strings.Join([]string{
+		"Id=gh-runner@web-1.service",
+		"ActiveState=activating",
+		"SubState=auto-restart",
+		"Result=exit-code",
+		"NRestarts=9",
+		"",
+	}, "\n")
+
+	runners, err := e.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runners) != 1 {
+		t.Fatalf("got %d runners", len(runners))
+	}
+	if runners[0].State != reconcile.StateStopped {
+		t.Errorf("state is %q, and this runner has never started", runners[0].State)
+	}
+	if !strings.Contains(runners[0].Trouble, "9 times") {
+		t.Errorf("the fleet has nothing to say about it: %q", runners[0].Trouble)
 	}
 }
 

@@ -302,41 +302,73 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 		return nil, err
 	}
 	for i := range runners {
-		if state, ok := states[unitName(runners[i].Name)]; ok {
-			runners[i].State = state
+		if unit, ok := states[unitName(runners[i].Name)]; ok {
+			runners[i].State = unit.state
+			runners[i].Trouble = unit.trouble(runners[i].Name)
 		}
 	}
 	sort.Slice(runners, func(i, j int) bool { return runners[i].Name < runners[j].Name })
 	return runners, nil
 }
 
+// unit is what systemd says about one runner.
+type unit struct {
+	state    reconcile.RunnerState
+	result   string
+	restarts int
+}
+
+// trouble is what to tell a person, and nothing when there is nothing to tell.
+//
+// The count is the useful part: one failure is a runner that finished a job and
+// is coming back, and nine is a runner that has never worked. The pointer to
+// the journal is there because the reason is always there and never here.
+func (u unit) trouble(runner string) string {
+	if u.result == "" || u.result == "success" {
+		return ""
+	}
+	if u.restarts > 1 {
+		return fmt.Sprintf("failing to start (%s), %d times over; journalctl -u %s",
+			u.result, u.restarts, unitName(runner))
+	}
+	return fmt.Sprintf("failed to start (%s); journalctl -u %s", u.result, unitName(runner))
+}
+
 // unitStates asks about every unit in one call rather than one call each: a
 // full fleet is one process, not sixty.
-func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]reconcile.RunnerState, error) {
-	args := append([]string{"show", "--property=Id,ActiveState"}, units...)
+func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]unit, error) {
+	args := append([]string{"show", "--property=Id,ActiveState,SubState,Result,NRestarts"}, units...)
 	out, err := e.cmd.Run(ctx, "systemctl", args...)
 	if err != nil {
 		return nil, err
 	}
 
-	states := map[string]reconcile.RunnerState{}
-	var id, active string
+	states := map[string]unit{}
+	var id, active, sub, result, restarts string
 	flush := func() {
 		if id != "" {
-			states[id] = mapActiveState(active)
+			count, _ := strconv.Atoi(restarts)
+			states[id] = unit{state: mapActiveState(active, sub), result: result, restarts: count}
 		}
-		id, active = "", ""
+		id, active, sub, result, restarts = "", "", "", "", ""
 	}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
+		key, value, _ := strings.Cut(line, "=")
 		switch {
 		case line == "":
 			flush()
-		case strings.HasPrefix(line, "Id="):
-			id = strings.TrimPrefix(line, "Id=")
-		case strings.HasPrefix(line, "ActiveState="):
-			active = strings.TrimPrefix(line, "ActiveState=")
+		case key == "Id":
+			id = value
+		case key == "ActiveState":
+			active = value
+		case key == "SubState":
+			sub = value
+		case key == "Result":
+			result = value
+		case key == "NRestarts":
+			restarts = value
 		}
 	}
 	flush()
@@ -345,7 +377,21 @@ func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]r
 
 // mapActiveState turns systemd's vocabulary into the three states the
 // reconciler reasons about.
-func mapActiveState(active string) reconcile.RunnerState {
+//
+// The sub-state matters for exactly one case, and it is the case that hid a bug
+// for a week. A unit that fails and is waiting out its RestartSec sits in
+// ActiveState=activating, SubState=auto-restart. Reading only the first, a
+// runner that had crashed on startup nine times in a row reported as running,
+// on the dashboard and to the reconciler both — which then left it alone,
+// because as far as it could tell there was nothing wrong.
+func mapActiveState(active, sub string) reconcile.RunnerState {
+	if active == "activating" && sub == "auto-restart" {
+		// Not running, and not going to be: it is dead and waiting to be tried
+		// again. Saying so lets the reconciler start it properly, which also
+		// clears the restart counter that would otherwise refuse with "start
+		// request repeated too quickly".
+		return reconcile.StateStopped
+	}
 	switch active {
 	case "active", "activating", "reloading":
 		return reconcile.StateRunning

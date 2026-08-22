@@ -34,6 +34,22 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # The daemon runs as root and the runners' agents do not, so half of what
+      # the daemon writes is written for somebody else to read. A test running
+      # as one user cannot check that, and while there was no test that could,
+      # every machine runner on a packaged install died on "permission denied"
+      # reading its credential.
+      #
+      # Built as this user and run as root, so root never touches the module
+      # cache.
+      - name: The service user can read what the daemon wrote
+        env:
+          REQUIRE_ROOT: '1'
+        run: |
+          set -euo pipefail
+          go test -tags root -c -o /tmp/cross-user-test ./cmd/runner-fleet/
+          sudo -E /tmp/cross-user-test -test.v
+
   ui:
     runs-on: ubuntu-latest
     steps:
@@ -114,6 +130,25 @@ jobs:
           curl -fsS http://127.0.0.1:8080/api/health | tee /dev/stderr | grep -q '"status":"ok"'
           # The password the installer was given is the one it set.
           curl -fsS -u "admin:an-install-test-password" http://127.0.0.1:8080/api/pools >/dev/null
+
+      # The same handover, on a real install: the daemon is root here, the
+      # service user is one the installer created, and the directories a machine
+      # agent reads from have to belong to it. Checked by being that user, not
+      # by reading modes.
+      - name: A machine agent can reach what it needs
+        run: |
+          set -euo pipefail
+          for dir in /run/runner-fleet /run/runner-fleet/credentials /var/lib/runner-fleet; do
+            owner=$(stat -c '%U' "$dir")
+            if [ "$owner" != "runner-fleet" ]; then
+              echo "::error::$dir belongs to $owner; a machine runner could not use it"
+              exit 1
+            fi
+            sudo -u runner-fleet test -r "$dir" -a -x "$dir" || {
+              echo "::error::the service user cannot enter $dir"
+              exit 1
+            }
+          done
 
       # Rerunning is how people upgrade, and it must not stop to ask anything
       # or move the address out from under them.

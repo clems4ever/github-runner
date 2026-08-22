@@ -44,7 +44,7 @@ func requireDocker(t *testing.T) *Executor {
 	}
 
 	layout := paths.Under(t.TempDir())
-	if err := layout.EnsureDirs(); err != nil {
+	if err := layout.EnsureDirs(paths.CurrentOwner()); err != nil {
 		t.Fatal(err)
 	}
 
