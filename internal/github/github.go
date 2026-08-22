@@ -196,6 +196,7 @@ func (c *Client) do(ctx context.Context, method, path string, out any, scope Sco
 // doAs makes a call with an explicit bearer, which is how the app flow signs
 // its own requests with a JWT rather than recursing into do.
 func (c *Client) doAs(ctx context.Context, method, path, bearer string, out any, scope Scope) error {
+	isApp := c.app != nil
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, nil)
 	if err != nil {
 		return err
@@ -212,7 +213,7 @@ func (c *Client) doAs(ctx context.Context, method, path, bearer string, out any,
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apiError(resp.StatusCode, body, scope)
+		return apiError(resp.StatusCode, body, scope, isApp)
 	}
 	if out == nil {
 		return nil
@@ -242,7 +243,7 @@ func (e *Error) Error() string {
 // apiError turns a refusal into the specific thing to go and check. The three
 // statuses have genuinely different causes, and the advice for one is useless
 // for the others.
-func apiError(status int, body []byte, scope Scope) error {
+func apiError(status int, body []byte, scope Scope, isApp bool) error {
 	var payload struct {
 		Message string `json:"message"`
 	}
@@ -266,9 +267,17 @@ func apiError(status int, body []byte, scope Scope) error {
 			e.Advice = "the credential is valid but not allowed to do this: a repository needs Administration: Read and write, or the classic repo scope"
 		}
 	case http.StatusNotFound:
-		if scope.Kind == model.ScopeOrganization {
+		switch {
+		case isApp:
+			// The app authenticated — a wrong key is a 401, not this — so the
+			// app simply cannot see this scope. On a repository that is
+			// almost always an installation that does not cover it.
+			e.Advice = fmt.Sprintf("the app is authenticated but has no installation covering %s. "+
+				"Install it there, or add %s to its repository access: "+
+				"https://github.com/settings/installations", scope.Path, scope.Path)
+		case scope.Kind == model.ScopeOrganization:
 			e.Advice = "either the credential cannot see this organisation, or it is a personal account — GitHub has no account-level runners, so a personal account needs one pool per repository"
-		} else {
+		default:
 			e.Advice = "a 404 here usually means the credential cannot see the repository at all rather than that it is missing: check the token's resource owner and repository access"
 		}
 	}

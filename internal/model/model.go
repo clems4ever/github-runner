@@ -208,6 +208,27 @@ func (p *Pool) EffectiveLabels() []string {
 	return out
 }
 
+// SpecRevision is bumped when the daemon changes how it builds a runner in a
+// way that existing runners cannot be left on.
+//
+// The generation hash covers what an operator configured. It cannot cover what
+// the daemon does with that, which is a problem the first time a release fixes
+// the building rather than the configuration: every runner on the host hashes
+// the same before and after, so the fleet keeps running the broken recipe until
+// somebody deletes the containers by hand. That happened once — a container
+// runner built before v0.3.0 looked for the runner in the wrong directory and
+// was handed a credential it could not read — and this is what stops it
+// happening quietly again.
+//
+// Raising it replaces every runner, gracefully, as each finishes its job. So it
+// is raised only when leaving them alone would be worse.
+//
+//	1  the first shape
+//	2  containers take a minted registration token instead of the credential,
+//	   find the runner by looking for config.sh, and are replaced rather than
+//	   restarted
+const SpecRevision = 2
+
 // Generation is a hash of everything a runner is built from. The reconciler
 // stamps it on each runner it creates and compares it later: a runner whose
 // generation no longer matches its pool is running the wrong configuration and
@@ -225,6 +246,7 @@ func (p *Pool) Generation(credentialFingerprint string) string {
 		}
 	}
 	write(
+		fmt.Sprint(SpecRevision),
 		p.Name,
 		string(p.ScopeKind),
 		p.Scope,

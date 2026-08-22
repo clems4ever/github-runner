@@ -1,6 +1,9 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -191,6 +194,43 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 			t.Fatal("changing the scaling bounds changed the generation, which would replace every healthy runner")
 		}
 	})
+}
+
+// An upgrade that changes how runners are built has to replace the ones
+// already on the host. The configuration hash cannot notice that on its own —
+// the pool is identical before and after — so the revision is part of it.
+func TestGenerationCoversHowRunnersAreBuilt(t *testing.T) {
+	p := validPool()
+	generation := p.Generation("fp")
+
+	// What the hash would be if the revision had not moved: if these are ever
+	// equal, an upgrade that fixes the recipe leaves every runner on the old
+	// one, and somebody has to go and delete them by hand.
+	previous := poolGenerationAtRevision(p, "fp", SpecRevision-1)
+	if generation == previous {
+		t.Fatal("the build revision is not part of the generation")
+	}
+}
+
+// poolGenerationAtRevision recomputes a pool's generation as an earlier
+// revision of the daemon would have.
+func poolGenerationAtRevision(p Pool, fingerprint string, revision int) string {
+	h := sha256.New()
+	write := func(parts ...string) {
+		for _, part := range parts {
+			h.Write([]byte(part))
+			h.Write([]byte{0})
+		}
+	}
+	write(
+		fmt.Sprint(revision),
+		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime),
+		fmt.Sprint(p.Nested), fmt.Sprint(p.Ephemeral),
+		strings.Join(p.EffectiveLabels(), ","),
+		fmt.Sprint(p.CPUs), fmt.Sprint(p.MemoryMB), fmt.Sprint(p.DiskGB),
+		p.Image, fingerprint,
+	)
+	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
 func TestGenerationIsStable(t *testing.T) {

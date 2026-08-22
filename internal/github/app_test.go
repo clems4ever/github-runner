@@ -332,6 +332,16 @@ func TestAppNotInstalledSaysSo(t *testing.T) {
 	if !strings.Contains(err.Error(), "find where app 123456 is installed") {
 		t.Fatalf("got %q", err)
 	}
+	// The thing to go and do, rather than advice written for a token: there is
+	// no token here, so "check the token's resource owner" helps nobody.
+	for _, want := range []string{"no installation covering", "settings/installations"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the advice does not mention %q: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "resource owner") {
+		t.Errorf("an app was given advice about a token: %v", err)
+	}
 }
 
 func TestParsePrivateKey(t *testing.T) {

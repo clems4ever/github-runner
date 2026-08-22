@@ -192,6 +192,12 @@ replaced, gracefully. The scaling bounds deliberately are not part of that hash:
 the autoscaler moves them many times an hour, and that must never replace a
 runner that is already correct.
 
+The hash also carries a build revision, raised when a release changes *how* the
+daemon builds a runner rather than what you asked for. Without it, an upgrade
+that fixes the building would leave every existing runner on the broken recipe,
+since the pool hashes the same before and after — which is exactly what happened
+once, and cost an afternoon of deleting containers by hand.
+
 ## Credentials
 
 A **GitHub App** is the better of the two, and what the form offers first:
