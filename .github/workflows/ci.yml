@@ -52,7 +52,56 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
       - name: Shellcheck
         run: shellcheck -S warning install.sh
+
       - name: The unit file is valid
         run: systemd-analyze verify packaging/runner-fleetd.service 2>&1 | grep -v "not executable" | (! grep .)
+
+      # Run it the way people run it: piped into bash, as root, on a host with
+      # systemd. Reading the script is not enough — it is read from standard
+      # input when piped, so any command inside it that consumes stdin eats the
+      # rest of the script and bash reports a syntax error in the middle of
+      # nowhere. That shipped once, and only this catches it.
+      #
+      # The runner is a disposable VM, so installing a real service on it is
+      # fine.
+      - name: Install it for real, from a pipe
+        env:
+          FLEET_PASSWORD: an-install-test-password
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install.sh" \
+            | sudo -E bash
+
+      - name: It came up
+        run: |
+          set -euo pipefail
+          systemctl is-active --quiet runner-fleetd
+          curl -fsS http://127.0.0.1:8080/api/health | tee /dev/stderr | grep -q '"status":"ok"'
+          # The password the installer was given is the one it set.
+          curl -fsS -u "admin:an-install-test-password" http://127.0.0.1:8080/api/pools >/dev/null
+
+      # Rerunning is how people upgrade, and it must not stop to ask anything
+      # or move the address out from under them.
+      - name: Upgrading over it is quiet
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install.sh" \
+            | sudo -E ADDR=127.0.0.1:8181 bash
+          systemctl is-active --quiet runner-fleetd
+          curl -fsS http://127.0.0.1:8181/api/health | grep -q '"status":"ok"'
+
+          # And again with no address given: it keeps the one it has rather
+          # than moving back to the default.
+          curl -fsSL "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/install.sh" \
+            | sudo -E bash
+          curl -fsS http://127.0.0.1:8181/api/health | grep -q '"status":"ok"'
+
+      - name: And uninstall puts the host back
+        run: |
+          set -euo pipefail
+          sudo runner-fleet version
+          sudo systemctl stop runner-fleetd
+          sudo rm -rf /etc/runner-fleet /var/lib/runner-fleet /usr/local/bin/runner-fleet
