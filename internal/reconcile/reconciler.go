@@ -66,6 +66,14 @@ type Reconciler struct {
 	writeSecret CredentialWriter
 	log         *slog.Logger
 
+	// pass serialises whole reconcile passes. The daemon's loop is not the
+	// only caller: the UI reconciles when somebody presses refresh, and saving
+	// a pool asks for one too. A pass reads the host and then acts on what it
+	// read, so two at once both see a runner missing and both create it — a
+	// container name conflict, and a fleet where each pass undoes what the
+	// other just did.
+	pass sync.Mutex
+
 	mu     sync.Mutex
 	last   Result
 	poolOf map[string]string // runner name -> pool, for reporting
@@ -169,6 +177,11 @@ type Result struct {
 // token has expired must not stop the other pools on the host from being
 // maintained. The error is surfaced in the result, which the UI shows.
 func (r *Reconciler) Once(ctx context.Context) Result {
+	// One at a time. Waiting rather than skipping: whoever asked for a pass
+	// wants the fleet reconciled after they asked, not before.
+	r.pass.Lock()
+	defer r.pass.Unlock()
+
 	var result Result
 
 	pools, err := r.store.ListPools(ctx)
