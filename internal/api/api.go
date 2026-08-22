@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io/fs"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,7 @@ type Store interface {
 	ImportPools(ctx context.Context, pools []model.Pool, replaceExisting, dryRun bool) ([]store.ImportOutcome, error)
 	Activity(ctx context.Context, since, until time.Time, buckets int, filter store.ActivityFilter) ([]model.ActivityPoint, error)
 	ActivityScopes(ctx context.Context, since, until time.Time) ([]string, error)
+	JobHistory(ctx context.Context, since, until time.Time) ([]model.JobDay, error)
 	HostHistory(ctx context.Context, since, until time.Time, buckets int) ([]model.HostPoint, error)
 	ListCredentials(ctx context.Context) ([]model.Credential, error)
 	CreateCredential(ctx context.Context, credential model.Credential, secret string) (model.Credential, error)
@@ -123,6 +125,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/runners", s.listRunners)
 	api.HandleFunc("POST /api/reconcile", s.reconcileNow)
 	api.HandleFunc("GET /api/activity", s.activity)
+	api.HandleFunc("GET /api/jobs", s.jobs)
 	api.HandleFunc("GET /api/resources", s.resourceReport)
 	api.HandleFunc("GET /api/resources/history", s.resourceHistory)
 	api.HandleFunc("GET /api/credentials", s.listCredentials)
@@ -438,6 +441,86 @@ func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 		"since":  since,
 		"until":  until,
 	})
+}
+
+// jobs is what each pool has run: how many jobs, and how much runner-time went
+// on them, a day at a time.
+//
+// Separate from the activity history above, and asked in days rather than
+// hours, because it answers a different question. Activity is what the fleet
+// was doing this afternoon; this is what a pool has cost over a quarter, which
+// is the evidence somebody brings to the decision to make it bigger.
+//
+// The counts are observations, not GitHub's own accounting: see the reconciler
+// for what that costs in accuracy.
+func (s *Server) jobs(w http.ResponseWriter, r *http.Request) {
+	since, until, err := dayWindow(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	days, err := s.store.JobHistory(r.Context(), since, until)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pools": totalPerPool(days),
+		"days":  days,
+		"since": since,
+		"until": until,
+	})
+}
+
+// totalPerPool adds a window up per pool, the hungriest first — the order
+// somebody scanning for what to resize is reading in.
+func totalPerPool(days []model.JobDay) []model.PoolJobs {
+	index := map[string]int{}
+	out := []model.PoolJobs{}
+	for _, day := range days {
+		at, seen := index[day.Pool]
+		if !seen {
+			at = len(out)
+			index[day.Pool] = at
+			out = append(out, model.PoolJobs{Pool: day.Pool})
+		}
+		out[at].Jobs += day.Jobs
+		out[at].Seconds += day.Seconds
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Seconds != out[j].Seconds {
+			return out[i].Seconds > out[j].Seconds
+		}
+		return out[i].Pool < out[j].Pool
+	})
+	return out
+}
+
+// maxJobDays is as far back as a jobs window may reach: everything the daemon
+// still has, and nothing beyond it, so the two never drift apart.
+const maxJobDays = int(store.JobRetention / (24 * time.Hour))
+
+// dayWindow is the span the job accounting is asked about.
+//
+// Whole UTC days, unlike the charts' rolling window of hours, because the tally
+// itself is per day: a window that started at half past two would take in a day
+// the daemon can only report whole, and report two thirds of it as all of it.
+func dayWindow(r *http.Request) (since, until time.Time, err error) {
+	days := 30
+	if raw := r.URL.Query().Get("days"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 1 || parsed > maxJobDays {
+			return time.Time{}, time.Time{},
+				errBadRequest("days must be a whole number from 1 to %d", maxJobDays)
+		}
+		days = parsed
+	}
+	until = time.Now().UTC()
+	// Today counts, so seven days is today and the six before it rather than
+	// today and the seven before it.
+	today := time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, time.UTC)
+	return today.AddDate(0, 0, -(days - 1)), until, nil
 }
 
 // buckets is how many points a history window is reduced to: enough for a

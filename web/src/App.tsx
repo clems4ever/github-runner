@@ -15,6 +15,7 @@ import {
 import { useDisclosure } from '@mantine/hooks'
 import { notifications } from '@mantine/notifications'
 import {
+  IconChartBar,
   IconGauge,
   IconMoon,
   IconRefresh,
@@ -38,14 +39,18 @@ import { Logo } from './Logo'
 import { FleetPage } from './pages/FleetPage'
 import { PoolsPage } from './pages/PoolsPage'
 import { CredentialsPage } from './pages/CredentialsPage'
+import { JobsPage } from './pages/JobsPage'
 import { ResourcesPage } from './pages/ResourcesPage'
 import { SettingsPage } from './pages/SettingsPage'
 
-type Page = 'fleet' | 'pools' | 'resources' | 'credentials' | 'settings'
+type Page = 'fleet' | 'pools' | 'jobs' | 'resources' | 'credentials' | 'settings'
 
 const pages: { key: Page; label: string; icon: typeof IconServer2 }[] = [
   { key: 'fleet', label: 'Fleet', icon: IconServer2 },
   { key: 'pools', label: 'Pools', icon: IconStack2 },
+  // Next to the pools it is read against: what a pool has run is an argument
+  // about how big that pool should be, not about the host.
+  { key: 'jobs', label: 'Jobs', icon: IconChartBar },
   { key: 'resources', label: 'Resources', icon: IconGauge },
   { key: 'credentials', label: 'Credentials', icon: IconKey },
   { key: 'settings', label: 'Settings', icon: IconSettings },
@@ -194,6 +199,7 @@ export function App() {
             onChange={refresh}
           />
         )}
+        {page === 'jobs' && <JobsPage pools={pools} />}
         {page === 'resources' && <ResourcesPage report={resources} />}
         {page === 'credentials' && (
           <CredentialsPage credentials={credentials} pools={pools} onChange={refresh} />
