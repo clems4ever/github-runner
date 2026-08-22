@@ -12,6 +12,7 @@ import {
 } from '@mantine/core'
 import { CompositeChart } from '@mantine/charts'
 import { api, type ActivityPoint, type Pool } from '../api'
+import { useNarrow } from '../responsive'
 
 /**
  * What the fleet has been doing.
@@ -41,6 +42,7 @@ const ranges = [
 export function ActivityChart({ pools }: { pools: Pool[] }) {
   const scheme = useComputedColorScheme('light')
   const palette = colours[scheme]
+  const narrow = useNarrow()
 
   const [hours, setHours] = useState('6')
   // Empty is the whole fleet. Narrowing to one pool is how someone looks at a
@@ -83,20 +85,22 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
   const peak = Math.max(1, ...(points ?? []).map((p) => p.running))
 
   return (
-    <Card withBorder padding="md">
-      <Group justify="space-between" mb="sm">
+    <Card withBorder p={{ base: 'sm', sm: 'md' }}>
+      <Group justify="space-between" mb="sm" gap="sm" wrap="wrap">
         <div>
           <Text fw={500}>Activity</Text>
           <Text size="xs" c="dimmed">
             Peak per interval, so a short burst is not averaged away
           </Text>
         </div>
-        {/* Filters in one row, above the chart. */}
-        <Group gap="xs">
+        {/* Filters in one row above the chart, on their own line once that row
+            no longer holds them and the heading both. */}
+        <Group gap="xs" wrap="nowrap" style={narrow ? { flex: '1 1 100%' } : undefined}>
           {pools.length > 1 && (
             <Select
               size="xs"
-              w={180}
+              w={narrow ? undefined : 180}
+              flex={narrow ? 1 : undefined}
               aria-label="Pool"
               placeholder="All pools"
               clearable
@@ -139,7 +143,7 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
         </Center>
       ) : (
         <CompositeChart
-          h={220}
+          h={narrow ? 200 : 220}
           data={data}
           dataKey="at"
           withLegend
@@ -157,7 +161,9 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
           xAxisProps={{
             tickFormatter: (value: string) =>
               new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            minTickGap: 48,
+            // Wide enough apart that two times never touch. A phone fits about
+            // three of them, which is enough to read the window.
+            minTickGap: narrow ? 72 : 48,
           }}
           // The colours go in as CSS variables rather than through the
           // `gridColor` and `textColor` props. Those are still in the type,

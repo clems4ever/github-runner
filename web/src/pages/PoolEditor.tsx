@@ -8,6 +8,7 @@ import {
   NumberInput,
   Select,
   SegmentedControl,
+  SimpleGrid,
   Stack,
   Switch,
   TagsInput,
@@ -110,7 +111,9 @@ export function PoolEditor({
       })}
     >
       <Stack gap="md">
-        <Group grow align="flex-start">
+        {/* Pairs of fields side by side are two half-width fields on a phone,
+            which is worse than one after the other. */}
+        <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="md" verticalSpacing="md">
           <TextInput
             label="Name"
             description="Runners are named after it: web-1, web-2"
@@ -126,14 +129,15 @@ export function PoolEditor({
             value={values.credentialId ? String(values.credentialId) : null}
             onChange={(value) => form.setFieldValue('credentialId', Number(value))}
           />
-        </Group>
+        </SimpleGrid>
 
         <div>
           <Text size="sm" fw={500} mb={4}>
             Scope
           </Text>
-          <Group align="flex-start" grow>
+          <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="sm" verticalSpacing="sm">
             <SegmentedControl
+              fullWidth
               data={[
                 { value: 'repository', label: 'Repository' },
                 { value: 'organization', label: 'Organisation' },
@@ -145,7 +149,7 @@ export function PoolEditor({
               placeholder={values.scopeKind === 'organization' ? 'my-org' : 'owner/repository'}
               {...form.getInputProps('scope')}
             />
-          </Group>
+          </SimpleGrid>
           {values.scopeKind === 'organization' && (
             <Text size="xs" c="dimmed" mt={4}>
               Every repository in the organisation can use these runners. GitHub has no equivalent
@@ -171,7 +175,7 @@ export function PoolEditor({
             : 'A container per runner: faster to start and cheaper to run, but a weaker boundary than a machine.'}
         </Text>
 
-        <Group grow>
+        <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="md" verticalSpacing="sm">
           <Switch
             label="Ephemeral"
             description="Take one job, then be replaced by a clean runner"
@@ -184,7 +188,7 @@ export function PoolEditor({
             checked={values.nested ?? false}
             onChange={(event) => form.setFieldValue('nested', event.currentTarget.checked)}
           />
-        </Group>
+        </SimpleGrid>
 
         {values.nested && !isVM && (
           <Alert color="orange" variant="light" icon={<IconAlertTriangle size={16} />}>
@@ -196,7 +200,7 @@ export function PoolEditor({
 
         <Divider label="Scaling" labelPosition="left" />
 
-        <Group grow align="flex-start">
+        <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="md" verticalSpacing="md">
           <NumberInput
             label="Minimum runners"
             description="Kept up even when nothing is running"
@@ -211,7 +215,7 @@ export function PoolEditor({
             max={64}
             {...form.getInputProps('maxReplicas')}
           />
-        </Group>
+        </SimpleGrid>
         <Text size="xs" c="dimmed" mt={-8}>
           {(values.maxReplicas ?? 1) > (values.minReplicas ?? 1)
             ? `The pool sits at ${values.minReplicas} and adds a runner whenever every one of them is busy, up to ${values.maxReplicas}. It returns to ${values.minReplicas} after a few minutes with no work.`
@@ -220,7 +224,9 @@ export function PoolEditor({
 
         <Divider label="Size" labelPosition="left" />
 
-        <Group grow>
+        {/* Three number inputs across a phone leaves no room for the steppers,
+            which is where the digits went. */}
+        <SimpleGrid cols={{ base: 2, sm: 3 }} spacing="md" verticalSpacing="md">
           <NumberInput label="vCPUs" min={1} max={64} {...form.getInputProps('cpus')} />
           <NumberInput
             label="Memory (MiB)"
@@ -229,7 +235,7 @@ export function PoolEditor({
             {...form.getInputProps('memoryMb')}
           />
           {isVM && <NumberInput label="Disk (GiB)" min={10} {...form.getInputProps('diskGb')} />}
-        </Group>
+        </SimpleGrid>
         <Text size="xs" c="dimmed" mt={-8}>
           Every runner is a machine of this size, so at its maximum the pool wants{' '}
           {((values.maxReplicas ?? 0) * (values.memoryMb ?? 0)) / 1024} GiB of memory at once.
@@ -286,13 +292,13 @@ export function PoolEditor({
           </Alert>
         )}
 
-        <Group justify="space-between" mt="sm">
+        <Group justify="space-between" mt="sm" gap="sm" wrap="wrap">
           <Switch
             label="Enabled"
             checked={values.enabled ?? true}
             onChange={(event) => form.setFieldValue('enabled', event.currentTarget.checked)}
           />
-          <Group>
+          <Group gap="sm" wrap="nowrap">
             <Button variant="default" onClick={onCancel} type="button">
               Cancel
             </Button>

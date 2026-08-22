@@ -6,6 +6,7 @@ import {
 import { notifications } from '@mantine/notifications'
 import { IconDots, IconKey, IconPlus, IconRefresh, IconTrash } from '@tabler/icons-react'
 import { api, type Credential, type Pool } from '../api'
+import { Field, useNarrow } from '../responsive'
 import { CredentialForm } from './CredentialForm'
 
 /**
@@ -18,6 +19,7 @@ import { CredentialForm } from './CredentialForm'
 export function CredentialsPage({
   credentials, pools, onChange,
 }: { credentials: Credential[]; pools: Pool[]; onChange: () => Promise<void> }) {
+  const narrow = useNarrow()
   const [adding, setAdding] = useState(false)
   const [rotating, setRotating] = useState<Credential | null>(null)
 
@@ -30,9 +32,12 @@ export function CredentialsPage({
 
   return (
     <Stack gap="lg">
-      <Group justify="space-between">
+      <Group justify="space-between" gap="sm" wrap="wrap">
         <Title order={3}>Credentials</Title>
-        <Button leftSection={<IconPlus size={16} />} onClick={() => { setAdding(true); setRotating(null) }}>
+        <Button
+          leftSection={<IconPlus size={16} />}
+          onClick={() => { setAdding(true); setRotating(null) }}
+        >
           Add credential
         </Button>
       </Group>
@@ -56,6 +61,18 @@ export function CredentialsPage({
             </Stack>
           </Center>
         </Card>
+      ) : narrow ? (
+        <Stack gap="sm">
+          {credentials.map((credential) => (
+            <CredentialCard
+              key={credential.id}
+              credential={credential}
+              usedBy={usedBy(credential)}
+              onRotate={() => { setRotating(credential); setAdding(false) }}
+              onChange={onChange}
+            />
+          ))}
+        </Stack>
       ) : (
         <Card withBorder padding={0}>
           <Table highlightOnHover verticalSpacing="sm" horizontalSpacing="md">
@@ -72,15 +89,7 @@ export function CredentialsPage({
               {credentials.map((credential) => (
                 <Table.Tr key={credential.id}>
                   <Table.Td><Text fw={500}>{credential.name}</Text></Table.Td>
-                  <Table.Td>
-                    {credential.kind === 'app' ? (
-                      <Tooltip label="Signs its own short-lived tokens; nothing expires on a calendar">
-                        <Badge variant="light" size="sm">app</Badge>
-                      </Tooltip>
-                    ) : (
-                      <Badge variant="default" size="sm">token</Badge>
-                    )}
-                  </Table.Td>
+                  <Table.Td><KindBadge kind={credential.kind} /></Table.Td>
                   <Table.Td><Text ff="monospace" size="sm" c="dimmed">{credential.hint}</Text></Table.Td>
                   <Table.Td>
                     <Text size="sm" c="dimmed">
@@ -88,40 +97,12 @@ export function CredentialsPage({
                     </Text>
                   </Table.Td>
                   <Table.Td>
-                    <Menu position="bottom-end">
-                      <Menu.Target>
-                        <ActionIcon variant="subtle" aria-label={`Actions for ${credential.name}`}>
-                          <IconDots size={16} />
-                        </ActionIcon>
-                      </Menu.Target>
-                      <Menu.Dropdown>
-                        <Menu.Item
-                          leftSection={<IconRefresh size={14} />}
-                          onClick={() => { setRotating(credential); setAdding(false) }}
-                        >
-                          {credential.kind === 'app' ? 'Replace private key' : 'Replace token'}
-                        </Menu.Item>
-                        <Menu.Item
-                          color="red"
-                          leftSection={<IconTrash size={14} />}
-                          disabled={usedBy(credential).length > 0}
-                          onClick={async () => {
-                            try {
-                              await api.deleteCredential(credential.id)
-                              await onChange()
-                            } catch (error) {
-                              notifications.show({
-                                color: 'red',
-                                title: 'Could not delete the credential',
-                                message: error instanceof Error ? error.message : String(error),
-                              })
-                            }
-                          }}
-                        >
-                          Delete
-                        </Menu.Item>
-                      </Menu.Dropdown>
-                    </Menu>
+                    <CredentialMenu
+                      credential={credential}
+                      usedBy={usedBy(credential)}
+                      onRotate={() => { setRotating(credential); setAdding(false) }}
+                      onChange={onChange}
+                    />
                   </Table.Td>
                 </Table.Tr>
               ))}
@@ -139,6 +120,7 @@ export function CredentialsPage({
             : 'Add credential'
         }
         size="lg"
+        fullScreen={narrow}
       >
         <CredentialForm
           rotating={rotating}
@@ -150,5 +132,104 @@ export function CredentialsPage({
         />
       </Modal>
     </Stack>
+  )
+}
+
+/**
+ * One credential, as a card.
+ *
+ * As on the pools page, the menu that rotates and deletes is what a narrow
+ * table loses first, so here it sits beside the name rather than in a column
+ * past the edge of the screen.
+ */
+function CredentialCard({
+  credential,
+  usedBy,
+  onRotate,
+  onChange,
+}: {
+  credential: Credential
+  usedBy: Pool[]
+  onRotate: () => void
+  onChange: () => Promise<void>
+}) {
+  return (
+    <Card withBorder padding="md">
+      <Stack gap="xs">
+        <Group justify="space-between" gap="xs" wrap="nowrap" align="flex-start">
+          <Text fw={500} style={{ wordBreak: 'break-word' }}>{credential.name}</Text>
+          <CredentialMenu
+            credential={credential}
+            usedBy={usedBy}
+            onRotate={onRotate}
+            onChange={onChange}
+          />
+        </Group>
+        <Field label="Kind"><KindBadge kind={credential.kind} /></Field>
+        <Field label="Identifier">
+          <Text ff="monospace" size="sm" c="dimmed">{credential.hint}</Text>
+        </Field>
+        <Field label="Used by">
+          <Text size="sm" c="dimmed">{usedBy.map((p) => p.name).join(', ') || '—'}</Text>
+        </Field>
+      </Stack>
+    </Card>
+  )
+}
+
+function KindBadge({ kind }: { kind: Credential['kind'] }) {
+  if (kind === 'app') {
+    return (
+      <Tooltip label="Signs its own short-lived tokens; nothing expires on a calendar">
+        <Badge variant="light" size="sm">app</Badge>
+      </Tooltip>
+    )
+  }
+  return <Badge variant="default" size="sm">token</Badge>
+}
+
+function CredentialMenu({
+  credential,
+  usedBy,
+  onRotate,
+  onChange,
+}: {
+  credential: Credential
+  usedBy: Pool[]
+  onRotate: () => void
+  onChange: () => Promise<void>
+}) {
+  return (
+    <Menu position="bottom-end">
+      <Menu.Target>
+        <ActionIcon variant="subtle" aria-label={`Actions for ${credential.name}`}>
+          <IconDots size={16} />
+        </ActionIcon>
+      </Menu.Target>
+      <Menu.Dropdown>
+        <Menu.Item leftSection={<IconRefresh size={14} />} onClick={onRotate}>
+          {credential.kind === 'app' ? 'Replace private key' : 'Replace token'}
+        </Menu.Item>
+        <Menu.Item
+          color="red"
+          leftSection={<IconTrash size={14} />}
+          disabled={usedBy.length > 0}
+          onClick={async () => {
+            try {
+              await api.deleteCredential(credential.id)
+              await onChange()
+            } catch (error) {
+              notifications.show({
+                color: 'red',
+                title: 'Could not delete the credential',
+                message: error instanceof Error ? error.message : String(error),
+              })
+            }
+          }}
+        >
+          Delete
+        </Menu.Item>
+      </Menu.Dropdown>
+    </Menu>
   )
 }

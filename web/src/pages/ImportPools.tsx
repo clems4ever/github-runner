@@ -4,11 +4,13 @@ import {
   Anchor,
   Badge,
   Button,
+  Card,
   Checkbox,
   FileButton,
   Group,
   SegmentedControl,
   Select,
+  SimpleGrid,
   Stack,
   Table,
   Text,
@@ -21,9 +23,11 @@ import {
   api,
   ApiError,
   type Credential,
+  type ImportOutcome,
   type ImportReport,
   type ScopeKind,
 } from '../api'
+import { Field, useNarrow } from '../responsive'
 
 /**
  * Importing a template.
@@ -42,6 +46,7 @@ export function ImportPools({
   onImported: () => Promise<void>
   onCancel: () => void
 }) {
+  const narrow = useNarrow()
   const [text, setText] = useState('')
   const [credentialId, setCredentialId] = useState<number>(credentials[0]?.id ?? 0)
   const [scope, setScope] = useState('')
@@ -107,7 +112,7 @@ export function ImportPools({
 
   return (
     <Stack>
-      <Group grow align="flex-start">
+      <SimpleGrid cols={{ base: 1, sm: 2 }} spacing="md" verticalSpacing="md">
         <Select
           label="Credential"
           description="Imported pools register with it"
@@ -129,11 +134,12 @@ export function ImportPools({
             setReport(null)
           }}
         />
-      </Group>
+      </SimpleGrid>
 
       {scope.trim() !== '' && (
         <SegmentedControl
           size="xs"
+          fullWidth={narrow}
           value={scopeKind}
           onChange={(value) => setScopeKind(value as ScopeKind)}
           data={[
@@ -147,7 +153,9 @@ export function ImportPools({
         label="Template"
         description="Paste a template, or choose the file"
         withAsterisk
-        rows={10}
+        // Ten rows is most of a phone screen before the buttons under it come
+        // into view.
+        rows={narrow ? 6 : 10}
         autosize={false}
         placeholder={'{\n  "version": 1,\n  "pools": [ … ]\n}'}
         styles={{ input: { fontFamily: 'var(--mantine-font-family-monospace)', fontSize: 12 } }}
@@ -155,7 +163,7 @@ export function ImportPools({
         onChange={(event) => change(event.currentTarget.value)}
       />
 
-      <Group justify="space-between">
+      <Group justify="space-between" gap="sm" wrap="wrap">
         <FileButton
           accept="application/json"
           onChange={async (file) => {
@@ -201,55 +209,82 @@ export function ImportPools({
               {report.description}
             </Text>
           )}
-          <Table withTableBorder verticalSpacing="xs" horizontalSpacing="sm">
-            <Table.Thead>
-              <Table.Tr>
-                <Table.Th>Pool</Table.Th>
-                <Table.Th>Scope</Table.Th>
-                <Table.Th>Runtime</Table.Th>
-                <Table.Th>Size</Table.Th>
-                <Table.Th>Runners</Table.Th>
-                <Table.Th />
-              </Table.Tr>
-            </Table.Thead>
-            <Table.Tbody>
+          {/* This preview is the point of the screen — what would happen, read
+              before pressing the button under it — so on a phone it becomes a
+              card per pool rather than a table with four columns off the edge. */}
+          {narrow ? (
+            <Stack gap="xs">
               {report.pools.map(({ name, action, pool }) => (
-                <Table.Tr key={name}>
-                  <Table.Td>
-                    <Text size="sm" fw={500}>
-                      {name}
-                    </Text>
-                  </Table.Td>
-                  <Table.Td>
-                    <Text size="sm">{pool.scope}</Text>
-                  </Table.Td>
-                  <Table.Td>
-                    <Badge size="sm" variant="default">
-                      {pool.runtime}
-                    </Badge>
-                  </Table.Td>
-                  <Table.Td>
-                    <Text size="sm" c="dimmed">
-                      {pool.cpus} vCPU · {Math.round(pool.memoryMb / 1024)} GiB
-                      {pool.runtime === 'vm' ? ` · ${pool.diskGb} GiB` : ''}
-                    </Text>
-                  </Table.Td>
-                  <Table.Td>
-                    <Text size="sm" c="dimmed">
-                      {pool.minReplicas === pool.maxReplicas
-                        ? pool.maxReplicas
-                        : `${pool.minReplicas}–${pool.maxReplicas}`}
-                    </Text>
-                  </Table.Td>
-                  <Table.Td>
-                    <Badge size="sm" color={action === 'update' ? 'yellow' : 'blue'} variant="light">
-                      {action === 'update' ? 'replaces the pool of this name' : 'new'}
-                    </Badge>
-                  </Table.Td>
-                </Table.Tr>
+                <Card key={name} withBorder padding="sm">
+                  <Stack gap={6}>
+                    <Group justify="space-between" gap="xs" wrap="nowrap" align="flex-start">
+                      <Text size="sm" fw={500} style={{ wordBreak: 'break-word' }}>
+                        {name}
+                      </Text>
+                      <ActionBadge action={action} />
+                    </Group>
+                    <Field label="Scope">
+                      <Text size="sm" style={{ wordBreak: 'break-word' }}>
+                        {pool.scope}
+                      </Text>
+                    </Field>
+                    <Field label="Runtime">
+                      <Badge size="sm" variant="default">
+                        {pool.runtime}
+                      </Badge>
+                    </Field>
+                    <Field label="Size">
+                      <SizeText pool={pool} />
+                    </Field>
+                    <Field label="Runners">
+                      <RunnersText pool={pool} />
+                    </Field>
+                  </Stack>
+                </Card>
               ))}
-            </Table.Tbody>
-          </Table>
+            </Stack>
+          ) : (
+            <Table withTableBorder verticalSpacing="xs" horizontalSpacing="sm">
+              <Table.Thead>
+                <Table.Tr>
+                  <Table.Th>Pool</Table.Th>
+                  <Table.Th>Scope</Table.Th>
+                  <Table.Th>Runtime</Table.Th>
+                  <Table.Th>Size</Table.Th>
+                  <Table.Th>Runners</Table.Th>
+                  <Table.Th />
+                </Table.Tr>
+              </Table.Thead>
+              <Table.Tbody>
+                {report.pools.map(({ name, action, pool }) => (
+                  <Table.Tr key={name}>
+                    <Table.Td>
+                      <Text size="sm" fw={500}>
+                        {name}
+                      </Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Text size="sm">{pool.scope}</Text>
+                    </Table.Td>
+                    <Table.Td>
+                      <Badge size="sm" variant="default">
+                        {pool.runtime}
+                      </Badge>
+                    </Table.Td>
+                    <Table.Td>
+                      <SizeText pool={pool} />
+                    </Table.Td>
+                    <Table.Td>
+                      <RunnersText pool={pool} />
+                    </Table.Td>
+                    <Table.Td>
+                      <ActionBadge action={action} />
+                    </Table.Td>
+                  </Table.Tr>
+                ))}
+              </Table.Tbody>
+            </Table>
+          )}
           {report.pools.some((outcome) => outcome.action === 'update') && (
             <Text size="xs" c="dimmed">
               Pools written over keep their identity and their runners: each runner is replaced
@@ -259,7 +294,7 @@ export function ImportPools({
         </Stack>
       )}
 
-      <Group justify="flex-end">
+      <Group justify="flex-end" gap="sm" wrap="wrap">
         <Button variant="default" onClick={onCancel}>
           Cancel
         </Button>
@@ -274,5 +309,32 @@ export function ImportPools({
         )}
       </Group>
     </Stack>
+  )
+}
+
+function SizeText({ pool }: { pool: ImportOutcome['pool'] }) {
+  return (
+    <Text size="sm" c="dimmed">
+      {pool.cpus} vCPU · {Math.round(pool.memoryMb / 1024)} GiB
+      {pool.runtime === 'vm' ? ` · ${pool.diskGb} GiB` : ''}
+    </Text>
+  )
+}
+
+function RunnersText({ pool }: { pool: ImportOutcome['pool'] }) {
+  return (
+    <Text size="sm" c="dimmed">
+      {pool.minReplicas === pool.maxReplicas
+        ? pool.maxReplicas
+        : `${pool.minReplicas}–${pool.maxReplicas}`}
+    </Text>
+  )
+}
+
+function ActionBadge({ action }: { action: ImportOutcome['action'] }) {
+  return (
+    <Badge size="sm" color={action === 'update' ? 'yellow' : 'blue'} variant="light">
+      {action === 'update' ? 'replaces the pool of this name' : 'new'}
+    </Badge>
   )
 }

@@ -17,6 +17,7 @@ import {
 } from '@mantine/core'
 import { IconAlertTriangle, IconServerOff } from '@tabler/icons-react'
 import type { Credential, JobState, Pool, Runner, RunnerState, Scale } from '../api'
+import { Field, useNarrow } from '../responsive'
 import { ActivityChart } from './ActivityChart'
 import { PoolEditor } from './PoolEditor'
 
@@ -45,6 +46,7 @@ export function FleetPage({
   loading: boolean
   onChange: () => Promise<void>
 }) {
+  const narrow = useNarrow()
   // The question a runner raises is usually about its pool — it is too small,
   // or it should not exist — so the answer is reachable from here rather than
   // through the pools page.
@@ -68,7 +70,9 @@ export function FleetPage({
     <Stack gap="lg">
       <Title order={3}>Fleet</Title>
 
-      <SimpleGrid cols={{ base: 1, sm: 2, md: 4 }}>
+      {/* Two across on a phone rather than one: four full-width cards is a
+          screenful of numbers before the fleet itself comes into view. */}
+      <SimpleGrid cols={{ base: 2, md: 4 }} spacing={{ base: 'xs', sm: 'md' }}>
         <Stat label="Runners" value={runners.length} hint={`up to ${ceiling}`} />
         <Stat label="Running a job" value={busy} />
         <Stat label="Idle" value={runners.filter((r) => r.job === 'idle').length} />
@@ -90,15 +94,17 @@ export function FleetPage({
             {elastic.map((pool) => {
               const decision = scaling[pool.name]
               const live = runners.filter((r) => r.pool === pool.name).length
+              // The reason is the point of this panel, so on a narrow screen it
+              // gets its own line rather than being truncated to make room.
               return (
-                <Group key={pool.id} gap="xs" wrap="nowrap">
-                  <Text size="sm" fw={500} w={140} truncate>
+                <Group key={pool.id} gap="xs" wrap={narrow ? 'wrap' : 'nowrap'}>
+                  <Text size="sm" fw={500} w={narrow ? undefined : 140} truncate={!narrow}>
                     {pool.name}
                   </Text>
                   <Badge variant="light" size="sm" color={decision?.scaledUp ? 'blue' : 'gray'}>
                     {live} of {pool.minReplicas}–{pool.maxReplicas}
                   </Badge>
-                  <Text size="sm" c="dimmed" truncate>
+                  <Text size="sm" c="dimmed" truncate={!narrow} style={narrow ? { width: '100%' } : undefined}>
                     {decision?.reason ?? 'waiting for the first pass'}
                   </Text>
                 </Group>
@@ -126,6 +132,17 @@ export function FleetPage({
             </Stack>
           </Center>
         </Card>
+      ) : narrow ? (
+        <Stack gap="sm">
+          {runners.map((runner) => (
+            <RunnerCard
+              key={runner.name}
+              runner={runner}
+              pool={poolsByName.get(runner.pool)}
+              onOpen={setEditing}
+            />
+          ))}
+        </Stack>
       ) : (
         <Card withBorder padding={0}>
           <Table highlightOnHover verticalSpacing="sm" horizontalSpacing="md">
@@ -160,36 +177,13 @@ export function FleetPage({
                     </Badge>
                   </Table.Td>
                   <Table.Td>
-                    <Group gap={6} wrap="nowrap">
-                      <StateBadge state={runner.state} />
-                      {runner.trouble && (
-                        <Tooltip label={runner.trouble} multiline maw={420}>
-                          <Badge
-                            color="red"
-                            variant="light"
-                            leftSection={<IconAlertTriangle size={12} />}
-                          >
-                            failing
-                          </Badge>
-                        </Tooltip>
-                      )}
-                    </Group>
+                    <StateCell runner={runner} />
                   </Table.Td>
                   <Table.Td>
                     <JobBadge job={runner.job} />
                   </Table.Td>
                   <Table.Td>
-                    {runner.upToDate ? (
-                      <Text size="sm" c="dimmed">
-                        up to date
-                      </Text>
-                    ) : (
-                      <Tooltip label="It will be replaced once the job it is on finishes">
-                        <Badge color="orange" variant="light">
-                          superseded
-                        </Badge>
-                      </Tooltip>
-                    )}
+                    <ConfigurationCell runner={runner} />
                   </Table.Td>
                 </Table.Tr>
               ))}
@@ -203,6 +197,9 @@ export function FleetPage({
         onClose={() => setEditing(null)}
         title={editing ? `Edit ${editing.name}` : ''}
         size="lg"
+        // As on the pools page: the editor is a long form, and on a phone it
+        // gets the screen rather than a panel floating inside one.
+        fullScreen={narrow}
       >
         {editing && (
           <PoolEditor
@@ -251,14 +248,91 @@ function PoolCell({
   )
 }
 
-function Stat({ label, value, hint }: { label: string; value: number; hint?: string }) {
+/**
+ * One runner, as a card.
+ *
+ * The same six facts the table carries, in the same order: what a phone loses
+ * against a desktop is the ability to compare two runners at a glance, not any
+ * of what either one says. The pool is the same way into its definition it is
+ * in the table — that route should not be the thing a phone loses.
+ */
+function RunnerCard({
+  runner,
+  pool,
+  onOpen,
+}: {
+  runner: Runner
+  pool?: Pool
+  onOpen: (pool: Pool) => void
+}) {
   return (
     <Card withBorder padding="md">
+      <Stack gap="xs">
+        <Group justify="space-between" gap="xs" wrap="nowrap" align="flex-start">
+          <Text ff="monospace" size="sm" fw={500} style={{ wordBreak: 'break-all' }}>
+            {runner.name}
+          </Text>
+          <Badge variant="default" size="sm" style={{ flexShrink: 0 }}>
+            {runner.runtime}
+          </Badge>
+        </Group>
+        <Field label="Pool">
+          <PoolCell name={runner.pool} pool={pool} onOpen={onOpen} />
+        </Field>
+        <Field label="State">
+          <StateCell runner={runner} />
+        </Field>
+        <Field label="Job">
+          <JobBadge job={runner.job} />
+        </Field>
+        <Field label="Configuration">
+          <ConfigurationCell runner={runner} />
+        </Field>
+      </Stack>
+    </Card>
+  )
+}
+
+function StateCell({ runner }: { runner: Runner }) {
+  return (
+    <Group gap={6} wrap="wrap" justify="flex-end">
+      <StateBadge state={runner.state} />
+      {runner.trouble && (
+        <Tooltip label={runner.trouble} multiline maw={420}>
+          <Badge color="red" variant="light" leftSection={<IconAlertTriangle size={12} />}>
+            failing
+          </Badge>
+        </Tooltip>
+      )}
+    </Group>
+  )
+}
+
+function ConfigurationCell({ runner }: { runner: Runner }) {
+  if (runner.upToDate) {
+    return (
+      <Text size="sm" c="dimmed">
+        up to date
+      </Text>
+    )
+  }
+  return (
+    <Tooltip label="It will be replaced once the job it is on finishes">
+      <Badge color="orange" variant="light">
+        superseded
+      </Badge>
+    </Tooltip>
+  )
+}
+
+function Stat({ label, value, hint }: { label: string; value: number; hint?: string }) {
+  return (
+    <Card withBorder p={{ base: 'sm', sm: 'md' }}>
       <Text size="xs" c="dimmed" tt="uppercase" fw={600}>
         {label}
       </Text>
       <Group align="baseline" gap="xs">
-        <Text fz={28} fw={600}>
+        <Text fz={{ base: 24, sm: 28 }} fw={600}>
           {value}
         </Text>
         {hint && (

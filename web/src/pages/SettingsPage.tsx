@@ -14,7 +14,7 @@ export function SettingsPage({ health }: { health: Health | null }) {
     <Stack gap="lg" maw={640}>
       <Title order={3}>Settings</Title>
 
-      <Card withBorder padding="lg">
+      <Card withBorder p={{ base: 'md', sm: 'lg' }}>
         <Stack gap="sm">
           <Text fw={500}>Web access</Text>
           <Text size="sm" c="dimmed">
@@ -61,14 +61,18 @@ export function SettingsPage({ health }: { health: Health | null }) {
         </Stack>
       </Card>
 
-      <Card withBorder padding="lg">
+      <Card withBorder p={{ base: 'md', sm: 'lg' }}>
         <Stack gap="xs">
           <Text fw={500}>Upgrading</Text>
           <Text size="sm" c="dimmed">
             Replacing the binary and restarting the daemon does not touch the runners: they are
             systemd units and containers of their own, and jobs carry on through it.
           </Text>
-          <Code block>sudo systemctl restart runner-fleetd</Code>
+          {/* A command is copied, not read across: it scrolls rather than
+              widening the page past the phone it is on. */}
+          <Code block style={{ overflowX: 'auto' }}>
+            sudo systemctl restart runner-fleetd
+          </Code>
           <Text size="sm" c="dimmed">Version {health?.version ?? 'unknown'}</Text>
         </Stack>
       </Card>

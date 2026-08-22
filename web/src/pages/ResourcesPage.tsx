@@ -15,6 +15,7 @@ import {
 } from '@mantine/core'
 import { IconAlertTriangle } from '@tabler/icons-react'
 import type { Commitment, HostResources, ResourceReport, RunnerUsage } from '../api'
+import { Field, useNarrow } from '../responsive'
 import { HostChart } from './HostChart'
 
 /**
@@ -32,6 +33,8 @@ import { HostChart } from './HostChart'
 const meterColours = { cpu: 'blue', memory: 'orange', disk: 'teal' } as const
 
 export function ResourcesPage({ report }: { report: ResourceReport | null }) {
+  const narrow = useNarrow()
+
   if (report === null || !report.ready || !report.host) {
     return (
       <Stack gap="lg">
@@ -55,7 +58,7 @@ export function ResourcesPage({ report }: { report: ResourceReport | null }) {
 
   return (
     <Stack gap="lg">
-      <Group justify="space-between" align="baseline">
+      <Group justify="space-between" align="baseline" gap="xs" wrap="wrap">
         <Title order={3}>Resources</Title>
         {report.at && (
           <Text size="xs" c="dimmed">
@@ -64,7 +67,7 @@ export function ResourcesPage({ report }: { report: ResourceReport | null }) {
         )}
       </Group>
 
-      <SimpleGrid cols={{ base: 1, sm: 3 }}>
+      <SimpleGrid cols={{ base: 1, sm: 3 }} spacing={{ base: 'sm', sm: 'md' }}>
         <Meter
           label="CPU"
           colour={meterColours.cpu}
@@ -96,32 +99,38 @@ export function ResourcesPage({ report }: { report: ResourceReport | null }) {
         </Alert>
       ))}
 
-      <Card withBorder padding={0}>
-        <Table highlightOnHover verticalSpacing="sm" horizontalSpacing="md">
-          <Table.Thead>
-            <Table.Tr>
-              <Table.Th>Runner</Table.Th>
-              <Table.Th>Pool</Table.Th>
-              <Table.Th>Runtime</Table.Th>
-              <Table.Th>CPU</Table.Th>
-              <Table.Th>Memory</Table.Th>
-            </Table.Tr>
-          </Table.Thead>
-          <Table.Tbody>
-            {runners.length === 0 ? (
+      {runners.length === 0 ? (
+        <Card withBorder padding="md">
+          <Text size="sm" c="dimmed" ta="center" py="md">
+            Nothing is running on this host yet.
+          </Text>
+        </Card>
+      ) : narrow ? (
+        <Stack gap="sm">
+          {runners.map((runner) => (
+            <RunnerUsageCard key={runner.name} runner={runner} />
+          ))}
+        </Stack>
+      ) : (
+        <Card withBorder padding={0}>
+          <Table highlightOnHover verticalSpacing="sm" horizontalSpacing="md">
+            <Table.Thead>
               <Table.Tr>
-                <Table.Td colSpan={5}>
-                  <Text size="sm" c="dimmed" ta="center" py="md">
-                    Nothing is running on this host yet.
-                  </Text>
-                </Table.Td>
+                <Table.Th>Runner</Table.Th>
+                <Table.Th>Pool</Table.Th>
+                <Table.Th>Runtime</Table.Th>
+                <Table.Th>CPU</Table.Th>
+                <Table.Th>Memory</Table.Th>
               </Table.Tr>
-            ) : (
-              runners.map((runner) => <RunnerRow key={runner.name} runner={runner} />)
-            )}
-          </Table.Tbody>
-        </Table>
-      </Card>
+            </Table.Thead>
+            <Table.Tbody>
+              {runners.map((runner) => (
+                <RunnerRow key={runner.name} runner={runner} />
+              ))}
+            </Table.Tbody>
+          </Table>
+        </Card>
+      )}
     </Stack>
   )
 }
@@ -141,23 +150,55 @@ function RunnerRow({ runner }: { runner: RunnerUsage }) {
         </Badge>
       </Table.Td>
       <Table.Td>
-        {runner.cpuPercent === null || runner.cpuPercent === undefined ? (
-          // A rate needs two readings and this runner has one. A dash is the
-          // truth; a zero would be a machine mid-boot shown as doing nothing.
-          <Tooltip label="Measured on the next reading">
-            <Text size="sm" c="dimmed">
-              —
-            </Text>
-          </Tooltip>
-        ) : (
-          <Text size="sm">{runner.cpuPercent.toFixed(1)}%</Text>
-        )}
+        <CpuCell runner={runner} />
       </Table.Td>
       <Table.Td>
         <Text size="sm">{bytes(runner.memoryBytes)}</Text>
       </Table.Td>
     </Table.Tr>
   )
+}
+
+/** One runner's usage, as a card — the five columns will not fit on a phone. */
+function RunnerUsageCard({ runner }: { runner: RunnerUsage }) {
+  return (
+    <Card withBorder padding="md">
+      <Stack gap="xs">
+        <Group justify="space-between" gap="xs" wrap="nowrap" align="flex-start">
+          <Text ff="monospace" size="sm" fw={500} style={{ wordBreak: 'break-all' }}>
+            {runner.name}
+          </Text>
+          <Badge variant="default" size="sm" style={{ flexShrink: 0 }}>
+            {runner.runtime}
+          </Badge>
+        </Group>
+        <Field label="Pool">
+          <Text size="sm">{runner.pool || '—'}</Text>
+        </Field>
+        <Field label="CPU">
+          <CpuCell runner={runner} />
+        </Field>
+        <Field label="Memory">
+          <Text size="sm">{bytes(runner.memoryBytes)}</Text>
+        </Field>
+      </Stack>
+    </Card>
+  )
+}
+
+function CpuCell({ runner }: { runner: RunnerUsage }) {
+  if (runner.cpuPercent === null || runner.cpuPercent === undefined) {
+    // A rate needs two readings and this runner has one. A dash is the truth;
+    // a zero would be a machine mid-boot shown as doing nothing.
+    return (
+      <Tooltip label="Measured on the next reading">
+        <Text size="sm" c="dimmed">
+          —
+        </Text>
+      </Tooltip>
+    )
+  }
+  return <Text size="sm">{runner.cpuPercent.toFixed(1)}%</Text>
 }
 
 /**
@@ -177,7 +218,8 @@ function Committed({ committed, host }: { committed: Commitment; host: HostResou
       <Text size="xs" c="dimmed" tt="uppercase" fw={600} mb="xs">
         Committed at full stretch
       </Text>
-      <Group gap="xl">
+      {/* Four facts in a row is two words each on a phone; they wrap instead. */}
+      <Group gap="xl" wrap="wrap">
         <Fact label="Runners" value={String(committed.runners)} />
         <Fact
           label="CPU"
