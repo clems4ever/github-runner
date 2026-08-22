@@ -171,3 +171,36 @@ func TestWhatTheContainerIsGivenIsReadableByIt(t *testing.T) {
 		t.Fatalf("the container cannot read what it was given:\n%s", logs)
 	}
 }
+
+// Which jobs can run in a container pool and which need a machine is not a
+// matter of taste. It is what the image has in it, and that is a fact about
+// something outside this repository — so it is checked here rather than
+// reasoned about in a comment.
+//
+// The runner image is built on dotnet runtime-deps: it carries the shared
+// libraries a .NET program needs and no compiler. `go test -race` needs cgo and
+// therefore a C compiler, which is why this repository's own `go` job runs on a
+// machine pool and not a container one.
+//
+// If this test ever fails because gcc has appeared, that is good news and the
+// go job can move to a container pool. Read it as a note, not as a break.
+func TestTheOfficialImageHasNoCToolchain(t *testing.T) {
+	requireDocker(t)
+
+	if out, err := inTheImage("command -v git tar curl"); err != nil {
+		t.Fatalf("the image is missing something checkout and the setup actions need: %v: %s", err, out)
+	}
+
+	out, err := inTheImage("command -v cc gcc")
+	if err == nil {
+		t.Fatalf("the image now has a C compiler:\n%s\n"+
+			"That is good news: the go job can move from the vm pool to the container pool.", out)
+	}
+}
+
+// inTheImage runs one command in the runner image and says what happened.
+func inTheImage(command string) (string, error) {
+	out, err := exec.Command("docker", "run", "--rm", "--entrypoint", "/bin/bash",
+		DefaultImage, "-lc", command).CombinedOutput()
+	return string(out), err
+}

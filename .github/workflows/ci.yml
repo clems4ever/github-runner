@@ -1,5 +1,21 @@
 name: ci
 
+# This workflow runs on the fleet this repository builds.
+#
+# Two rules decide where each job goes.
+#
+# A pull request from a fork runs on GitHub's runners, never on ours. This
+# repository is public, so a fork's pull request is a stranger's code, and a
+# self-hosted runner would run it on our host. `head.repo.fork` is empty for
+# anything that is not a pull request, so pushes to main use the fleet.
+#
+# A job that needs a Docker daemon, root, systemd or a C compiler gets a
+# machine; everything else gets a container. That is not a preference: the
+# official runner image has no compiler and no daemon, which
+# TestTheOfficialImageHasNoCToolchain checks against the real image.
+#
+# To take CI off the fleet, replace the two expressions with ubuntu-latest.
+
 on:
   push:
     branches: [main]
@@ -7,8 +23,9 @@ on:
   workflow_dispatch:
 
 jobs:
+  # A machine: `go test -race` needs cgo, and so a C compiler.
   go:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "vm"]') }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -50,8 +67,10 @@ jobs:
           go test -tags root -c -o /tmp/cross-user-test ./cmd/runner-fleet/
           sudo -E /tmp/cross-user-test -test.v
 
+  # A container: node and npm come from setup-node, and nothing here leaves the
+  # working tree.
   ui:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "container"]') }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -74,8 +93,13 @@ jobs:
   # last CI run, then dropped by a merge from a branch that predated it — and in
   # the window where it did not exist, two of the three bugs it covers shipped.
   # If this job is ever missing from this file again, that is the bug.
+  #
+  # A machine: this needs a Docker daemon it may create and destroy containers
+  # in. Handing it the host's socket instead would give the job root on the host
+  # and, worse for this test, the daemon that runs the fleet's own runners —
+  # which are found by the same labels these containers carry.
   container-runner:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "vm"]') }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -96,13 +120,28 @@ jobs:
           REQUIRE_DOCKER: '1'
         run: go test -tags docker -v -timeout 15m ./internal/executor/docker/
 
+  # A machine, and an ephemeral one: this installs a systemd service as root,
+  # binds a port, and deletes what it installed. A container has no systemd to
+  # install into, and a runner that took a second job after this one would
+  # inherit a host somebody had been root on.
   installer:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || fromJSON('["self-hosted", "linux", "vm"]') }}
     steps:
       - uses: actions/checkout@v5
 
+      # shellcheck is in the golden image's package list, but a machine built
+      # from an image made before it was added will not have it, and neither
+      # would a host that is not one of ours. Installing it when it is missing
+      # keeps this job from depending on which release built the image it is
+      # running on.
       - name: Shellcheck
-        run: shellcheck -S warning install.sh
+        run: |
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq shellcheck
+          fi
+          shellcheck -S warning install.sh
 
       - name: The unit file is valid
         run: systemd-analyze verify packaging/runner-fleetd.service 2>&1 | grep -v "not executable" | (! grep .)

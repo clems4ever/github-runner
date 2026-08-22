@@ -202,6 +202,30 @@ func TestEffectivePackages(t *testing.T) {
 	}
 }
 
+// What is in the image decides which jobs can run in a container pool and which
+// need a machine of their own, so the packages this repository's own workflow
+// depends on are named here rather than discovered by a job failing.
+//
+// build-essential is the load-bearing one: `go test -race` needs a C toolchain,
+// and the official runner container image has none — see
+// TestTheOfficialImageHasNoCToolchain in the docker executor.
+func TestTheImageCarriesWhatTheCIJobsNeed(t *testing.T) {
+	needed := map[string]string{
+		"build-essential": "go test -race needs a C toolchain",
+		"docker.io":       "the container-runner job runs real containers",
+		"shellcheck":      "the installer job lints install.sh",
+		"git":             "actions/checkout",
+		"nodejs":          "actions written in JavaScript, and the ui job",
+		"sudo":            "the installer job installs a service as root",
+	}
+	packages := (ImageSpec{Variant: "default"}).EffectivePackages()
+	for pkg, why := range needed {
+		if !contains(packages, pkg) {
+			t.Errorf("%s is not in the image, and %s", pkg, why)
+		}
+	}
+}
+
 func TestRunUserDataCarriesTheRegistration(t *testing.T) {
 	c := Config{
 		Runner: "web-1", URL: "https://github.com/o/r", Labels: []string{"vm", "gpu"},

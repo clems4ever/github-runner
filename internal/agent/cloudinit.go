@@ -39,8 +39,8 @@ var basePackages = []string{
 	"libreadline-dev", "libsqlite3-dev", "libssl-dev", "libtool", "libxml2-dev",
 	"libxmlsec1-dev", "make", "nodejs", "npm", "openssh-client", "pkg-config", "python3",
 	"python3-dev", "python3-pip", "python3-venv", "qemu-system-x86", "qemu-utils",
-	"rsync", "software-properties-common", "sudo", "tar", "tk-dev", "unzip", "wget",
-	"xz-utils", "zip", "zlib1g-dev",
+	"rsync", "shellcheck", "software-properties-common", "sudo", "tar", "tk-dev", "unzip",
+	"wget", "xz-utils", "zip", "zlib1g-dev",
 }
 
 // ImageSpec describes a golden image. Two pools wanting the same thing share
