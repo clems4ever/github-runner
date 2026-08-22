@@ -35,7 +35,8 @@ type Store interface {
 	UpdatePool(ctx context.Context, p model.Pool) (model.Pool, error)
 	DeletePool(ctx context.Context, id int64) error
 	ImportPools(ctx context.Context, pools []model.Pool, replaceExisting, dryRun bool) ([]store.ImportOutcome, error)
-	Activity(ctx context.Context, since, until time.Time, buckets int, pool string) ([]model.ActivityPoint, error)
+	Activity(ctx context.Context, since, until time.Time, buckets int, filter store.ActivityFilter) ([]model.ActivityPoint, error)
+	ActivityScopes(ctx context.Context, since, until time.Time) ([]string, error)
 	HostHistory(ctx context.Context, since, until time.Time, buckets int) ([]model.HostPoint, error)
 	ListCredentials(ctx context.Context) ([]model.Credential, error)
 	CreateCredential(ctx context.Context, credential model.Credential, secret string) (model.Credential, error)
@@ -409,18 +410,31 @@ func (s *Server) activity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// An unknown pool is not an error: it comes back empty, which is what a
-	// pool created a moment ago honestly has.
-	pool := r.URL.Query().Get("pool")
+	// An unknown pool or scope is not an error: it comes back empty, which is
+	// what a pool created a moment ago honestly has.
+	filter := store.ActivityFilter{
+		Pool:  r.URL.Query().Get("pool"),
+		Scope: r.URL.Query().Get("scope"),
+	}
 
-	points, err := s.store.Activity(r.Context(), since, until, buckets, pool)
+	points, err := s.store.Activity(r.Context(), since, until, buckets, filter)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	// The scopes are what the window has history for, sent whatever the filter
+	// is: a reader narrowed to one repository still needs the others in the
+	// list to be able to leave it.
+	scopes, err := s.store.ActivityScopes(r.Context(), since, until)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"points": points,
-		"pool":   pool,
+		"pool":   filter.Pool,
+		"scope":  filter.Scope,
+		"scopes": scopes,
 		"since":  since,
 		"until":  until,
 	})

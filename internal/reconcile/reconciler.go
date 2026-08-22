@@ -333,7 +333,7 @@ func (r *Reconciler) record(ctx context.Context, pools []model.Pool, byPool map[
 
 	samples := make([]model.Sample, 0, len(pools))
 	for _, pool := range pools {
-		sample := model.Sample{Pool: pool.Name, Target: scaling[pool.Name].Target}
+		sample := model.Sample{Pool: pool.Name, Scope: pool.Scope, Target: scaling[pool.Name].Target}
 		for _, runner := range byPool[pool.Name] {
 			if runner.State == StateStopping {
 				continue

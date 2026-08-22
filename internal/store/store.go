@@ -128,6 +128,14 @@ var migrations = []string{
 		disk_total   INTEGER NOT NULL
 	)`,
 	`CREATE INDEX host_samples_at ON host_samples(at)`,
+	// Which repository or organisation each observation was for. Written on
+	// the sample rather than looked up from the pool at query time, because a
+	// pool can be deleted and the hours it worked still happened: the history
+	// keeps the scope it was recorded against. Existing rows are backfilled
+	// from the pools that are still there, which is the best that can be said
+	// about them.
+	`ALTER TABLE samples ADD COLUMN scope TEXT NOT NULL DEFAULT ''`,
+	`UPDATE samples SET scope = COALESCE((SELECT scope FROM pools WHERE pools.name = samples.pool), '')`,
 }
 
 // SampleRetention is how much history the daemon keeps. Two days covers "what
@@ -685,8 +693,8 @@ func (s *Store) RecordSamples(ctx context.Context, at time.Time, samples []model
 	stamp := at.UTC().Format(time.RFC3339Nano)
 	for _, sample := range samples {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO samples (at, pool, running, busy, target) VALUES (?,?,?,?,?)`,
-			stamp, sample.Pool, sample.Running, sample.Busy, sample.Target); err != nil {
+			`INSERT INTO samples (at, pool, scope, running, busy, target) VALUES (?,?,?,?,?,?)`,
+			stamp, sample.Pool, sample.Scope, sample.Running, sample.Busy, sample.Target); err != nil {
 			return err
 		}
 	}
@@ -697,6 +705,14 @@ func (s *Store) RecordSamples(ctx context.Context, at time.Time, samples []model
 	return tx.Commit()
 }
 
+// ActivityFilter narrows a history query. Both fields empty is the whole
+// fleet; either one on its own is the usual case, and both together is a
+// single pool checked against the scope it was targeting.
+type ActivityFilter struct {
+	Pool  string
+	Scope string
+}
+
 // Activity returns a history over a window, in a fixed number of buckets.
 //
 // Bucketed here rather than in the browser, because a day at one pass every
@@ -704,19 +720,24 @@ func (s *Store) RecordSamples(ctx context.Context, at time.Time, samples []model
 // points. Each bucket reports the *peak* it saw, not the average: a burst that
 // filled the fleet for two minutes is the thing worth seeing, and a mean over
 // a ten-minute bucket would flatten it into nothing.
-// An empty pool name is the whole fleet; naming one narrows it to that pool,
-// which is how the UI shows a single repository's history without a chart per
-// pool crowding the page.
-func (s *Store) Activity(ctx context.Context, since, until time.Time, buckets int, pool string) ([]model.ActivityPoint, error) {
+// A zero filter is the whole fleet; narrowing it is how the UI shows one
+// repository's history without a chart per pool crowding the page.
+func (s *Store) Activity(ctx context.Context, since, until time.Time, buckets int, filter ActivityFilter) ([]model.ActivityPoint, error) {
 	if buckets < 1 {
 		buckets = 1
 	}
 
 	query := `SELECT at, SUM(running), SUM(busy) FROM samples WHERE at >= ? AND at <= ?`
 	args := []any{since.UTC().Format(time.RFC3339Nano), until.UTC().Format(time.RFC3339Nano)}
-	if pool != "" {
+	if filter.Pool != "" {
 		query += ` AND pool = ?`
-		args = append(args, pool)
+		args = append(args, filter.Pool)
+	}
+	if filter.Scope != "" {
+		// Summing across every pool that targets the scope is the point: two
+		// pools on one repository are one repository's worth of work.
+		query += ` AND scope = ?`
+		args = append(args, filter.Scope)
 	}
 	query += ` GROUP BY at ORDER BY at`
 
@@ -770,6 +791,34 @@ func (s *Store) Activity(ctx context.Context, since, until time.Time, buckets in
 		}
 	}
 	return out, nil
+}
+
+// ActivityScopes returns the repositories and organisations that appear in a
+// window, in the order a list of them should be read.
+//
+// Taken from the history rather than from the pools that exist now, so a scope
+// stays offered for as long as there is something to show for it — including
+// after the pool that was working on it has been deleted. Samples recorded
+// before scopes were kept have none, and are left out rather than shown as a
+// scope with no name.
+func (s *Store) ActivityScopes(ctx context.Context, since, until time.Time) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT scope FROM samples WHERE at >= ? AND at <= ? AND scope != '' ORDER BY scope`,
+		since.UTC().Format(time.RFC3339Nano), until.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	scopes := []string{}
+	for rows.Next() {
+		var scope string
+		if err := rows.Scan(&scope); err != nil {
+			return nil, err
+		}
+		scopes = append(scopes, scope)
+	}
+	return scopes, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

@@ -126,6 +126,22 @@ export interface ActivityPoint {
   busy: number
 }
 
+/**
+ * A window of fleet history, with what it could have been narrowed to.
+ *
+ * `scopes` is every repository and organisation the window has history for,
+ * sent whatever the filter is — including scopes whose pool has since been
+ * deleted, because the hours it worked still happened.
+ */
+export interface ActivityHistory {
+  points: ActivityPoint[]
+  pool: string
+  scope: string
+  scopes: string[]
+  since: string
+  until: string
+}
+
 /** What the whole machine is doing. */
 export interface HostResources {
   cpus: number
@@ -265,9 +281,11 @@ export const api = {
   runners: () =>
     request<{ runners: Runner[]; warnings: string[]; scaling: Record<string, Scale> }>('/api/runners'),
   /** Pass a pool name to narrow the history to it; omit it for the whole fleet. */
-  activity: (hours: number, pool?: string) =>
-    request<{ points: ActivityPoint[]; pool: string; since: string; until: string }>(
-      `/api/activity?hours=${hours}` + (pool ? `&pool=${encodeURIComponent(pool)}` : ''),
+  activity: (hours: number, pool?: string, scope?: string) =>
+    request<ActivityHistory>(
+      `/api/activity?hours=${hours}` +
+        (pool ? `&pool=${encodeURIComponent(pool)}` : '') +
+        (scope ? `&scope=${encodeURIComponent(scope)}` : ''),
     ),
 
   /** What the host and its runners are using, as of the daemon's last reading. */

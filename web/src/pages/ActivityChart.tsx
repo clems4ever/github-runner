@@ -45,19 +45,24 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
   const narrow = useNarrow()
 
   const [hours, setHours] = useState('6')
-  // Empty is the whole fleet. Narrowing to one pool is how someone looks at a
-  // single repository without a chart per pool crowding the page.
+  // Empty is the whole fleet. Narrowing is how someone looks at one thing
+  // without a chart per pool crowding the page: to a pool, or to the scope —
+  // the repository or organisation — that several pools may be serving
+  // between them.
   const [pool, setPool] = useState<string | null>(null)
+  const [scope, setScope] = useState<string | null>(null)
   const [points, setPoints] = useState<ActivityPoint[] | null>(null)
+  const [seen, setSeen] = useState<string[]>([])
   const [failed, setFailed] = useState(false)
 
   useEffect(() => {
     let cancelled = false
     const load = async () => {
       try {
-        const activity = await api.activity(Number(hours), pool ?? undefined)
+        const activity = await api.activity(Number(hours), pool ?? undefined, scope ?? undefined)
         if (!cancelled) {
           setPoints(activity.points ?? [])
+          setSeen(activity.scopes ?? [])
           setFailed(false)
         }
       } catch {
@@ -72,7 +77,27 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
       cancelled = true
       clearInterval(timer)
     }
-  }, [hours, pool])
+  }, [hours, pool, scope])
+
+  // The scopes on offer are the ones the window has history for, plus the ones
+  // the current pools point at. Both, because either on its own leaves someone
+  // stuck: history alone hides a pool created a minute ago, and the pools alone
+  // would drop a repository the moment the pool working on it was deleted —
+  // and the hours it worked still happened. The selection is kept whatever
+  // happens, so changing the window cannot blank the control.
+  const scopes = [
+    ...new Set([...seen, ...pools.map((p) => p.scope), ...(scope ? [scope] : [])]),
+  ].sort()
+
+  const chooseScope = (chosen: string | null) => {
+    setScope(chosen)
+    // A pool outside the scope just chosen would narrow the chart to nothing,
+    // which reads as an outage rather than as a contradiction.
+    if (chosen && pool && !pools.some((p) => p.name === pool && p.scope === chosen)) setPool(null)
+  }
+
+  // Whatever the chart was narrowed to, for the empty state to name.
+  const narrowedTo = pool ?? scope
 
   const data = (points ?? []).map((point) => ({
     at: point.at,
@@ -93,9 +118,30 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
             Peak per interval, so a short burst is not averaged away
           </Text>
         </div>
-        {/* Filters in one row above the chart, on their own line once that row
-            no longer holds them and the heading both. */}
-        <Group gap="xs" wrap="nowrap" style={narrow ? { flex: '1 1 100%' } : undefined}>
+        {/* Filters in one row above the chart, widest first, on their own line
+            once that row no longer holds them and the heading both. Two
+            filters and the range control do not fit across a phone, and a
+            select cannot shrink below the width of its own text, so on a
+            narrow screen with both of them the row is allowed to wrap rather
+            than to run off the edge. */}
+        <Group
+          gap="xs"
+          wrap={narrow && scopes.length > 1 && pools.length > 1 ? 'wrap' : 'nowrap'}
+          style={narrow ? { flex: '1 1 100%' } : undefined}
+        >
+          {scopes.length > 1 && (
+            <Select
+              size="xs"
+              w={narrow ? undefined : 220}
+              flex={narrow ? 1 : undefined}
+              aria-label="Scope"
+              placeholder="All scopes"
+              clearable
+              value={scope}
+              onChange={chooseScope}
+              data={scopes.map((s) => ({ value: s, label: s }))}
+            />
+          )}
           {pools.length > 1 && (
             <Select
               size="xs"
@@ -106,7 +152,10 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
               clearable
               value={pool}
               onChange={setPool}
-              data={pools.map((p) => ({ value: p.name, label: p.name }))}
+              // Only the pools that can say anything about the chosen scope.
+              data={pools
+                .filter((p) => !scope || p.scope === scope)
+                .map((p) => ({ value: p.name, label: p.name }))}
             />
           )}
           <SegmentedControl size="xs" data={ranges} value={hours} onChange={setHours} />
@@ -135,8 +184,8 @@ export function ActivityChart({ pools }: { pools: Pool[] }) {
               No history yet
             </Text>
             <Text size="xs" c="dimmed">
-              {pool
-                ? `Nothing recorded for ${pool} in this window.`
+              {narrowedTo
+                ? `Nothing recorded for ${narrowedTo} in this window.`
                 : 'The daemon records what the fleet is doing on every pass; come back in a minute.'}
             </Text>
           </Stack>

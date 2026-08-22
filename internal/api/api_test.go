@@ -565,6 +565,47 @@ func TestActivityCanBeNarrowedToOnePool(t *testing.T) {
 	}
 }
 
+func TestActivityCanBeNarrowedToOneScope(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now().UTC()
+	if err := h.store.RecordSamples(context.Background(), now.Add(-time.Minute), []model.Sample{
+		{Pool: "web", Scope: "acme/site", Running: 3, Busy: 2},
+		{Pool: "web-arm", Scope: "acme/site", Running: 1, Busy: 1},
+		{Pool: "api", Scope: "acme/api", Running: 7, Busy: 5},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := readAll(t, h.do("GET", "/api/activity?hours=1&scope=acme%2Fsite", nil))
+	if !strings.Contains(payload, `"running":4`) {
+		t.Fatalf("want both pools on acme/site added together: %s", payload)
+	}
+	if !strings.Contains(payload, `"scope":"acme/site"`) {
+		t.Fatalf("the response does not say what it was narrowed to: %s", payload)
+	}
+
+	// The scopes on offer come back whatever the filter is, or a reader who
+	// narrowed to one repository could not leave it again.
+	for _, want := range []string{`"acme/api"`, `"acme/site"`} {
+		if !strings.Contains(payload, want) {
+			t.Errorf("the response is missing the scope %s: %s", want, payload)
+		}
+	}
+}
+
+// A scope nothing was ever recorded against is empty, not an error.
+func TestActivityForAnUnknownScope(t *testing.T) {
+	h := newHarness(t)
+	resp := h.do("GET", "/api/activity?hours=1&scope=nobody%2Fnothing", nil)
+	payload := readAll(t, resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("answered %d: %s", resp.StatusCode, payload)
+	}
+	if !strings.Contains(payload, `"points":[]`) {
+		t.Fatalf("got %s", payload)
+	}
+}
+
 func TestActivityDefaultsToARecentWindow(t *testing.T) {
 	h := newHarness(t)
 	payload := readAll(t, h.do("GET", "/api/activity", nil))

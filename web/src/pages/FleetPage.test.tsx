@@ -19,7 +19,14 @@ vi.mock('../api', async () => {
 })
 
 beforeEach(() => {
-  vi.mocked(api.activity).mockResolvedValue({ points: [], pool: '', since: '', until: '' })
+  vi.mocked(api.activity).mockResolvedValue({
+    points: [],
+    pool: '',
+    scope: '',
+    scopes: [],
+    since: '',
+    until: '',
+  })
 })
 
 async function renderPage(
