@@ -29,7 +29,7 @@ describe('PoolEditor', () => {
     expect(screen.getByText('vm')).toBeInTheDocument()
 
     await userEvent.click(screen.getByRole('switch', { name: /Nested virtualisation/ }))
-    expect(screen.getByText('nested')).toBeInTheDocument()
+    expect(screen.getByText('nestedvirt')).toBeInTheDocument()
   })
 
   it('warns that a container with nested virtualisation is a weaker boundary', async () => {

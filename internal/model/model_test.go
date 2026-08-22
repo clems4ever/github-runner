@@ -123,20 +123,33 @@ func TestEffectiveLabelsDescribeTheRunner(t *testing.T) {
 	p.Labels = []string{"gpu", "eu-west"}
 
 	got := strings.Join(p.EffectiveLabels(), ",")
-	want := "container,nested,ephemeral,gpu,eu-west"
+	want := "container,nestedvirt,ephemeral,gpu,eu-west"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-// A workflow asking for "nested" must not reach a pool that only calls itself
-// that, so the automatic labels follow the settings rather than the name.
+// A workflow asking for "nestedvirt" must not reach a pool that only calls
+// itself that, so the automatic labels follow the settings rather than the name.
 func TestEffectiveLabelsFollowTheConfiguration(t *testing.T) {
 	p := validPool()
 	p.Nested = false
 	for _, label := range p.EffectiveLabels() {
+		if label == "nestedvirt" {
+			t.Fatal("a pool without nested virtualisation labelled itself nestedvirt")
+		}
+	}
+}
+
+// The label was "nested" until it was found to say nothing about what is
+// nested. Nobody should reintroduce it as a second spelling: two labels for one
+// capability is how a workflow ends up on a runner that cannot do the work.
+func TestNestedIsNoLongerALabel(t *testing.T) {
+	p := validPool()
+	p.Nested = true
+	for _, label := range p.EffectiveLabels() {
 		if label == "nested" {
-			t.Fatal("a pool without nested virtualisation labelled itself nested")
+			t.Fatal("the old label is back; workflows must target nestedvirt")
 		}
 	}
 }

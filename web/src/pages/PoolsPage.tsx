@@ -170,7 +170,7 @@ export function PoolsPage({
                         {pool.nested && (
                           <Tooltip label="Jobs can boot machines of their own">
                             <Badge size="sm" color="grape" variant="light">
-                              nested
+                              nestedvirt
                             </Badge>
                           </Tooltip>
                         )}

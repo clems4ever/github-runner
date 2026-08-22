@@ -59,7 +59,7 @@ func testSpec(name string) reconcile.Spec {
 		Name: name, Pool: "web", PoolID: 1, Generation: "abc123def456",
 		Runtime: model.RuntimeVM, URL: "https://github.com/o/r",
 		ScopeKind: model.ScopeRepository, Scope: "o/r",
-		Labels: []string{"vm", "nested"}, Ephemeral: true, Nested: true,
+		Labels: []string{"vm", "nestedvirt"}, Ephemeral: true, Nested: true,
 		CPUs: 4, MemoryMB: 8192, DiskGB: 60, Image: "default", CredentialID: 7,
 	}
 }
@@ -80,7 +80,7 @@ func TestCreateWritesTheConfigurationThenStarts(t *testing.T) {
 		"FLEET_POOL=web",
 		"FLEET_GENERATION=abc123def456",
 		"FLEET_URL=https://github.com/o/r",
-		"FLEET_LABELS=vm,nested",
+		"FLEET_LABELS=vm,nestedvirt",
 		"FLEET_EPHEMERAL=true",
 		"FLEET_NESTED=true",
 		"FLEET_CPUS=4",
