@@ -31,7 +31,7 @@ export interface Pool {
 }
 
 export type RunnerState = 'running' | 'stopping' | 'stopped'
-export type JobState = 'busy' | 'idle' | 'offline' | 'unknown'
+export type JobState = 'busy' | 'idle' | 'starting' | 'offline' | 'unknown'
 
 export interface Runner {
   name: string

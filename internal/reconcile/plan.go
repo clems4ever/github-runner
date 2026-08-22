@@ -9,6 +9,7 @@ package reconcile
 
 import (
 	"sort"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
@@ -78,6 +79,10 @@ type Runner struct {
 	ScopeKind    model.ScopeKind
 	Scope        string
 	CredentialID int64
+	// Up is how long this runner has been running, when the host knows. A
+	// machine takes a minute or two to boot and register, and a runner GitHub
+	// has not heard of yet is not the same as one it will never hear of.
+	Up time.Duration
 	// Trouble is what the host says is wrong with this runner, when it says
 	// anything: a unit that keeps failing, a container that keeps exiting.
 	//

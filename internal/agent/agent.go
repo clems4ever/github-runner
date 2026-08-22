@@ -153,16 +153,88 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 
 	case <-ctx.Done():
 		log.Info("stopping: asking the machine to shut down and waiting for the job in flight", "runner", c.Runner)
-		if err := powerDown(options.QMPSocket); err != nil {
-			log.Warn("could not reach the monitor; the machine will be stopped the hard way", "error", err)
-			_ = cmd.Process.Signal(syscall.SIGTERM)
-		}
+		return drain(exited, drainOptions{
+			press: func() error {
+				if err := powerDown(options.QMPSocket); err != nil {
+					// The monitor is the polite route. Without it the only
+					// thing left is a signal to QEMU, which is a power cut.
+					_ = cmd.Process.Signal(syscall.SIGTERM)
+					return err
+				}
+				return nil
+			},
+			kill:   func() { _ = cmd.Process.Kill() },
+			runner: c.Runner,
+			log:    log,
+		})
+	}
+}
+
+// pressInterval is how often the power button is pressed again while a machine
+// refuses to go.
+//
+// An ACPI power button press is an edge-triggered event, and something in the
+// guest has to be listening for it. A machine that is still booting has nothing
+// listening yet, so the press is dropped — and a drain that arrives nine
+// seconds after boot, which is what a daemon replacing a fleet does, is lost
+// entirely. The machine then runs until the grace period ends, holding its
+// cpus and memory, with the fleet showing it as stopping the whole time.
+//
+// So the button is pressed again, and again, until the machine goes. Pressing
+// it during a shutdown that has already started is ignored by the guest, which
+// is why this is safe to repeat.
+const pressInterval = 30 * time.Second
+
+// drainOptions is what draining a machine needs, injected so the waiting can be
+// tested without QEMU.
+type drainOptions struct {
+	press  func() error
+	kill   func()
+	runner string
+	log    *slog.Logger
+	// interval and grace default to pressInterval and shutdownGrace.
+	interval time.Duration
+	grace    time.Duration
+}
+
+// drain asks a machine to stop, keeps asking, and gives up on it eventually.
+func drain(exited <-chan error, o drainOptions) error {
+	interval, grace := o.interval, o.grace
+	if interval == 0 {
+		interval = pressInterval
+	}
+	if grace == 0 {
+		grace = shutdownGrace
+	}
+
+	if err := o.press(); err != nil {
+		o.log.Warn("could not reach the monitor; the machine will be stopped the hard way",
+			"runner", o.runner, "error", err)
+	}
+
+	pressing := time.NewTicker(interval)
+	defer pressing.Stop()
+	giveUp := time.After(grace)
+	started := time.Now()
+
+	for {
 		select {
 		case err := <-exited:
 			return ignoreCleanExit(err)
-		case <-time.After(shutdownGrace):
-			log.Warn("the machine did not stop in time and is being killed", "runner", c.Runner)
-			_ = cmd.Process.Kill()
+
+		case <-pressing.C:
+			// Said out loud, because a machine that needs asking twice is
+			// either finishing a long job or was too young to hear the first
+			// one, and the difference matters to whoever is watching.
+			o.log.Warn("the machine has not stopped; asking it again",
+				"runner", o.runner, "waiting_for", time.Since(started).Round(time.Second).String())
+			if err := o.press(); err != nil {
+				o.log.Warn("could not reach the monitor", "runner", o.runner, "error", err)
+			}
+
+		case <-giveUp:
+			o.log.Warn("the machine did not stop in time and is being killed", "runner", o.runner)
+			o.kill()
 			<-exited
 			return errors.New("the machine did not shut down within the grace period")
 		}

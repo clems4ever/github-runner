@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/agent"
 	"github.com/clems4ever/github-runner/internal/model"
@@ -51,6 +52,8 @@ type Executor struct {
 	binary   string // what the unit runs: this daemon's own binary, in agent mode
 	user     string
 	unitPath string
+	// now is the clock, replaced in tests that need one that does not move.
+	now func() time.Time
 }
 
 // Option configures an executor.
@@ -62,6 +65,9 @@ func WithCommander(c Commander) Option { return func(e *Executor) { e.cmd = c } 
 // WithUnitPath puts the template unit somewhere other than /etc/systemd/system.
 func WithUnitPath(path string) Option { return func(e *Executor) { e.unitPath = path } }
 
+// WithClock replaces the clock, so a test can say how long a drain has taken.
+func WithClock(now func() time.Time) Option { return func(e *Executor) { e.now = now } }
+
 // New builds the executor.
 func New(layout paths.Layout, binary, user string, opts ...Option) *Executor {
 	e := &Executor{
@@ -70,6 +76,7 @@ func New(layout paths.Layout, binary, user string, opts ...Option) *Executor {
 		binary:   binary,
 		user:     user,
 		unitPath: "/etc/systemd/system/" + UnitTemplate + ".service",
+		now:      time.Now,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -317,6 +324,9 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 		if unit, ok := states[unitName(runners[i].Name)]; ok {
 			runners[i].State = unit.state
 			runners[i].Trouble = unit.trouble(runners[i].Name)
+			if unit.state == reconcile.StateRunning {
+				runners[i].Up = unit.running
+			}
 		}
 	}
 	sort.Slice(runners, func(i, j int) bool { return runners[i].Name < runners[j].Name })
@@ -328,7 +338,21 @@ type unit struct {
 	state    reconcile.RunnerState
 	result   string
 	restarts int
+	// draining is how long the unit has been stopping, when it is.
+	draining time.Duration
+	// running is how long it has been up, when it is. A machine takes a minute
+	// or two to boot and register, and that is not the same thing as a runner
+	// GitHub has never heard of.
+	running time.Duration
 }
+
+// patience is how long a drain can take before it is worth mentioning.
+//
+// Stopping a runner waits for the job it is on, so minutes are ordinary and a
+// clock is not a failure. But a machine that missed the power button waits out
+// the agent's whole grace period looking exactly like a machine finishing a
+// long job, and half an hour of that is worth saying out loud.
+const patience = 15 * time.Minute
 
 // trouble is what to tell a person, and nothing when there is nothing to tell.
 //
@@ -336,6 +360,13 @@ type unit struct {
 // is coming back, and nine is a runner that has never worked. The pointer to
 // the journal is there because the reason is always there and never here.
 func (u unit) trouble(runner string) string {
+	// A drain that has outlived any plausible job. Not necessarily broken —
+	// a three-hour job is allowed — but the fleet should say how long rather
+	// than showing "stopping" for an hour with no clock on it.
+	if u.state == reconcile.StateStopping && u.draining > patience {
+		return fmt.Sprintf("draining for %s; if no job is running, the machine is not shutting down: journalctl -u %s",
+			u.draining.Round(time.Minute), unitName(runner))
+	}
 	if u.result == "" || u.result == "success" {
 		return ""
 	}
@@ -349,20 +380,29 @@ func (u unit) trouble(runner string) string {
 // unitStates asks about every unit in one call rather than one call each: a
 // full fleet is one process, not sixty.
 func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]unit, error) {
-	args := append([]string{"show", "--property=Id,ActiveState,SubState,Result,NRestarts"}, units...)
+	// --timestamp=unix so the timestamps are numbers rather than a locale's
+	// idea of a date.
+	args := append([]string{"show", "--timestamp=unix",
+		"--property=Id,ActiveState,SubState,Result,NRestarts,ActiveExitTimestamp,ActiveEnterTimestamp"}, units...)
 	out, err := e.cmd.Run(ctx, "systemctl", args...)
 	if err != nil {
 		return nil, err
 	}
 
 	states := map[string]unit{}
-	var id, active, sub, result, restarts string
+	var id, active, sub, result, restarts, leftActive, becameActive string
 	flush := func() {
 		if id != "" {
 			count, _ := strconv.Atoi(restarts)
-			states[id] = unit{state: mapActiveState(active, sub), result: result, restarts: count}
+			states[id] = unit{
+				state:    mapActiveState(active, sub),
+				result:   result,
+				restarts: count,
+				draining: e.since(leftActive),
+				running:  e.since(becameActive),
+			}
 		}
-		id, active, sub, result, restarts = "", "", "", "", ""
+		id, active, sub, result, restarts, leftActive, becameActive = "", "", "", "", "", "", ""
 	}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
@@ -381,6 +421,10 @@ func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]u
 			result = value
 		case key == "NRestarts":
 			restarts = value
+		case key == "ActiveExitTimestamp":
+			leftActive = value
+		case key == "ActiveEnterTimestamp":
+			becameActive = value
 		}
 	}
 	flush()
@@ -414,6 +458,17 @@ func mapActiveState(active, sub string) reconcile.RunnerState {
 	default: // inactive, failed, or a unit systemd has never heard of
 		return reconcile.StateStopped
 	}
+}
+
+// since reads systemd's "@1755870627" timestamp and says how long ago that was.
+// Anything it cannot read is no time at all, which reports nothing rather than
+// a number made up out of a parse failure.
+func (e *Executor) since(stamp string) time.Duration {
+	seconds, err := strconv.ParseInt(strings.TrimPrefix(strings.TrimSpace(stamp), "@"), 10, 64)
+	if err != nil || seconds <= 0 {
+		return 0
+	}
+	return e.now().Sub(time.Unix(seconds, 0))
 }
 
 func readEnv(path string) (map[string]string, error) {
