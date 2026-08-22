@@ -104,6 +104,17 @@ jobs:
           npm --prefix web ci
           npm --prefix web test
 
+      # Before the tag, not after it. A deprecated key in .goreleaser.yaml only
+      # shows up when goreleaser runs, and by then the tag is pushed — which
+      # leaves a version that exists in git and nowhere else. `check` exits
+      # non-zero on a deprecation, not just on invalid config, so a key on its
+      # way out stops the release while stopping it is still free.
+      - name: Check the release config
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          version: '~> v2'
+          args: check
+
       # Tagged only once the tests have passed, so a failed release leaves no
       # tag behind to clean up.
       - name: Tag
@@ -117,7 +128,11 @@ jobs:
           git tag -a "$VERSION" -m "runner-fleet ${VERSION}"
           git push origin "$VERSION"
 
-      - uses: goreleaser/goreleaser-action@v6
+      # v7 rather than v6: v6 declares Node 20, which the runners no longer
+      # provide — they force it onto Node 24 and annotate the job with a
+      # deprecation warning. v7 is the same action declaring Node 24, with the
+      # same inputs.
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: '~> v2'
           args: release --clean
