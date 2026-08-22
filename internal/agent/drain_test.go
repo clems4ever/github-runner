@@ -129,12 +129,56 @@ func discardLog() *slog.Logger {
 // because the runner had gone, systemd would not replace it because the agent
 // was alive, and the fleet showed a healthy runner. Twelve jobs queued behind
 // it for twenty minutes, and it took an upgrade to clear.
-func TestAMachineThatOutlivesItsRunnerIsStopped(t *testing.T) {
+//
+// The machine is asked to go the moment its runner is done, with no waiting
+// first: the ask is the same request the guest's own unit makes from the
+// inside, so there is nothing to be gained by holding it back.
+func TestAMachineIsAskedToGoAsSoonAsItsRunnerFinishes(t *testing.T) {
 	console := writeConsole(t, "[   55.2] run-runner.sh[1339]: Exiting runner...")
 	exited := make(chan error, 1)
 
-	// Bounded, because a watchdog that never fires would otherwise leave this
-	// test waiting for the go test timeout rather than saying what is wrong.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	var pressed atomic.Int32
+	var askedAfter atomic.Int64
+	_, err := waitForMachine(ctx, exited, watchOptions{
+		console: console,
+		press: func() error {
+			pressed.Add(1)
+			askedAfter.Store(int64(time.Since(started)))
+			exited <- nil // a machine that is listening goes when it is asked
+			return nil
+		},
+		kill:   func() { t.Error("a machine that answered the power button was killed") },
+		runner: "ci-vm-1",
+		log:    discardLog(),
+		check:  2 * time.Millisecond,
+		linger: time.Hour, // the waiting-before-asking that must not happen
+	})
+	if err != nil {
+		t.Fatalf("waiting: %v", err)
+	}
+	if pressed.Load() != 1 {
+		t.Fatalf("the machine was asked %d times, want once", pressed.Load())
+	}
+	// A poll or two, not a linger. The hour above is what this is guarding
+	// against: it must play no part in the healthy path.
+	if waited := time.Duration(askedAfter.Load()); waited > 200*time.Millisecond {
+		t.Fatalf("the machine sat for %s after its runner finished before anyone asked it to go", waited)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the machine was only stopped because the test gave up waiting")
+	}
+}
+
+// And the machine that does not answer: asked, given a moment, then kept at
+// until it goes. This is the one that ran for eighteen minutes.
+func TestAMachineThatIgnoresTheAskIsStopped(t *testing.T) {
+	console := writeConsole(t, "[   55.2] run-runner.sh[1339]: Exiting runner...")
+	exited := make(chan error, 1)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -142,25 +186,29 @@ func TestAMachineThatOutlivesItsRunnerIsStopped(t *testing.T) {
 	stopped, err := waitForMachine(ctx, exited, watchOptions{
 		console: console,
 		press: func() error {
-			pressed.Add(1)
-			// The machine goes when it is asked properly.
-			exited <- nil
+			// It ignores the first two asks, as a guest that is not listening
+			// for the power button does.
+			if pressed.Add(1) >= 3 {
+				exited <- nil
+			}
 			return nil
 		},
-		kill:   func() { t.Error("a machine that answered the power button was killed") },
-		runner: "ci-vm-1",
-		log:    discardLog(),
-		check:  time.Millisecond,
-		linger: 5 * time.Millisecond,
+		kill:     func() { t.Error("killed a machine that was still being asked politely") },
+		runner:   "ci-vm-1",
+		log:      discardLog(),
+		check:    2 * time.Millisecond,
+		linger:   5 * time.Millisecond,
+		interval: 2 * time.Millisecond,
+		grace:    time.Second,
 	})
 	if err != nil {
 		t.Fatalf("waiting: %v", err)
 	}
 	if !stopped {
-		t.Fatal("the machine was reported as having gone by itself")
+		t.Fatal("a machine that had to be kept at was reported as having gone by itself")
 	}
-	if pressed.Load() == 0 {
-		t.Fatal("a machine with no runner on it was left running")
+	if pressed.Load() < 3 {
+		t.Fatalf("it was asked %d times and then left alone", pressed.Load())
 	}
 	if ctx.Err() != nil {
 		t.Fatal("the machine was only stopped because the test gave up waiting")
