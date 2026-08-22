@@ -3,6 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- An SVG favicon rather than a packed .ico: the UI ships inside the Go
+         binary, so every asset is a file somebody has to embed, and one that
+         stays sharp on a retina tab and in a bookmark bar is worth more than
+         three rasterised sizes. -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="theme-color" content="#5A54F0" />
     <title>runner-fleet</title>
   </head>
   <body>
