@@ -680,3 +680,99 @@ func TestASettledRunnerIsNotComingBack(t *testing.T) {
 		t.Fatal("a runner that has been up for an hour is reported as coming back")
 	}
 }
+
+// The numbers come from systemd rather than from QEMU: every runner is a unit,
+// every unit is a cgroup, and the kernel is already accounting for it.
+func TestUsageReadsWhatSystemdAlreadyAccountsFor(t *testing.T) {
+	e, cmd, _ := newExecutor(t)
+	if err := e.Create(context.Background(), testSpec("web-1")); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show --timestamp=unix --property=Id,ActiveState"] = "Id=gh-runner@web-1.service\nActiveState=active\nSubState=running\nResult=success\nNRestarts=0\n"
+	cmd.output["systemctl show --timestamp=unix --property=Id,MemoryCurrent"] = "Id=gh-runner@web-1.service\nMemoryCurrent=4294967296\nCPUUsageNSec=1000000000\n"
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 {
+		t.Fatalf("got %v", usage)
+	}
+	if usage[0].Name != "web-1" || usage[0].Pool != "web" || usage[0].Runtime != "vm" {
+		t.Fatalf("the row does not say which runner this is: %+v", usage[0])
+	}
+	if usage[0].MemoryBytes != 4294967296 {
+		t.Fatalf("memory: got %d", usage[0].MemoryBytes)
+	}
+	// One reading, so there is no rate yet. A machine mid-boot reported as
+	// zero per cent would be a machine burning a core shown as idle.
+	if usage[0].CPUPercent != nil {
+		t.Fatalf("want no figure from one reading, got %v", *usage[0].CPUPercent)
+	}
+
+	cmd.output["systemctl show --timestamp=unix --property=Id,MemoryCurrent"] = "Id=gh-runner@web-1.service\nMemoryCurrent=4294967296\nCPUUsageNSec=2000000000\n"
+	again, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 1 || again[0].CPUPercent == nil {
+		t.Fatalf("want a figure once the counter has been read twice: %+v", again)
+	}
+}
+
+// A unit that is not running has no cgroup and systemd says so by printing
+// "[not set]". A runner using zero and a runner that cannot be measured are
+// different things, and neither is a parse error.
+func TestUsageSkipsWhatSystemdCannotAccountFor(t *testing.T) {
+	e, cmd, _ := newExecutor(t)
+	if err := e.Create(context.Background(), testSpec("web-1")); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show --timestamp=unix --property=Id,MemoryCurrent"] = "Id=gh-runner@web-1.service\nMemoryCurrent=[not set]\nCPUUsageNSec=[not set]\n"
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 || usage[0].MemoryBytes != 0 || usage[0].CPUPercent != nil {
+		t.Fatalf("want the runner listed with nothing measured: %+v", usage)
+	}
+}
+
+func TestUsageOfAnEmptyHostAsksSystemdNothing(t *testing.T) {
+	e, cmd, _ := newExecutor(t)
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 0 {
+		t.Fatalf("got %v", usage)
+	}
+	if cmd.called("MemoryCurrent") {
+		t.Fatal("systemd was asked about a fleet that does not exist")
+	}
+}
+
+// The unit name is read out of each block rather than counted off against the
+// list that was asked for, so a unit systemd has never heard of — one removed
+// between the listing and the question — cannot shift every later answer onto
+// the wrong runner.
+func TestPropertiesAreMatchedByNameNotByPosition(t *testing.T) {
+	e, cmd, _ := newExecutor(t)
+	for _, name := range []string{"web-1", "web-2"} {
+		if err := e.Create(context.Background(), testSpec(name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Only the second unit comes back, and it comes back first.
+	cmd.output["systemctl show --timestamp=unix --property=Id,MemoryCurrent"] = "Id=gh-runner@web-2.service\nMemoryCurrent=512\nCPUUsageNSec=1\n"
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 || usage[0].Name != "web-2" || usage[0].MemoryBytes != 512 {
+		t.Fatalf("the answer landed on the wrong runner: %+v", usage)
+	}
+}

@@ -22,6 +22,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
+	"github.com/clems4ever/github-runner/internal/resources"
 	"github.com/clems4ever/github-runner/internal/secrets"
 	"github.com/clems4ever/github-runner/internal/store"
 	"github.com/clems4ever/github-runner/internal/ui"
@@ -34,6 +35,8 @@ func serveCommand(args []string) error {
 	addr := flags.String("addr", "127.0.0.1:8080", "where to listen")
 	root := flags.String("root", "", "put everything under this directory")
 	interval := flags.Duration("interval", 30*time.Second, "how often to reconcile")
+	sampleInterval := flags.Duration("resource-interval", 15*time.Second,
+		"how often to measure what the host and its runners are using")
 	user := flags.String("user", "runner-fleet", "the service user the runners' units run as")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -78,6 +81,14 @@ func serveCommand(args []string) error {
 	}
 	containers := docker.New(layout, binary)
 
+	// What the host and its runners are actually using, as opposed to what
+	// their pools were promised. The disk watched is the state directory's,
+	// because that is the one the fleet fills: golden images and every
+	// machine's disk live under it.
+	sampler := resources.NewSampler(
+		resources.NewReporter(resources.NewHostCollector(layout.State), vm, containers),
+		db, log)
+
 	// The reconciler is told how to reach GitHub and how to hand a credential
 	// to a runner. Both are injected rather than reached for directly, which
 	// is what lets the fleet's rules be tested without either.
@@ -107,10 +118,11 @@ func serveCommand(args []string) error {
 	}
 
 	server := api.New(api.Options{
-		Store:   db,
-		Fleet:   reconciler,
-		UI:      uiAssets(log),
-		Version: version,
+		Store:     db,
+		Fleet:     reconciler,
+		Resources: sampler,
+		UI:        uiAssets(log),
+		Version:   version,
 		// Asked when a pool is saved, so a credential that cannot serve it is
 		// caught while someone is looking at the form rather than a minute
 		// later in a log.
@@ -169,6 +181,11 @@ func serveCommand(args []string) error {
 	}()
 
 	go reconcileLoop(ctx, reconciler, *interval, nudge, log)
+	// On a clock of its own rather than on the reconciler's. A pass that scaled
+	// up comes back in three seconds and the host's history should not be
+	// dense wherever the fleet was busy and sparse everywhere else — an evenly
+	// spaced record is the one a chart can be read off.
+	go sampler.Run(ctx, *sampleInterval)
 
 	select {
 	case err := <-serving:

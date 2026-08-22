@@ -15,6 +15,7 @@ import {
 import { useDisclosure } from '@mantine/hooks'
 import { notifications } from '@mantine/notifications'
 import {
+  IconGauge,
   IconMoon,
   IconRefresh,
   IconServer2,
@@ -23,18 +24,28 @@ import {
   IconSun,
   IconKey,
 } from '@tabler/icons-react'
-import { api, type Credential, type Health, type Pool, type Runner, type Scale } from './api'
+import {
+  api,
+  type Credential,
+  type Health,
+  type Pool,
+  type ResourceReport,
+  type Runner,
+  type Scale,
+} from './api'
 import { Logo } from './Logo'
 import { FleetPage } from './pages/FleetPage'
 import { PoolsPage } from './pages/PoolsPage'
 import { CredentialsPage } from './pages/CredentialsPage'
+import { ResourcesPage } from './pages/ResourcesPage'
 import { SettingsPage } from './pages/SettingsPage'
 
-type Page = 'fleet' | 'pools' | 'credentials' | 'settings'
+type Page = 'fleet' | 'pools' | 'resources' | 'credentials' | 'settings'
 
 const pages: { key: Page; label: string; icon: typeof IconServer2 }[] = [
   { key: 'fleet', label: 'Fleet', icon: IconServer2 },
   { key: 'pools', label: 'Pools', icon: IconStack2 },
+  { key: 'resources', label: 'Resources', icon: IconGauge },
   { key: 'credentials', label: 'Credentials', icon: IconKey },
   { key: 'settings', label: 'Settings', icon: IconSettings },
 ]
@@ -48,15 +59,17 @@ export function App() {
   const [scaling, setScaling] = useState<Record<string, Scale>>({})
   const [credentials, setCredentials] = useState<Credential[]>([])
   const [health, setHealth] = useState<Health | null>(null)
+  const [resources, setResources] = useState<ResourceReport | null>(null)
   const [loading, setLoading] = useState(true)
 
   const refresh = useCallback(async () => {
     try {
-      const [poolList, runnerList, credentialList, healthInfo] = await Promise.all([
+      const [poolList, runnerList, credentialList, healthInfo, resourceReport] = await Promise.all([
         api.pools(),
         api.runners(),
         api.credentials(),
         api.health(),
+        api.resources(),
       ])
       setPools(poolList)
       setRunners(runnerList.runners ?? [])
@@ -64,6 +77,7 @@ export function App() {
       setScaling(runnerList.scaling ?? {})
       setCredentials(credentialList)
       setHealth(healthInfo)
+      setResources(resourceReport)
     } catch (error) {
       notifications.show({
         color: 'red',
@@ -156,6 +170,7 @@ export function App() {
             onChange={refresh}
           />
         )}
+        {page === 'resources' && <ResourcesPage report={resources} />}
         {page === 'credentials' && (
           <CredentialsPage credentials={credentials} pools={pools} onChange={refresh} />
         )}

@@ -23,6 +23,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
+	"github.com/clems4ever/github-runner/internal/resources"
 )
 
 // UnitTemplate is the template unit every VM runner is an instance of.
@@ -54,6 +55,9 @@ type Executor struct {
 	unitPath string
 	// now is the clock, replaced in tests that need one that does not move.
 	now func() time.Time
+	// cpu remembers each unit's processor counter between samples, which is
+	// what makes a percentage out of it.
+	cpu *resources.Rate
 }
 
 // Option configures an executor.
@@ -77,6 +81,7 @@ func New(layout paths.Layout, binary, user string, opts ...Option) *Executor {
 		user:     user,
 		unitPath: "/etc/systemd/system/" + UnitTemplate + ".service",
 		now:      time.Now,
+		cpu:      resources.NewRate(),
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -392,60 +397,124 @@ func (u unit) trouble(runner string) string {
 // unitStates asks about every unit in one call rather than one call each: a
 // full fleet is one process, not sixty.
 func (e *Executor) unitStates(ctx context.Context, units []string) (map[string]unit, error) {
-	// --timestamp=unix so the timestamps are numbers rather than a locale's
-	// idea of a date.
+	shown, err := e.show(ctx, []string{"ActiveState", "SubState", "Result", "NRestarts",
+		"ActiveExitTimestamp", "ActiveEnterTimestamp"}, units)
+	if err != nil {
+		return nil, err
+	}
+
+	states := make(map[string]unit, len(shown))
+	for id, properties := range shown {
+		count, _ := strconv.Atoi(properties["NRestarts"])
+		states[id] = unit{
+			state:    mapActiveState(properties["ActiveState"], properties["SubState"]),
+			result:   properties["Result"],
+			restarts: count,
+			draining: e.since(properties["ActiveExitTimestamp"]),
+			running:  e.since(properties["ActiveEnterTimestamp"]),
+			// Both sub-states of "activating" are on the way up: "start" is a
+			// unit systemd is launching, "auto-restart" is one waiting out
+			// RestartSec, which for an ephemeral runner is the gap between two
+			// machines.
+			coming: properties["ActiveState"] == "activating",
+		}
+	}
+	return states, nil
+}
+
+// show reads properties of several units in one systemctl call, keyed by unit
+// name.
+//
+// Id is always asked for and is what keys the result: systemctl prints one
+// block per unit separated by a blank line, in the order they were named, and
+// reading the name out of the block rather than counting blocks is what keeps
+// this correct when a unit systemd has never heard of is in the list.
+//
+// --timestamp=unix so that any timestamp among the properties comes back as a
+// number rather than as a locale's idea of a date.
+func (e *Executor) show(ctx context.Context, properties, units []string) (map[string]map[string]string, error) {
 	args := append([]string{"show", "--timestamp=unix",
-		"--property=Id,ActiveState,SubState,Result,NRestarts,ActiveExitTimestamp,ActiveEnterTimestamp"}, units...)
+		"--property=Id," + strings.Join(properties, ",")}, units...)
 	out, err := e.cmd.Run(ctx, "systemctl", args...)
 	if err != nil {
 		return nil, err
 	}
 
-	states := map[string]unit{}
-	var id, active, sub, result, restarts, leftActive, becameActive string
+	shown := map[string]map[string]string{}
+	block := map[string]string{}
 	flush := func() {
-		if id != "" {
-			count, _ := strconv.Atoi(restarts)
-			states[id] = unit{
-				state:    mapActiveState(active, sub),
-				result:   result,
-				restarts: count,
-				draining: e.since(leftActive),
-				running:  e.since(becameActive),
-				// Both sub-states of "activating" are on the way up: "start" is
-				// a unit systemd is launching, "auto-restart" is one waiting out
-				// RestartSec, which for an ephemeral runner is the gap between
-				// two machines.
-				coming: active == "activating",
-			}
+		if id := block["Id"]; id != "" {
+			shown[id] = block
 		}
-		id, active, sub, result, restarts, leftActive, becameActive = "", "", "", "", "", "", ""
+		block = map[string]string{}
 	}
 	scanner := bufio.NewScanner(strings.NewReader(out))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		key, value, _ := strings.Cut(line, "=")
-		switch {
-		case line == "":
+		if line == "" {
 			flush()
-		case key == "Id":
-			id = value
-		case key == "ActiveState":
-			active = value
-		case key == "SubState":
-			sub = value
-		case key == "Result":
-			result = value
-		case key == "NRestarts":
-			restarts = value
-		case key == "ActiveExitTimestamp":
-			leftActive = value
-		case key == "ActiveEnterTimestamp":
-			becameActive = value
+			continue
+		}
+		if key, value, ok := strings.Cut(line, "="); ok {
+			block[key] = value
 		}
 	}
 	flush()
-	return states, scanner.Err()
+	return shown, scanner.Err()
+}
+
+// Usage reports what each machine on this host is consuming.
+//
+// The numbers come from systemd rather than from QEMU, and that is the whole
+// trick: every runner is a unit, every unit is a cgroup, and the kernel is
+// already accounting for it. Nothing has to be read out of the guest, nothing
+// has to know where QEMU put its process, and a machine that has wandered off
+// into swap is still counted.
+//
+// A unit that is not running has no cgroup and no figures. systemd says so by
+// printing "[not set]", which parses as nothing and is skipped: a stopped
+// runner using zero and a stopped runner we cannot measure are the same thing.
+func (e *Executor) Usage(ctx context.Context) ([]resources.RunnerUsage, error) {
+	runners, err := e.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list what the machines are using: %w", err)
+	}
+	if len(runners) == 0 {
+		return nil, nil
+	}
+
+	units := make([]string, 0, len(runners))
+	for _, runner := range runners {
+		units = append(units, unitName(runner.Name))
+	}
+	shown, err := e.show(ctx, []string{"MemoryCurrent", "CPUUsageNSec"}, units)
+	if err != nil {
+		return nil, fmt.Errorf("ask systemd what the machines are using: %w", err)
+	}
+
+	usage := make([]resources.RunnerUsage, 0, len(runners))
+	names := make([]string, 0, len(runners))
+	for _, runner := range runners {
+		names = append(names, runner.Name)
+		properties, ok := shown[unitName(runner.Name)]
+		if !ok {
+			continue
+		}
+		row := resources.RunnerUsage{
+			Name:    runner.Name,
+			Pool:    runner.Pool,
+			Runtime: string(model.RuntimeVM),
+		}
+		if memory, err := strconv.ParseInt(properties["MemoryCurrent"], 10, 64); err == nil {
+			row.MemoryBytes = memory
+		}
+		if consumed, err := strconv.ParseUint(properties["CPUUsageNSec"], 10, 64); err == nil {
+			row.CPUPercent = e.cpu.Percent(runner.Name, consumed)
+		}
+		usage = append(usage, row)
+	}
+	e.cpu.Keep(names)
+	return usage, nil
 }
 
 // mapActiveState turns systemd's vocabulary into the three states the

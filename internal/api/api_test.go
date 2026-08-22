@@ -17,6 +17,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
+	"github.com/clems4ever/github-runner/internal/resources"
 	"github.com/clems4ever/github-runner/internal/secrets"
 	"github.com/clems4ever/github-runner/internal/store"
 )
@@ -37,12 +38,21 @@ func (f *stubFleet) Once(ctx context.Context) reconcile.Result {
 }
 func (f *stubFleet) Scaling() map[string]reconcile.Scale { return f.scaling }
 
+// stubResources stands in for the sampler, which reads the host on a timer.
+type stubResources struct {
+	report resources.Report
+	ready  bool
+}
+
+func (r *stubResources) Latest() (resources.Report, bool) { return r.report, r.ready }
+
 type harness struct {
 	t           *testing.T
 	server      *httptest.Server
 	store       *store.Store
 	fleet       *stubFleet
 	nudges      int
+	resources   *stubResources
 	credID      int64
 	checkAccess func(context.Context, int64, github.Scope) error
 }
@@ -60,9 +70,9 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	h := &harness{t: t, store: db, fleet: &stubFleet{}}
+	h := &harness{t: t, store: db, fleet: &stubFleet{}, resources: &stubResources{}}
 	srv := New(Options{
-		Store: db, Fleet: h.fleet, Version: "test",
+		Store: db, Fleet: h.fleet, Resources: h.resources, Version: "test",
 		UI:    fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html>fleet</html>")}},
 		Nudge: func() { h.nudges++ },
 		CheckAccess: func(ctx context.Context, id int64, scope github.Scope) error {
@@ -132,7 +142,8 @@ func (h *harness) samplePool() map[string]any {
 func TestEverythingNeedsCredentials(t *testing.T) {
 	h := newHarness(t)
 
-	for _, path := range []string{"/api/pools", "/api/pools/export", "/api/runners", "/api/credentials", "/api/settings", "/"} {
+	for _, path := range []string{"/api/pools", "/api/pools/export", "/api/runners", "/api/credentials",
+		"/api/resources", "/api/resources/history", "/api/settings", "/"} {
 		resp, err := h.server.Client().Get(h.server.URL + path)
 		if err != nil {
 			t.Fatal(err)
@@ -699,5 +710,145 @@ func TestAskingWithoutCredentialsIsNotAGuess(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("got %d after a browser knocked without credentials", resp.StatusCode)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Resources
+// ---------------------------------------------------------------------------
+
+func percent(v float64) *float64 { return &v }
+
+// The daemon has been up for less than one sample. That is not an error and it
+// is not a host with no memory, so it says which of the two it is.
+func TestResourcesSaysWhenNothingHasBeenMeasuredYet(t *testing.T) {
+	h := newHarness(t)
+
+	resp := h.do(http.MethodGet, "/api/resources", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	var body struct {
+		Ready bool `json:"ready"`
+		Host  *struct {
+			CPUs int `json:"cpus"`
+		} `json:"host"`
+	}
+	h.decode(resp, &body)
+	if body.Ready {
+		t.Fatal("a daemon that has not measured anything says it has")
+	}
+	if body.Host != nil {
+		t.Fatalf("a host was drawn from no measurement: %+v", body.Host)
+	}
+}
+
+func TestResourcesReportsTheHostAndItsRunners(t *testing.T) {
+	h := newHarness(t)
+	h.resources.ready = true
+	h.resources.report = resources.Report{
+		At: time.Now().UTC(),
+		Host: resources.Host{
+			CPUs: 8, CPUPercent: 42.5,
+			MemoryUsedBytes: 4 << 30, MemoryTotalBytes: 16 << 30,
+			DiskPath: "/var/lib/runner-fleet", DiskUsedBytes: 100 << 30, DiskTotalBytes: 400 << 30,
+			Load1: 1.5,
+		},
+		Runners: []resources.RunnerUsage{
+			{Name: "web-1", Pool: "web", Runtime: "vm", CPUPercent: percent(12.5), MemoryBytes: 2 << 30},
+			// Seen once, so there is no rate for it yet.
+			{Name: "api-1", Pool: "api", Runtime: "container", MemoryBytes: 512 << 20},
+		},
+		Warnings: []string{"is dockerd running?"},
+	}
+
+	var body struct {
+		Ready    bool                    `json:"ready"`
+		Host     resources.Host          `json:"host"`
+		Runners  []resources.RunnerUsage `json:"runners"`
+		Warnings []string                `json:"warnings"`
+	}
+	h.decode(h.do(http.MethodGet, "/api/resources", nil), &body)
+
+	if !body.Ready || body.Host.CPUs != 8 || body.Host.CPUPercent != 42.5 {
+		t.Fatalf("host: %+v", body.Host)
+	}
+	if len(body.Runners) != 2 {
+		t.Fatalf("runners: %+v", body.Runners)
+	}
+	if body.Runners[0].CPUPercent == nil || *body.Runners[0].CPUPercent != 12.5 {
+		t.Fatalf("the measured runner lost its figure: %+v", body.Runners[0])
+	}
+	// A rate needs two readings. Zero would show a machine mid-boot as idle,
+	// so the field is absent rather than false.
+	if body.Runners[1].CPUPercent != nil {
+		t.Fatalf("an unmeasured runner was given a figure: %v", *body.Runners[1].CPUPercent)
+	}
+	if len(body.Warnings) != 1 {
+		t.Fatalf("the runtime that could not answer was swallowed: %v", body.Warnings)
+	}
+}
+
+// What the pools would take if every one of them grew at once. It is a
+// different question from what is being used, and the answer is the one nobody
+// is watching for.
+func TestResourcesSaysWhatThePoolsHavePromised(t *testing.T) {
+	h := newHarness(t)
+	h.resources.ready = true
+
+	pool := h.samplePool()
+	pool["cpus"] = 4
+	pool["memoryMb"] = 8192
+	pool["diskGb"] = 40
+	pool["minReplicas"] = 1
+	pool["maxReplicas"] = 3
+	if resp := h.do(http.MethodPost, "/api/pools", pool); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("could not create the pool: %d", resp.StatusCode)
+	}
+
+	var body struct {
+		Committed model.Commitment `json:"committed"`
+	}
+	h.decode(h.do(http.MethodGet, "/api/resources", nil), &body)
+
+	if body.Committed.Runners != 3 || body.Committed.CPUs != 12 {
+		t.Fatalf("committed: %+v", body.Committed)
+	}
+	if body.Committed.MemoryBytes != 3*8192*1024*1024 {
+		t.Fatalf("committed memory: %d", body.Committed.MemoryBytes)
+	}
+}
+
+func TestResourceHistoryIsBucketedOverTheWindowAsked(t *testing.T) {
+	h := newHarness(t)
+	now := time.Now().UTC()
+	for i := range 3 {
+		if err := h.store.RecordHostSample(context.Background(), now.Add(-time.Duration(i)*time.Minute),
+			model.HostSample{CPUPercent: float64(10 * (i + 1)), MemoryUsedBytes: 1, MemoryTotalBytes: 4}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var body struct {
+		Points []model.HostPoint `json:"points"`
+	}
+	h.decode(h.do(http.MethodGet, "/api/resources/history?hours=1", nil), &body)
+
+	if len(body.Points) == 0 {
+		t.Fatal("no history came back")
+	}
+	for _, point := range body.Points {
+		if point.MemoryPercent != 25 {
+			t.Fatalf("memory should be a share of the total: %+v", point)
+		}
+	}
+}
+
+func TestResourceHistoryRefusesAWindowItCannotServe(t *testing.T) {
+	h := newHarness(t)
+	resp := h.do(http.MethodGet, "/api/resources/history?hours=999", nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status %d", resp.StatusCode)
 	}
 }

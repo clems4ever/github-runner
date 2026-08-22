@@ -126,6 +126,70 @@ export interface ActivityPoint {
   busy: number
 }
 
+/** What the whole machine is doing. */
+export interface HostResources {
+  cpus: number
+  /** 0 to 100 across every core together, not per core. */
+  cpuPercent: number
+  memoryUsedBytes: number
+  memoryTotalBytes: number
+  /** The filesystem the fleet fills: golden images and every machine's disk. */
+  diskPath: string
+  diskUsedBytes: number
+  diskTotalBytes: number
+  load1: number
+  load5: number
+  load15: number
+}
+
+/** What one runner is consuming. */
+export interface RunnerUsage {
+  name: string
+  pool: string
+  runtime: string
+  /**
+   * Null until the runner has been measured twice.
+   *
+   * Processor time is a counter, so a rate needs two readings and a runner
+   * created a moment ago has one. Zero would show a machine that is busily
+   * booting as idle, so the daemon says nothing instead.
+   */
+  cpuPercent: number | null
+  memoryBytes: number
+}
+
+/** What the pools would take if every one of them grew to its ceiling. */
+export interface Commitment {
+  runners: number
+  cpus: number
+  memoryBytes: number
+  /** Machines only: a container reserves no disk. */
+  diskBytes: number
+}
+
+/**
+ * The host and its runners at one moment.
+ *
+ * `ready` is false for the first second after the daemon starts, before it has
+ * taken a reading. It is not an error, and it is not a host with no memory.
+ */
+export interface ResourceReport {
+  ready: boolean
+  at?: string
+  host?: HostResources
+  runners?: RunnerUsage[]
+  warnings?: string[]
+  committed?: Commitment
+}
+
+/** One point of host history. Percentages, so three units share one axis. */
+export interface HostPoint {
+  at: string
+  cpuPercent: number
+  memoryPercent: number
+  diskPercent: number
+}
+
 /** What the autoscaler decided for a pool, and why. */
 export interface Scale {
   target: number
@@ -204,6 +268,14 @@ export const api = {
   activity: (hours: number, pool?: string) =>
     request<{ points: ActivityPoint[]; pool: string; since: string; until: string }>(
       `/api/activity?hours=${hours}` + (pool ? `&pool=${encodeURIComponent(pool)}` : ''),
+    ),
+
+  /** What the host and its runners are using, as of the daemon's last reading. */
+  resources: () => request<ResourceReport>('/api/resources'),
+  /** What the host has been using, over a window. */
+  resourceHistory: (hours: number) =>
+    request<{ points: HostPoint[]; since: string; until: string }>(
+      `/api/resources/history?hours=${hours}`,
     ),
 
   reconcile: () => request<{ actions: unknown[]; errors: string[] }>('/api/reconcile', { method: 'POST' }),
