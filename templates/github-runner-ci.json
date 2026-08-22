@@ -1,7 +1,7 @@
 {
   "version": 1,
   "name": "github-runner CI",
-  "description": "The two pools this repository's own CI needs. Containers run the jobs that only need a toolchain — go and ui. Machines run the two that cannot work in a container: container-runner needs a Docker daemon of its own, and installer installs a systemd service as root and then deletes it again. Import both, or the fleet can only serve half the workflow.",
+  "description": "The two pools this repository's own CI needs. The ui job runs in a container: node comes from setup-node and nothing leaves the working tree. The other three need a machine — go because `go test -race` needs a C compiler and the runner image has none, container-runner because it needs a Docker daemon it may destroy containers in, installer because it installs a systemd service as root and then deletes it. Import both, or the fleet can only serve part of the workflow.",
   "pools": [
     {
       "name": "ci-container",
@@ -11,7 +11,7 @@
       "nested": false,
       "ephemeral": true,
       "minReplicas": 1,
-      "maxReplicas": 3,
+      "maxReplicas": 2,
       "cpus": 2,
       "memoryMb": 4096,
       "image": "default",
@@ -25,7 +25,7 @@
       "nested": false,
       "ephemeral": true,
       "minReplicas": 1,
-      "maxReplicas": 2,
+      "maxReplicas": 3,
       "cpus": 4,
       "memoryMb": 8192,
       "diskGb": 40,
