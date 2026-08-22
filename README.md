@@ -291,8 +291,20 @@ on 8080.
 Tests cover everything that does not need a hypervisor: the reconciler's rules
 as table tests against fake executors, the rendered units and container specs,
 the API including every authentication path, encryption, and end-to-end runs
-that drive the daemon over HTTP against a real database. Booting a guest needs
-`/dev/kvm`, which hosted CI runners do not have, so that stays a manual check.
+that drive the daemon over HTTP against a real database.
+
+Those fakes check this code against its author's assumptions, which is not the
+same as checking the assumptions. A separate job runs a real container from the
+real runner image:
+
+```bash
+go test -tags docker ./internal/executor/docker/
+```
+
+It answers the two questions no fake can — is the runner where we think it is
+in that image, and can the container read what the daemon hands it — because
+both of those shipped wrong once. Booting a guest needs `/dev/kvm`, which hosted
+CI runners do not have, so the VM path stays a manual check.
 
 ## Roadmap
 

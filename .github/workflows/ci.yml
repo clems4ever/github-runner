@@ -48,6 +48,28 @@ jobs:
       - run: npm --prefix web run build
       - run: npm --prefix web test
 
+  # The tests beside the code fake Docker, which checks this code against its
+  # author's assumptions. This job checks the assumptions: it runs a real
+  # container from the real runner image, which is the only thing that can tell
+  # us the runner is where we think it is and that what we hand the container is
+  # readable by it. Both of those shipped wrong once.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+
+      # Pulled here rather than inside the test, so a slow pull reads as a slow
+      # step instead of a mysterious timeout.
+      - name: Pull the runner image
+        run: docker pull ghcr.io/actions/actions-runner:latest
+
+      - name: Integration tests
+        run: go test -tags docker -v -timeout 15m ./internal/executor/docker/
+
   installer:
     runs-on: ubuntu-latest
     steps:
