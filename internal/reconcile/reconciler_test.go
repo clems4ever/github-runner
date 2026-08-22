@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,10 @@ import (
 // passes and watch a fleet converge.
 type fakeExecutor struct {
 	runtime model.Runtime
+	recipe  string
+	// onList runs when the host is read, which is where a pass spends its time
+	// and therefore where two passes would be caught overlapping.
+	onList  func()
 	runners map[string]*Runner
 	calls   []string
 	started []Spec
@@ -33,7 +38,20 @@ func newFakeExecutor(runtime model.Runtime) *fakeExecutor {
 
 func (f *fakeExecutor) Runtime() model.Runtime { return f.runtime }
 
+// Recipe is how this executor would build a runner. The fake carries one so a
+// test can change it, which is how "the daemon builds runners differently now"
+// is expressed.
+func (f *fakeExecutor) Recipe(model.Pool) string {
+	if f.recipe == "" {
+		return "image"
+	}
+	return f.recipe
+}
+
 func (f *fakeExecutor) List(ctx context.Context) ([]Runner, error) {
+	if f.onList != nil {
+		f.onList()
+	}
 	if err := f.failOn["list"]; err != nil {
 		return nil, err
 	}
@@ -293,7 +311,7 @@ func TestReconfiguringAPoolReplacesRunnersGracefully(t *testing.T) {
 
 	// And the rebuilt runners carry the new configuration.
 	for _, r := range h.vm.runners {
-		if r.Generation != pool.Generation("fp") {
+		if r.Generation != pool.Generation("fp", "image") {
 			t.Fatalf("%s came back on the old generation", r.Name)
 		}
 	}
@@ -526,4 +544,57 @@ func TestStatusFlagsRunnersOnAnOldConfiguration(t *testing.T) {
 // fleet.
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// A pass reads the host and then acts on what it read, so two at once act on
+// the same reading twice. On a real fleet that looked like this, inside one
+// second:
+//
+//	op=remove runner=ci-container-1  reason="configuration changed"
+//	op=create runner=ci-container-1  reason="replacing the previous configuration"
+//	op=remove runner=ci-container-1  reason="configuration changed"
+//	problem="create ci-container-1: docker: 409: Conflict. The container name
+//	         \"/ci-container-1\" is already in use"
+//
+// The daemon's loop is not the only caller: the UI reconciles when somebody
+// presses refresh, and saving a pool asks for one too.
+func TestOnlyOnePassRunsAtATime(t *testing.T) {
+	h := newHarness(testPool("web", 3))
+
+	var (
+		mu      sync.Mutex
+		inside  int
+		overlap int
+	)
+	// The executor is the slow part of a real pass — Docker, systemctl — so it
+	// is where an overlap would show.
+	h.vm.onList = func() {
+		mu.Lock()
+		inside++
+		if inside > 1 {
+			overlap++
+		}
+		mu.Unlock()
+
+		time.Sleep(2 * time.Millisecond)
+
+		mu.Lock()
+		inside--
+		mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.rec.Once(context.Background())
+		}()
+	}
+	wg.Wait()
+
+	if overlap != 0 {
+		t.Fatalf("%d passes ran while another was running; each acts on a host the other"+
+			" is changing underneath it", overlap)
+	}
 }

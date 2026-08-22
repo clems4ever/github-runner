@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/clems4ever/github-runner/internal/agent"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -78,6 +79,17 @@ func New(layout paths.Layout, binary, user string, opts ...Option) *Executor {
 
 // Runtime is what this executor runs.
 func (e *Executor) Runtime() model.Runtime { return model.RuntimeVM }
+
+// Recipe is the golden image a machine in this pool would boot from.
+//
+// Its name is a hash of everything the image is built from, so this changes
+// whenever the daemon changes how it builds machines — a new runner version,
+// a different package list, a different provisioning script. Runners built from
+// the old image are then no longer what the pool asked for, and are replaced
+// gracefully, which is the whole reason the reconciler asks.
+func (e *Executor) Recipe(pool model.Pool) string {
+	return agent.ImageSpec{Variant: pool.Image}.Name()
+}
 
 // EnsureUnit writes the template unit and reloads systemd if it changed.
 //
