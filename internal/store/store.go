@@ -365,19 +365,30 @@ func (s *Store) DeleteCredential(ctx context.Context, id int64) error {
 const poolColumns = `id, name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
 	labels, cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at`
 
+// execer is the part of the database both a connection and a transaction offer,
+// so the statements below can be run either way. Importing several pools has to
+// be all-or-nothing, and that means a transaction.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 // CreatePool validates and stores a pool.
 func (s *Store) CreatePool(ctx context.Context, p model.Pool) (model.Pool, error) {
 	p.Defaults()
 	if err := p.Validate(); err != nil {
 		return model.Pool{}, err
 	}
-	if err := s.credentialExists(ctx, p.CredentialID); err != nil {
+	if err := credentialExists(ctx, s.db, p.CredentialID); err != nil {
 		return model.Pool{}, err
 	}
+	return insertPool(ctx, s.db, p)
+}
 
+func insertPool(ctx context.Context, db execer, p model.Pool) (model.Pool, error) {
 	now := time.Now().UTC()
 	p.CreatedAt, p.UpdatedAt = now, now
-	res, err := s.db.ExecContext(ctx,
+	res, err := db.ExecContext(ctx,
 		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
 			labels, cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at, replicas)
 		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
@@ -405,12 +416,18 @@ func (s *Store) UpdatePool(ctx context.Context, p model.Pool) (model.Pool, error
 	if err := p.Validate(); err != nil {
 		return model.Pool{}, err
 	}
-	if err := s.credentialExists(ctx, p.CredentialID); err != nil {
+	if err := credentialExists(ctx, s.db, p.CredentialID); err != nil {
 		return model.Pool{}, err
 	}
+	if err := updatePool(ctx, s.db, p); err != nil {
+		return model.Pool{}, err
+	}
+	return s.Pool(ctx, p.ID)
+}
 
+func updatePool(ctx context.Context, db execer, p model.Pool) error {
 	p.UpdatedAt = time.Now().UTC()
-	res, err := s.db.ExecContext(ctx,
+	res, err := db.ExecContext(ctx,
 		`UPDATE pools SET name=?, scope_kind=?, scope=?, runtime=?, nested=?, ephemeral=?,
 			min_replicas=?, max_replicas=?, replicas=?,
 			labels=?, cpus=?, memory_mb=?, disk_gb=?, image=?, credential_id=?, enabled=?, updated_at=?
@@ -421,14 +438,14 @@ func (s *Store) UpdatePool(ctx context.Context, p model.Pool) (model.Pool, error
 		p.UpdatedAt.Format(time.RFC3339Nano), p.ID)
 	if err != nil {
 		if isUnique(err) {
-			return model.Pool{}, fmt.Errorf("pool %q: %w", p.Name, ErrConflict)
+			return fmt.Errorf("pool %q: %w", p.Name, ErrConflict)
 		}
-		return model.Pool{}, err
+		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return model.Pool{}, fmt.Errorf("pool %d: %w", p.ID, ErrNotFound)
+		return fmt.Errorf("pool %d: %w", p.ID, ErrNotFound)
 	}
-	return s.Pool(ctx, p.ID)
+	return nil
 }
 
 // DeletePool forgets a pool. Its runners are not touched here: the reconciler
@@ -447,12 +464,114 @@ func (s *Store) DeletePool(ctx context.Context, id int64) error {
 
 // Pool returns one pool.
 func (s *Store) Pool(ctx context.Context, id int64) (model.Pool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+poolColumns+` FROM pools WHERE id = ?`, id)
+	return poolByID(ctx, s.db, id)
+}
+
+func poolByID(ctx context.Context, db execer, id int64) (model.Pool, error) {
+	row := db.QueryRowContext(ctx, `SELECT `+poolColumns+` FROM pools WHERE id = ?`, id)
 	p, err := scanPool(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Pool{}, fmt.Errorf("pool %d: %w", id, ErrNotFound)
 	}
 	return p, err
+}
+
+func poolByName(ctx context.Context, db execer, name string) (model.Pool, error) {
+	row := db.QueryRowContext(ctx, `SELECT `+poolColumns+` FROM pools WHERE name = ?`, name)
+	p, err := scanPool(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Pool{}, fmt.Errorf("pool %q: %w", name, ErrNotFound)
+	}
+	return p, err
+}
+
+// ImportAction is what an import did to one pool, or would do.
+type ImportAction string
+
+const (
+	// ImportCreate means the name was free.
+	ImportCreate ImportAction = "create"
+	// ImportUpdate means a pool of that name existed and was written over. Its
+	// runners are replaced gracefully by the next pass, as each finishes its
+	// job, exactly as if it had been edited in the UI.
+	ImportUpdate ImportAction = "update"
+)
+
+// ImportOutcome is one line of an import's report.
+type ImportOutcome struct {
+	Name   string       `json:"name"`
+	Action ImportAction `json:"action"`
+	Pool   model.Pool   `json:"pool"`
+}
+
+// ImportPools writes a set of pools in one transaction.
+//
+// All of them or none. A document is usually a fleet that only makes sense
+// whole — two pools that between them cover a repository's jobs — so importing
+// the first and failing on the second would leave someone with half a fleet and
+// an error message.
+//
+// A dry run does the entire thing and rolls back. That is what makes the
+// preview worth reading: it is not a second implementation guessing at what
+// would happen, it is what happened, undone.
+func (s *Store) ImportPools(ctx context.Context, pools []model.Pool, replaceExisting, dryRun bool) ([]ImportOutcome, error) {
+	if len(pools) == 0 {
+		return nil, fmt.Errorf("there is nothing to import")
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Rolls back unless the commit below happened first, which covers both the
+	// dry run and every error path.
+	defer func() { _ = tx.Rollback() }()
+
+	outcomes := make([]ImportOutcome, 0, len(pools))
+	for _, pool := range pools {
+		pool.Defaults()
+		if err := pool.Validate(); err != nil {
+			return nil, err
+		}
+		if err := credentialExists(ctx, tx, pool.CredentialID); err != nil {
+			return nil, err
+		}
+
+		existing, err := poolByName(ctx, tx, pool.Name)
+		switch {
+		case errors.Is(err, ErrNotFound):
+			created, err := insertPool(ctx, tx, pool)
+			if err != nil {
+				return nil, err
+			}
+			outcomes = append(outcomes, ImportOutcome{Name: pool.Name, Action: ImportCreate, Pool: created})
+
+		case err != nil:
+			return nil, err
+
+		case !replaceExisting:
+			return nil, fmt.Errorf("pool %q: %w. Import over the pools that are already here, or rename them in the template", pool.Name, ErrConflict)
+
+		default:
+			pool.ID = existing.ID
+			if err := updatePool(ctx, tx, pool); err != nil {
+				return nil, err
+			}
+			updated, err := poolByID(ctx, tx, pool.ID)
+			if err != nil {
+				return nil, err
+			}
+			outcomes = append(outcomes, ImportOutcome{Name: pool.Name, Action: ImportUpdate, Pool: updated})
+		}
+	}
+
+	if dryRun {
+		return outcomes, nil
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return outcomes, nil
 }
 
 // ListPools returns every pool, in a stable order so the UI does not shuffle.
@@ -503,9 +622,9 @@ func scanPool(row scanner) (model.Pool, error) {
 	return p, nil
 }
 
-func (s *Store) credentialExists(ctx context.Context, id int64) error {
+func credentialExists(ctx context.Context, db execer, id int64) error {
 	var n int
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM credentials WHERE id = ?`, id).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM credentials WHERE id = ?`, id).Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {

@@ -20,6 +20,8 @@ import { notifications } from '@mantine/notifications'
 import {
   IconAlertTriangle,
   IconDots,
+  IconDownload,
+  IconFileImport,
   IconPencil,
   IconPlus,
   IconStack2,
@@ -34,6 +36,7 @@ import {
   type Runner,
   type Scale,
 } from '../api'
+import { ImportPools } from './ImportPools'
 import { PoolEditor } from './PoolEditor'
 
 export function PoolsPage({
@@ -51,20 +54,59 @@ export function PoolsPage({
 }) {
   const [editing, setEditing] = useState<Partial<Pool> | null>(null)
   const [deleting, setDeleting] = useState<Pool | null>(null)
+  const [importing, setImporting] = useState(false)
 
   const runnersOf = (pool: Pool) => runners.filter((r) => r.pool === pool.name)
+
+  // Saved as a file rather than shown: this is something to keep next to a
+  // repository, so the next host can be set up by importing it.
+  const exportPools = async () => {
+    try {
+      const document = await api.exportPools()
+      const url = URL.createObjectURL(new Blob([document], { type: 'application/json' }))
+      const link = window.document.createElement('a')
+      link.href = url
+      link.download = 'runner-fleet-pools.json'
+      link.click()
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      notifications.show({
+        color: 'red',
+        title: 'Could not export the pools',
+        message: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
 
   return (
     <Stack gap="lg">
       <Group justify="space-between">
         <Title order={3}>Pools</Title>
-        <Button
-          leftSection={<IconPlus size={16} />}
-          disabled={credentials.length === 0}
-          onClick={() => setEditing(emptyPool(credentials[0]?.id ?? 0))}
-        >
-          New pool
-        </Button>
+        <Group gap="xs">
+          <Button
+            variant="default"
+            leftSection={<IconDownload size={16} />}
+            disabled={pools.length === 0}
+            onClick={exportPools}
+          >
+            Export
+          </Button>
+          <Button
+            variant="default"
+            leftSection={<IconFileImport size={16} />}
+            disabled={credentials.length === 0}
+            onClick={() => setImporting(true)}
+          >
+            Import
+          </Button>
+          <Button
+            leftSection={<IconPlus size={16} />}
+            disabled={credentials.length === 0}
+            onClick={() => setEditing(emptyPool(credentials[0]?.id ?? 0))}
+          >
+            New pool
+          </Button>
+        </Group>
       </Group>
 
       {credentials.length === 0 && (
@@ -241,6 +283,22 @@ export function PoolsPage({
             }}
           />
         )}
+      </Modal>
+
+      <Modal
+        opened={importing}
+        onClose={() => setImporting(false)}
+        title="Import pools from a template"
+        size="xl"
+      >
+        <ImportPools
+          credentials={credentials}
+          onCancel={() => setImporting(false)}
+          onImported={async () => {
+            setImporting(false)
+            await onChange()
+          }}
+        />
       </Modal>
 
       <Modal opened={deleting !== null} onClose={() => setDeleting(null)} title="Delete pool">

@@ -86,6 +86,44 @@ something it is not.
 
 ![The pool editor](docs/img/pool-editor.png)
 
+### Templates
+
+Pools can be written down and imported, so a fleet is something a repository
+carries rather than something rebuilt by hand on each host.
+
+**Pools → Import**, paste a template or choose the file, pick the credential,
+and press **Preview**. The preview is not a guess about what would happen: it
+is the import itself, run against the database and rolled back, so a line
+saying *new* is a pool that was created a moment ago and then undone. Press
+**Import** underneath it and the same thing happens for real.
+
+**Pools → Export** writes the fleet out in the same format, for the next host or
+for the repository it serves.
+
+A template carries nothing local to one installation — no pool ids, no
+credential, no timestamps. The credential is chosen at import time, and the
+scope can be replaced, so one document serves several repositories:
+
+```json
+{
+  "version": 1,
+  "name": "github-runner CI",
+  "pools": [
+    { "name": "ci-container", "runtime": "container", "minReplicas": 1, "maxReplicas": 3 },
+    { "name": "ci-vm", "runtime": "vm", "cpus": 4, "memoryMb": 8192, "diskGb": 40 }
+  ]
+}
+```
+
+Anything left out takes the same default it has in the editor, except that a
+pool is enabled and ephemeral unless it says otherwise. Importing over a pool
+that already exists has to be asked for, and when it is, the pool keeps its
+identity and its runners are replaced gracefully as each finishes its job.
+
+[`templates/`](templates/) holds the ones shipped with the daemon, including the
+two pools this repository's own CI needs. They are imported by the test suite,
+so one that stops working fails the build rather than an operator's afternoon.
+
 ### Autoscaling
 
 Set the minimum to 1 and the maximum to 5, and the pool sits at one idle runner

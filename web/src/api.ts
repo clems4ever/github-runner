@@ -66,6 +66,46 @@ export interface NewCredential {
   installationId?: number
 }
 
+/**
+ * A pool template: the portable form of a fleet's pools.
+ *
+ * Nothing local to one installation is in it — no pool ids, no credential, no
+ * timestamps — so the same document imports anywhere. The import supplies the
+ * credential, and may replace the scope.
+ */
+export interface PoolTemplate {
+  version: number
+  name?: string
+  description?: string
+  pools: unknown[]
+}
+
+export interface ImportRequest {
+  document: unknown
+  credentialId: number
+  /** Replaces the scope of every pool in the document when given. */
+  scope?: string
+  scopeKind?: ScopeKind
+  /** Import over pools of the same name instead of refusing. */
+  replaceExisting?: boolean
+  /** Report what would happen and write nothing. */
+  dryRun?: boolean
+}
+
+/** What an import did to one pool, or — in a preview — would do. */
+export interface ImportOutcome {
+  name: string
+  action: 'create' | 'update'
+  pool: Pool
+}
+
+export interface ImportReport {
+  pools: ImportOutcome[]
+  dryRun: boolean
+  name?: string
+  description?: string
+}
+
 /** One point of fleet history: the whole fleet at a moment. */
 export interface ActivityPoint {
   at: string
@@ -137,6 +177,13 @@ export const api = {
   updatePool: (id: number, pool: Partial<Pool>) =>
     request<Pool>(`/api/pools/${id}`, { method: 'PUT', body: JSON.stringify(pool) }),
   deletePool: (id: number) => request<void>(`/api/pools/${id}`, { method: 'DELETE' }),
+  importPools: (body: ImportRequest) =>
+    request<ImportReport>('/api/pools/import', { method: 'POST', body: JSON.stringify(body) }),
+  /** The fleet's pools as a template, ready to be saved next to a repository. */
+  exportPools: async () => {
+    const document = await request<PoolTemplate>('/api/pools/export')
+    return JSON.stringify(document, null, 2)
+  },
 
   runners: () =>
     request<{ runners: Runner[]; warnings: string[]; scaling: Record<string, Scale> }>('/api/runners'),

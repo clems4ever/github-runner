@@ -22,6 +22,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
 	"github.com/clems4ever/github-runner/internal/store"
+	"github.com/clems4ever/github-runner/internal/template"
 )
 
 // Store is what the API needs from the database.
@@ -32,6 +33,7 @@ type Store interface {
 	CreatePool(ctx context.Context, p model.Pool) (model.Pool, error)
 	UpdatePool(ctx context.Context, p model.Pool) (model.Pool, error)
 	DeletePool(ctx context.Context, id int64) error
+	ImportPools(ctx context.Context, pools []model.Pool, replaceExisting, dryRun bool) ([]store.ImportOutcome, error)
 	Activity(ctx context.Context, since, until time.Time, buckets int, pool string) ([]model.ActivityPoint, error)
 	ListCredentials(ctx context.Context) ([]model.Credential, error)
 	CreateCredential(ctx context.Context, credential model.Credential, secret string) (model.Credential, error)
@@ -99,6 +101,8 @@ func (s *Server) Handler() http.Handler {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /api/pools", s.listPools)
 	api.HandleFunc("POST /api/pools", s.createPool)
+	api.HandleFunc("POST /api/pools/import", s.importPools)
+	api.HandleFunc("GET /api/pools/export", s.exportPools)
 	api.HandleFunc("GET /api/pools/{id}", s.getPool)
 	api.HandleFunc("PUT /api/pools/{id}", s.updatePool)
 	api.HandleFunc("DELETE /api/pools/{id}", s.deletePool)
@@ -250,6 +254,103 @@ func (s *Server) deletePool(w http.ResponseWriter, r *http.Request) {
 	// what keeps deleting a pool from failing a job that is in flight.
 	s.nudge()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// importPools writes a template's pools into the fleet.
+//
+// The document arrives as it was written — the daemon does not accept a list of
+// pools, it accepts a template — so a file someone was handed can be pasted
+// whole, and anything wrong with it is reported in the template's own terms.
+func (s *Server) importPools(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Document json.RawMessage `json:"document"`
+		// CredentialID is what the imported pools register with. A template
+		// cannot name one: credentials are local to the host they were sealed
+		// on.
+		CredentialID int64 `json:"credentialId"`
+		// Scope, when given, replaces the scope of every pool in the document.
+		Scope     string          `json:"scope"`
+		ScopeKind model.ScopeKind `json:"scopeKind"`
+		// ReplaceExisting imports over pools of the same name instead of
+		// refusing.
+		ReplaceExisting bool `json:"replaceExisting"`
+		// DryRun reports what would happen and writes nothing.
+		DryRun bool `json:"dryRun"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	if len(body.Document) == 0 {
+		writeError(w, errBadRequest("there is no template here: paste one, or choose a file"))
+		return
+	}
+
+	doc, err := template.Parse(body.Document)
+	if err != nil {
+		writeError(w, errBadRequest("%v", err))
+		return
+	}
+	pools, err := template.Apply(doc, template.Options{
+		CredentialID: body.CredentialID,
+		Scope:        body.Scope,
+		ScopeKind:    body.ScopeKind,
+	})
+	if err != nil {
+		writeError(w, errBadRequest("%v", err))
+		return
+	}
+
+	// Asked before anything is written, and during a dry run too: a preview
+	// that says "create" for a pool GitHub will refuse is a preview that lied.
+	asked := map[string]bool{}
+	for _, pool := range pools {
+		key := string(pool.ScopeKind) + ":" + pool.Scope
+		if asked[key] {
+			continue
+		}
+		asked[key] = true
+		if err := s.reachable(r.Context(), pool); err != nil {
+			writeError(w, err)
+			return
+		}
+	}
+
+	outcomes, err := s.store.ImportPools(r.Context(), pools, body.ReplaceExisting, body.DryRun)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if !body.DryRun {
+		s.nudge()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"pools":       outcomes,
+		"dryRun":      body.DryRun,
+		"name":        doc.Name,
+		"description": doc.Description,
+	})
+}
+
+// exportPools writes the fleet out as a template someone can keep.
+//
+// Indented, because the point of it is to be read, edited and committed
+// somewhere rather than handed straight back to a machine.
+func (s *Server) exportPools(w http.ResponseWriter, r *http.Request) {
+	pools, err := s.store.ListPools(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	body, err := json.MarshalIndent(template.Export(pools), "", "  ")
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="runner-fleet-pools.json"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(append(body, '\n'))
 }
 
 // reachable refuses a pool whose credential GitHub says cannot serve it.

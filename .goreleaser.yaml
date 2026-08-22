@@ -29,6 +29,10 @@ archives:
       - LICENSE
       - packaging/runner-fleetd.service
       - install.sh
+      # The pool templates travel with the release: importing one is the
+      # quickest way from a fresh install to a fleet, and it should not need a
+      # trip back to the repository.
+      - templates/*
 
 checksum:
   # The installer verifies against this file, so its name is part of the
