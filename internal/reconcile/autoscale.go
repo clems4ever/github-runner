@@ -68,6 +68,26 @@ func Autoscale(p model.Pool, runners []Runner, states map[string]github.State, l
 	// would add another every pass until the first one finished registering.
 	free := current - busy
 
+	// How many are on their way back: running, GitHub has not seen them yet,
+	// and young enough that this is a boot rather than a runner that will never
+	// register.
+	//
+	// This is the difference between a quiet pool and a busy one, and without
+	// it they look identical. An ephemeral runner deregisters itself the moment
+	// a job ends and its machine powers off, so a pool working through a queue
+	// spends much of its time with nothing busy and nothing registered — which
+	// read as "nobody wants this pool" and shrank it, on a real host, while
+	// twelve jobs were queued.
+	coming := 0
+	for _, runner := range live {
+		if _, known := states[runner.Name]; known {
+			continue
+		}
+		if runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
+			coming++
+		}
+	}
+
 	switch {
 	case current < floor:
 		scale.Target = floor
@@ -91,6 +111,13 @@ func Autoscale(p model.Pool, runners []Runner, states map[string]github.State, l
 		} else {
 			scale.Reason = "fixed size, and every runner is busy"
 		}
+
+	case busy == 0 && coming > 0 && current > floor:
+		// Nothing is busy, but a machine is coming back — which for an
+		// ephemeral runner means it just finished a job. A pool mid-cycle is
+		// the opposite of a quiet one, so the clock does not run.
+		scale.Target = current
+		scale.Reason = "a runner is coming back from a job"
 
 	case busy == 0 && current > floor && !lastBusy.IsZero() && now.Sub(lastBusy) >= ScaleDownAfter:
 		scale.Target = floor

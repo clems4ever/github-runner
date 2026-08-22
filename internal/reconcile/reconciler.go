@@ -94,9 +94,18 @@ type Reconciler struct {
 // lastBusy is when the pool last had a runner with a job on it. A pool that is
 // busy right now is busy as of now.
 func (r *Reconciler) lastBusy(pool string, runners []Runner, states map[string]github.State) time.Time {
+	// Working, or just finished working. An ephemeral runner that is on its way
+	// back has by definition just completed a job, and that is as good a proof
+	// of demand as catching it mid-job — better, in fact, since a job shorter
+	// than the gap between two passes is never seen busy at all.
 	busy := false
 	for _, runner := range runners {
 		if states[runner.Name] == github.StateBusy {
+			busy = true
+			break
+		}
+		if _, known := states[runner.Name]; !known &&
+			runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
 			busy = true
 			break
 		}
@@ -531,7 +540,7 @@ type RunnerStatus struct {
 	Trouble string `json:"trouble,omitempty"`
 }
 
-// registering is how long a runner is given to appear on GitHub before its
+// Registering is how long a runner is given to appear on GitHub before its
 // absence is worth remarking on.
 //
 // A machine boots, runs cloud-init and registers, which is a minute or two; an
@@ -539,12 +548,12 @@ type RunnerStatus struct {
 // most of what anybody sees. Reporting it as "unknown" the whole time made a
 // working fleet look broken — three times in one day, to the person who built
 // it.
-const registering = 4 * time.Minute
+const Registering = 4 * time.Minute
 
 // jobOfARunnerGitHubHasNotSeen distinguishes a runner on its way up from one
 // that should be there and is not.
 func jobOfARunnerGitHubHasNotSeen(runner Runner) string {
-	if runner.State == StateRunning && runner.Up > 0 && runner.Up < registering {
+	if runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
 		return "starting"
 	}
 	return "unknown"

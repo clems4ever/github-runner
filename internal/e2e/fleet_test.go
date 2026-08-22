@@ -587,6 +587,22 @@ func (f *fleet) everyRunnerIdle() {
 	f.idle(f.vm.names()...)
 }
 
+// recycling is what a pool between jobs looks like: every ephemeral runner has
+// deregistered itself and its machine is seconds into a fresh boot, so GitHub
+// knows nothing about any of them and the host reports them all as young.
+func (f *fleet) recycling() {
+	f.gh.mu.Lock()
+	f.gh.states = map[string]github.State{}
+	f.gh.mu.Unlock()
+
+	f.vm.mu.Lock()
+	defer f.vm.mu.Unlock()
+	for _, runner := range f.vm.runners {
+		runner.State = reconcile.StateRunning
+		runner.Up = 15 * time.Second
+	}
+}
+
 func TestAPoolGrowsWhenEveryRunnerIsBusy(t *testing.T) {
 	f := newFleet(t)
 	defer f.close()
@@ -1179,5 +1195,45 @@ func TestTheSameRecipeChangesNothing(t *testing.T) {
 	f.reconcileNow()
 	if len(f.vm.created) != 0 {
 		t.Fatalf("a settled fleet rebuilt %v", f.vm.created)
+	}
+}
+
+// A pool working through a queue must not shrink itself.
+//
+// From a real host: the pool grew to three because every runner was busy, and
+// ten minutes later threw the third machine away as "no longer wanted" while
+// twelve jobs were still queued. Between jobs an ephemeral runner is
+// deregistered and its machine is rebooting, so a pool that is working looks
+// exactly like a pool nobody wants.
+func TestAPoolChurningThroughJobsKeepsItsRunners(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(elasticVMPool(credential, 1, 3))
+
+	// Every runner busy: the pool climbs to its ceiling.
+	for i := 0; i < 3; i++ {
+		f.reconcileNow()
+		f.busy(f.vm.names()...)
+	}
+	if got := len(f.vm.names()); got != 3 {
+		t.Fatalf("the pool grew to %d, want 3", got)
+	}
+
+	// Now they are between jobs: nothing busy, nothing registered, machines
+	// seconds old — which is what recycling looks like from out here.
+	f.recycling()
+
+	// Well past the point where a genuinely quiet pool would have shrunk. Two
+	// passes and a drain in between, because shrinking asks a runner to stop
+	// and removes it once it has — one pass would show three either way.
+	f.now = f.now.Add(reconcile.ScaleDownAfter + time.Minute)
+	f.reconcileNow()
+	f.vm.jobsFinish()
+	f.reconcileNow()
+
+	if got := len(f.vm.names()); got != 3 {
+		t.Fatalf("the pool shrank to %d while its machines were coming back from jobs", got)
 	}
 }
