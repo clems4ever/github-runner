@@ -4,11 +4,11 @@ import { effectiveLabels, emptyPool } from './api'
 describe('effectiveLabels', () => {
   it('describes what the runner actually is', () => {
     expect(effectiveLabels({ runtime: 'container', nested: true, ephemeral: true, labels: ['gpu'] }))
-      .toEqual(['container', 'nested', 'ephemeral', 'gpu'])
+      .toEqual(['container', 'nestedvirt', 'ephemeral', 'gpu'])
   })
 
   it('follows the settings rather than the name', () => {
-    // A workflow asking for "nested" must not reach a pool that only calls
+    // A workflow asking for "nestedvirt" must not reach a pool that only calls
     // itself that.
     expect(effectiveLabels({ runtime: 'vm', nested: false })).toEqual(['vm'])
   })

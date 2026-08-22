@@ -17,7 +17,7 @@ func TestConfigFromEnv(t *testing.T) {
 		"FLEET_URL":             "https://github.com/o/r",
 		"FLEET_SCOPE_KIND":      "repository",
 		"FLEET_SCOPE":           "o/r",
-		"FLEET_LABELS":          "vm,nested,gpu",
+		"FLEET_LABELS":          "vm,nestedvirt,gpu",
 		"FLEET_EPHEMERAL":       "true",
 		"FLEET_NESTED":          "true",
 		"FLEET_CPUS":            "8",
@@ -35,7 +35,7 @@ func TestConfigFromEnv(t *testing.T) {
 	if c.Runner != "web-1" || c.Pool != "web" || c.Generation != "abc123" {
 		t.Fatalf("got %+v", c)
 	}
-	if strings.Join(c.Labels, ",") != "vm,nested,gpu" {
+	if strings.Join(c.Labels, ",") != "vm,nestedvirt,gpu" {
 		t.Fatalf("labels are %v", c.Labels)
 	}
 	if !c.Ephemeral || !c.Nested {

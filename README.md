@@ -72,17 +72,23 @@ A pool named `web` with a maximum of three gives you `web-1`, `web-2` and
 | **Size** | vCPUs, memory, and disk for VM pools |
 
 Every runner also registers with labels describing what it is — `vm` or
-`container`, plus `nested` and `ephemeral` when they apply — so a workflow can
-ask for what it needs:
+`container`, plus `nestedvirt` and `ephemeral` when they apply — so a workflow
+can ask for what it needs:
 
 ```yaml
 jobs:
   build:
-    runs-on: [self-hosted, nested]
+    runs-on: [self-hosted, nestedvirt]
 ```
 
 Those follow the settings rather than the name, so a pool cannot claim to be
 something it is not.
+
+The nested virtualisation label used to be `nested`, which said nothing about
+what was nested. A workflow still asking for `nested` will queue for ever;
+change it to `nestedvirt`. The runners themselves need nothing done to them —
+the label is part of what a runner is built from, so each is replaced with a
+correctly labelled one as it finishes its current job.
 
 ![The pool editor](docs/img/pool-editor.png)
 

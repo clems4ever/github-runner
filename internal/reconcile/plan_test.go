@@ -241,7 +241,7 @@ func TestSpecsForAPool(t *testing.T) {
 	if specs[0].URL != "https://github.com/o/r" || specs[0].CredentialID != 3 {
 		t.Fatalf("got %+v", specs[0])
 	}
-	if strings.Join(specs[0].Labels, ",") != "vm,nested,ephemeral,gpu" {
+	if strings.Join(specs[0].Labels, ",") != "vm,nestedvirt,ephemeral,gpu" {
 		t.Fatalf("labels are %v", specs[0].Labels)
 	}
 }

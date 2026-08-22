@@ -177,7 +177,7 @@ func (p *Pool) Ceiling() int {
 // the pool plus the ones describing what it actually is.
 //
 // The automatic ones exist so a workflow can ask for what it needs —
-// runs-on: [self-hosted, nested] — without every pool having to remember to
+// runs-on: [self-hosted, nestedvirt] — without every pool having to remember to
 // spell it out, and without the label and the reality drifting apart.
 func (p *Pool) EffectiveLabels() []string {
 	seen := map[string]bool{}
@@ -197,7 +197,10 @@ func (p *Pool) EffectiveLabels() []string {
 		add("vm")
 	}
 	if p.Nested {
-		add("nested")
+		// "nested" on its own says nothing about what is nested; a workflow
+		// author reading runs-on has to guess. The label spells out the
+		// capability it is really asking for.
+		add("nestedvirt")
 	}
 	if p.Ephemeral {
 		add("ephemeral")

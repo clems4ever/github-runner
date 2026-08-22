@@ -254,7 +254,7 @@ export function effectiveLabels(pool: Partial<Pool>): string[] {
   }
 
   add(pool.runtime === 'container' ? 'container' : 'vm')
-  if (pool.nested) add('nested')
+  if (pool.nested) add('nestedvirt')
   if (pool.ephemeral) add('ephemeral')
   ;(pool.labels ?? []).forEach(add)
   return out
