@@ -169,7 +169,7 @@ func TestRemoveIsIdempotent(t *testing.T) {
 
 func TestStartClearsAFailedUnitFirst(t *testing.T) {
 	e, cmd, _ := newExecutor(t)
-	if err := e.Start(context.Background(), "web-1"); err != nil {
+	if err := e.Start(context.Background(), testSpec("web-1")); err != nil {
 		t.Fatal(err)
 	}
 	// A failed unit refuses to start again with "start request repeated too

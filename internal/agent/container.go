@@ -6,13 +6,40 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// runnerHome is where the actions runner lives in the runner image.
-const runnerHome = "/home/runner/actions-runner"
+// runnerHomes are where the actions runner is found in the images people use.
+//
+// The official image (ghcr.io/actions/actions-runner) puts it straight in the
+// home directory; others put it in a subdirectory. Looking for config.sh
+// rather than assuming a path is what makes a custom image work without
+// anything else changing — which is where per-repository images are going.
+var runnerHomes = []string{
+	"/home/runner",
+	"/home/runner/actions-runner",
+	"/actions-runner",
+	"/runner",
+}
+
+// findRunnerHome returns the directory holding the runner, or an error naming
+// everywhere it looked.
+func findRunnerHome() (string, error) {
+	if override := os.Getenv("FLEET_RUNNER_HOME"); override != "" {
+		return override, nil
+	}
+	for _, candidate := range runnerHomes {
+		if _, err := os.Stat(filepath.Join(candidate, "config.sh")); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("no GitHub Actions runner in this image: looked for config.sh in %s. "+
+		"Set FLEET_RUNNER_HOME if it is somewhere else",
+		strings.Join(runnerHomes, ", "))
+}
 
 // runContainer is the agent inside a container: it registers the runner that
 // the image already carries, then runs it.
@@ -22,8 +49,9 @@ const runnerHome = "/home/runner/actions-runner"
 // which is a weaker boundary than a VM and is why the runtime is a per-pool
 // choice rather than a default.
 func runContainer(ctx context.Context, c Config, log *slog.Logger) error {
-	if _, err := os.Stat(runnerHome); err != nil {
-		return fmt.Errorf("no runner found at %s: the image must carry the GitHub Actions runner: %w", runnerHome, err)
+	runnerHome, err := findRunnerHome()
+	if err != nil {
+		return err
 	}
 
 	token, err := registrationToken(ctx, c)

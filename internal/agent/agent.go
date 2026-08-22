@@ -42,6 +42,12 @@ func Run(ctx context.Context, c Config, log *slog.Logger) error {
 // One per boot: it expires an hour after it is issued, so it cannot be stored
 // in the machine's configuration and reused.
 func registrationToken(ctx context.Context, c Config) (string, error) {
+	// A token the daemon minted for this runner, which is how a container
+	// registers without ever being given the credential itself.
+	if minted := c.RegistrationToken(); minted != "" {
+		return minted, nil
+	}
+
 	secret, err := c.Token()
 	if err != nil {
 		return "", err

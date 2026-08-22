@@ -2,7 +2,6 @@ package reconcile
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -25,7 +24,7 @@ type Executor interface {
 	Runtime() model.Runtime
 	List(ctx context.Context) ([]Runner, error)
 	Create(ctx context.Context, spec Spec) error
-	Start(ctx context.Context, name string) error
+	Start(ctx context.Context, spec Spec) error
 	Drain(ctx context.Context, name string) error
 	Remove(ctx context.Context, name string) error
 }
@@ -42,6 +41,7 @@ type Fleet interface {
 type GitHubClient interface {
 	States(ctx context.Context, scope github.Scope) (map[string]github.State, error)
 	Deregister(ctx context.Context, scope github.Scope, name string) error
+	RegistrationToken(ctx context.Context, scope github.Scope) (string, error)
 }
 
 // ClientFactory builds a GitHub client for one credential, whichever kind it
@@ -380,13 +380,25 @@ func (r *Reconciler) apply(ctx context.Context, action Action, pools map[string]
 	}
 
 	switch action.Op {
-	case OpCreate:
+	case OpCreate, OpStart:
 		if action.Spec == nil {
-			return errors.New("a create action without a spec")
+			return fmt.Errorf("a %s action without a spec", action.Op)
 		}
-		return executor.Create(ctx, *action.Spec)
-	case OpStart:
-		return executor.Start(ctx, action.Runner)
+		spec := *action.Spec
+		// A runtime that shares everything with the job it runs must not be
+		// handed the credential, so the daemon does the minting and passes on
+		// a token that can do one thing and expires in an hour.
+		if spec.Runtime == model.RuntimeContainer {
+			minted, err := r.mintFor(ctx, spec, pools)
+			if err != nil {
+				return err
+			}
+			spec.RegistrationToken = minted
+		}
+		if action.Op == OpCreate {
+			return executor.Create(ctx, spec)
+		}
+		return executor.Start(ctx, spec)
 	case OpDrain:
 		return executor.Drain(ctx, action.Runner)
 	case OpRemove:
@@ -402,6 +414,26 @@ func (r *Reconciler) apply(ctx context.Context, action Action, pools map[string]
 	default:
 		return fmt.Errorf("unknown operation %q", action.Op)
 	}
+}
+
+// mintFor buys a registration token for one runner.
+func (r *Reconciler) mintFor(ctx context.Context, spec Spec, pools map[string]model.Pool) (string, error) {
+	if r.newClient == nil {
+		return "", nil
+	}
+	pool, ok := pools[spec.Pool]
+	if !ok {
+		return "", fmt.Errorf("pool %s is gone", spec.Pool)
+	}
+	secret, err := r.store.Secret(ctx, pool.CredentialID)
+	if err != nil {
+		return "", err
+	}
+	client, err := r.newClient(secret)
+	if err != nil {
+		return "", err
+	}
+	return client.RegistrationToken(ctx, github.ScopeOf(pool))
 }
 
 func (r *Reconciler) deregister(ctx context.Context, action Action, pools map[string]model.Pool) {
