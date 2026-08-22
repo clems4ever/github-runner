@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "name": "github-runner CI",
+  "description": "The two pools this repository's own CI needs. Containers run the jobs that only need a toolchain — go and ui. Machines run the two that cannot work in a container: container-runner needs a Docker daemon of its own, and installer installs a systemd service as root and then deletes it again. Import both, or the fleet can only serve half the workflow.",
+  "pools": [
+    {
+      "name": "ci-container",
+      "scopeKind": "repository",
+      "scope": "clems4ever/github-runner",
+      "runtime": "container",
+      "nested": false,
+      "ephemeral": true,
+      "minReplicas": 1,
+      "maxReplicas": 3,
+      "cpus": 2,
+      "memoryMb": 4096,
+      "image": "default",
+      "enabled": true
+    },
+    {
+      "name": "ci-vm",
+      "scopeKind": "repository",
+      "scope": "clems4ever/github-runner",
+      "runtime": "vm",
+      "nested": false,
+      "ephemeral": true,
+      "minReplicas": 1,
+      "maxReplicas": 2,
+      "cpus": 4,
+      "memoryMb": 8192,
+      "diskGb": 40,
+      "image": "default",
+      "enabled": true
+    }
+  ]
+}

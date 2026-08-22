@@ -132,7 +132,7 @@ func (h *harness) samplePool() map[string]any {
 func TestEverythingNeedsCredentials(t *testing.T) {
 	h := newHarness(t)
 
-	for _, path := range []string{"/api/pools", "/api/runners", "/api/credentials", "/api/settings", "/"} {
+	for _, path := range []string{"/api/pools", "/api/pools/export", "/api/runners", "/api/credentials", "/api/settings", "/"} {
 		resp, err := h.server.Client().Get(h.server.URL + path)
 		if err != nil {
 			t.Fatal(err)

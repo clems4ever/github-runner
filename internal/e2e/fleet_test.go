@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -968,4 +969,148 @@ func TestAStoppedContainerIsRebuiltWithAFreshToken(t *testing.T) {
 	if got := f.containers.started[0].RegistrationToken; got == "" || got == first {
 		t.Fatalf("it was brought back with %q, want a token minted for this attempt", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Templates
+// ---------------------------------------------------------------------------
+
+// The template checked into this repository, through the real route, all the
+// way to runners on the host.
+//
+// It is what someone is handed and told to import, so what it is worth is not
+// that it parses: it is that importing it leaves a fleet that can serve both
+// halves of the workflow — containers for the jobs that need a toolchain,
+// machines for the ones that need a Docker daemon or a systemd of their own.
+func TestImportingTheShippedTemplateBringsUpBothKindsOfRunner(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.importTemplate(t, "github-runner-ci.json", map[string]any{"credentialId": credential})
+	f.reconcileNow()
+
+	// Every pool keeps one runner at its floor, so each can accept a job and
+	// find out whether more are needed.
+	if got := strings.Join(f.containers.names(), ","); got != "ci-container-1" {
+		t.Fatalf("containers: %q", got)
+	}
+	if got := strings.Join(f.vm.names(), ","); got != "ci-vm-1" {
+		t.Fatalf("machines: %q", got)
+	}
+
+	// And a workflow can tell them apart, which is the whole point of having
+	// two pools.
+	payload := f.mustRequest("GET", "/api/pools", nil, http.StatusOK)
+	var pools []model.Pool
+	if err := json.Unmarshal([]byte(payload), &pools); err != nil {
+		t.Fatal(err)
+	}
+	for _, pool := range pools {
+		labels := strings.Join(pool.EffectiveLabels(), ",")
+		if !strings.Contains(labels, string(pool.Runtime)) {
+			t.Errorf("%s cannot be selected by runs-on: %q", pool.Name, labels)
+		}
+		if !pool.Ephemeral {
+			t.Errorf("%s reuses runners between jobs", pool.Name)
+		}
+	}
+}
+
+// Importing the same template again is how a fleet is updated from a file in a
+// repository, and it must not fail the job a runner is on.
+func TestImportingOverAFleetReplacesRunnersGracefully(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.importTemplate(t, "github-runner-ci.json", map[string]any{"credentialId": credential})
+	f.reconcileNow()
+	f.vm.created = nil
+
+	// The same document, with the machines given more memory. Without the
+	// tick-box it is refused rather than silently doing nothing.
+	edited := f.template(t, "github-runner-ci.json")
+	pools := edited["pools"].([]any)
+	pools[1].(map[string]any)["memoryMb"] = 16384
+
+	f.mustRequest("POST", "/api/pools/import", map[string]any{
+		"document": edited, "credentialId": credential,
+	}, http.StatusConflict)
+
+	f.mustRequest("POST", "/api/pools/import", map[string]any{
+		"document": edited, "credentialId": credential, "replaceExisting": true,
+	}, http.StatusOK)
+
+	// The runner is mid-job, so it is drained rather than rebuilt under it.
+	f.reconcileNow()
+	if len(f.vm.created) != 0 {
+		t.Fatalf("a runner was rebuilt before the old one stopped: %v", f.vm.created)
+	}
+
+	f.vm.jobsFinish()
+	f.reconcileNow()
+	if got := strings.Join(f.vm.created, ","); got != "ci-vm-1" {
+		t.Fatalf("the replacement was %q", got)
+	}
+	if got := f.vm.specs[len(f.vm.specs)-1].MemoryMB; got != 16384 {
+		t.Fatalf("the replacement has %d MiB, so the import did not reach it", got)
+	}
+}
+
+// What comes out of one daemon goes into the next one. This is the path
+// somebody takes when they move a fleet to another host.
+func TestAFleetCanBeExportedAndImportedSomewhereElse(t *testing.T) {
+	source := newFleet(t)
+	defer source.close()
+	credential := source.addCredential()
+	source.addPool(elasticVMPool(credential, 1, 4))
+
+	exported := source.mustRequest("GET", "/api/pools/export", nil, http.StatusOK)
+	var document map[string]any
+	if err := json.Unmarshal([]byte(exported), &document); err != nil {
+		t.Fatalf("the export is not JSON: %v", err)
+	}
+
+	destination := newFleet(t)
+	defer destination.close()
+	destination.mustRequest("POST", "/api/pools/import", map[string]any{
+		"document": document, "credentialId": destination.addCredential(),
+	}, http.StatusOK)
+	destination.reconcileNow()
+
+	if got := strings.Join(destination.vm.names(), ","); got != "web-1" {
+		t.Fatalf("the second host has %q", got)
+	}
+	payload := destination.mustRequest("GET", "/api/pools", nil, http.StatusOK)
+	var pools []model.Pool
+	if err := json.Unmarshal([]byte(payload), &pools); err != nil {
+		t.Fatal(err)
+	}
+	if pools[0].MinReplicas != 1 || pools[0].MaxReplicas != 4 {
+		t.Fatalf("the scaling bounds did not travel: %+v", pools[0])
+	}
+}
+
+// template reads a template shipped in this repository.
+func (f *fleet) template(t *testing.T, name string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "templates", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatalf("%s is not JSON: %v", name, err)
+	}
+	return document
+}
+
+func (f *fleet) importTemplate(t *testing.T, name string, options map[string]any) {
+	t.Helper()
+	body := map[string]any{"document": f.template(t, name)}
+	for key, value := range options {
+		body[key] = value
+	}
+	f.mustRequest("POST", "/api/pools/import", body, http.StatusOK)
 }
