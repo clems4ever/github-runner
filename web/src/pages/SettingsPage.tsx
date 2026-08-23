@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
-  Button, Card, Code, Group, PasswordInput, Stack, Text, TextInput, Title,
+  Button, Card, Code, Group, NumberInput, PasswordInput, Stack, Switch, Text, TextInput, Title,
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
-import { api, type Health } from '../api'
+import { api, type Budget, type Health } from '../api'
 
 export function SettingsPage({ health }: { health: Health | null }) {
   const [user, setUser] = useState('')
@@ -61,6 +61,8 @@ export function SettingsPage({ health }: { health: Health | null }) {
         </Stack>
       </Card>
 
+      <FleetBudget />
+
       <Card withBorder p={{ base: 'md', sm: 'lg' }}>
         <Stack gap="xs">
           <Text fw={500}>Upgrading</Text>
@@ -77,5 +79,117 @@ export function SettingsPage({ health }: { health: Health | null }) {
         </Stack>
       </Card>
     </Stack>
+  )
+}
+
+/**
+ * What the whole fleet may take from this host, as opposed to what any one pool
+ * was promised.
+ *
+ * Zero in a field is that dimension uncapped, and the fields say so rather than
+ * being left empty: "0" next to "no cap" is unambiguous where an empty box is a
+ * question about whether the form loaded.
+ */
+function FleetBudget() {
+  const [budget, setBudget] = useState<Budget | null>(null)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .settings()
+      .then((settings) => {
+        if (!cancelled) setBudget(settings.budget)
+      })
+      .catch(() => {
+        // The page has a password form on it that works regardless, and the
+        // budget is not what somebody came here for when the daemon is
+        // struggling to answer at all.
+        if (!cancelled) setBudget({ cpus: 0, cpuWeight: 0, memoryMb: 0, hardMemory: false })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  if (!budget) return null
+
+  const set = (patch: Partial<Budget>) => setBudget({ ...budget, ...patch })
+
+  return (
+    <Card withBorder p={{ base: 'md', sm: 'lg' }}>
+      <Stack gap="sm">
+        <Text fw={500}>Fleet budget</Text>
+        <Text size="sm" c="dimmed">
+          A pool's size is per runner and says nothing about what happens when every pool is busy
+          at once. This is the ceiling over all of them together: the machines run in one control
+          group, and these are its limits. Pools stop growing when the budget is spent, and never
+          shrink below their own minimums. Container pools are not covered.
+        </Text>
+        <Group grow align="flex-start">
+          <NumberInput
+            label="CPU" description="Cores across every machine. 0 for no cap."
+            min={0} max={1024} allowDecimal={false}
+            value={budget.cpus} onChange={(value) => set({ cpus: Number(value) || 0 })}
+          />
+          <NumberInput
+            label="Memory (MiB)" description="Across every machine. 0 for no cap."
+            min={0} step={1024} allowDecimal={false}
+            value={budget.memoryMb} onChange={(value) => set({ memoryMb: Number(value) || 0 })}
+          />
+        </Group>
+        <NumberInput
+          label="Share when the host is contended"
+          description={
+            "What the fleet gets when something else on this host wants the machine too." +
+            " systemd's default is 100, so below that is a fleet that yields. 0 leaves the default."
+          }
+          min={0} max={10000} allowDecimal={false}
+          value={budget.cpuWeight} onChange={(value) => set({ cpuWeight: Number(value) || 0 })}
+        />
+        <Switch
+          checked={budget.hardMemory}
+          disabled={!budget.memoryMb}
+          onChange={(event) => set({ hardMemory: event.currentTarget.checked })}
+          label="Kill a machine rather than let the fleet exceed its memory"
+          description={
+            'Off by default. Without it the kernel reclaims harder as the fleet approaches the' +
+            ' ceiling and the fleet gets slower. With it, the kernel kills the largest machine in' +
+            ' the group — which is not necessarily the one that overspent, so it costs somebody' +
+            ' their job. Turn it on if you would rather lose a job than have the host crawl.'
+          }
+        />
+        <Group justify="flex-end">
+          <Button
+            loading={saving}
+            onClick={async () => {
+              setSaving(true)
+              try {
+                const saved = await api.setBudget(budget)
+                setBudget(saved)
+                notifications.show({
+                  color: 'green',
+                  title: 'Budget saved',
+                  message:
+                    saved.cpus || saved.memoryMb
+                      ? 'It applies to the machines that are already running.'
+                      : 'The fleet is no longer capped.',
+                })
+              } catch (error) {
+                notifications.show({
+                  color: 'red',
+                  title: 'Could not save the budget',
+                  message: error instanceof Error ? error.message : String(error),
+                })
+              } finally {
+                setSaving(false)
+              }
+            }}
+          >
+            Save budget
+          </Button>
+        </Group>
+      </Stack>
+    </Card>
   )
 }

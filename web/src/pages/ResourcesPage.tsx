@@ -14,7 +14,7 @@ import {
   Tooltip,
 } from '@mantine/core'
 import { IconAlertTriangle } from '@tabler/icons-react'
-import type { Commitment, HostResources, ResourceReport, RunnerUsage } from '../api'
+import type { Budget, Commitment, HostResources, ResourceReport, RunnerUsage } from '../api'
 import { Field, useNarrow } from '../responsive'
 import { HostChart } from './HostChart'
 
@@ -92,6 +92,10 @@ export function ResourcesPage({ report }: { report: ResourceReport | null }) {
       <HostChart />
 
       {report.committed && <Committed committed={report.committed} host={host} />}
+
+      {report.budget && (
+        <Budgeted budget={report.budget} committed={report.committed} host={host} />
+      )}
 
       {(report.warnings ?? []).map((warning) => (
         <Alert key={warning} color="yellow" icon={<IconAlertTriangle size={18} />} variant="light">
@@ -235,6 +239,84 @@ function Committed({ committed, host }: { committed: Commitment; host: HostResou
         />
         <Fact label="Disk" value={bytes(committed.diskBytes)} note="machines only" />
       </Group>
+    </Card>
+  )
+}
+
+/**
+ * What the fleet is allowed to take, against what the host has and what the
+ * pools have asked for.
+ *
+ * Only shown when there is a budget: a host that has never set one has nothing
+ * to say here, and an empty card that says "no limits" is a row of zeroes
+ * somebody has to learn to ignore.
+ *
+ * A commitment above the budget is stated rather than flagged as an error. It
+ * is the ordinary way to run this: pools are configured for the busiest hour
+ * and the budget is what keeps that hour from taking the host. What the
+ * operator needs to know is that the pools will be held below their maximums,
+ * so that is what it says.
+ */
+function Budgeted({
+  budget,
+  committed,
+  host,
+}: {
+  budget: Budget
+  committed?: Commitment
+  host: HostResources
+}) {
+  if (!budget.cpus && !budget.memoryMb && !budget.cpuWeight) return null
+
+  const budgetMemoryBytes = budget.memoryMb * 1024 * 1024
+  const cpuHeld = Boolean(budget.cpus && committed && committed.cpus > budget.cpus)
+  const memoryHeld = Boolean(
+    budget.memoryMb && committed && committed.memoryBytes > budgetMemoryBytes,
+  )
+
+  return (
+    <Card withBorder padding="md">
+      <Text size="xs" c="dimmed" tt="uppercase" fw={600} mb="xs">
+        Fleet budget
+      </Text>
+      <Group gap="xl" wrap="wrap">
+        <Fact
+          label="CPU"
+          value={budget.cpus ? `${budget.cpus} of ${host.cpus}` : 'uncapped'}
+          note={cpuHeld ? 'pools held below their maximums' : undefined}
+        />
+        <Fact
+          label="Memory"
+          value={
+            budget.memoryMb
+              ? `${bytes(budgetMemoryBytes)} of ${bytes(host.memoryTotalBytes)}`
+              : 'uncapped'
+          }
+          note={memoryHeld ? 'pools held below their maximums' : undefined}
+        />
+        {Boolean(budget.cpuWeight) && (
+          <Fact
+            label="Share when contended"
+            value={String(budget.cpuWeight)}
+            note={budget.cpuWeight < 100 ? 'yields to the rest of the host' : undefined}
+          />
+        )}
+        {budget.hardMemory && (
+          // Worth saying out loud on the page somebody reads after a job died
+          // for no reason they can find in its log.
+          <Fact
+            label="Over the ceiling"
+            value="a machine is killed"
+            flagged
+            note="mid-job"
+          />
+        )}
+      </Group>
+      {/* Machines only, and said here rather than in a tooltip: a host running
+          container pools would otherwise read this as a fleet-wide ceiling. */}
+      <Text size="xs" c="dimmed" mt="xs">
+        Machine pools only. Containers are not inside the group this is enforced in.
+      </Text>
     </Card>
   )
 }

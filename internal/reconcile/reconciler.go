@@ -34,9 +34,23 @@ type Executor interface {
 	Remove(ctx context.Context, name string) error
 }
 
+// Budgeted is an executor that can hold its runners to a fleet-wide budget.
+//
+// Optional, and asked for with a type assertion, because only one runtime can:
+// machines are systemd units and a slice over them is a group the kernel
+// accounts for. A runtime that cannot is not broken and is not warned about —
+// it simply is not rationed either, which is the same rule Ration follows.
+type Budgeted interface {
+	ApplyBudget(ctx context.Context, budget model.Budget) error
+}
+
 // Fleet is the part of the store the reconciler needs.
 type Fleet interface {
 	ListPools(ctx context.Context) ([]model.Pool, error)
+	// Setting is how the fleet budget is read. It is read on every pass rather
+	// than held, so a change made in the UI reaches the host on the next one
+	// without anything having to be told about it.
+	Setting(ctx context.Context, key string) (string, error)
 	CredentialFingerprint(ctx context.Context, id int64) (string, error)
 	Secret(ctx context.Context, id int64) (model.Secret, error)
 	RecordSamples(ctx context.Context, at time.Time, samples []model.Sample) error
@@ -138,6 +152,51 @@ func (r *Reconciler) lastBusy(pool string, runners []Runner, states map[string]g
 	return r.busySince[pool]
 }
 
+// budget is what the whole fleet may take from this host.
+//
+// A budget that cannot be read, or that has been stored in a shape this daemon
+// does not understand, is reported and then treated as no budget at all. The
+// alternative — refusing to reconcile — would take a fleet down over a
+// settings row, and the group on the host is still holding whatever was last
+// applied to it in the meantime.
+func (r *Reconciler) budget(ctx context.Context, result *Result) model.Budget {
+	stored, err := r.store.Setting(ctx, model.SettingFleetBudget)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("read the fleet budget: %v", err))
+		return model.Budget{}
+	}
+	budget, err := model.ParseBudget(stored)
+	if err != nil {
+		result.Errors = append(result.Errors, err.Error())
+		return model.Budget{}
+	}
+	if err := budget.Validate(); err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("the stored fleet budget cannot be used: %v", err))
+		return model.Budget{}
+	}
+	return budget
+}
+
+// applyBudget puts the limits on the host, for the runtimes that have somewhere
+// to put them.
+//
+// Failing is not fatal to the pass. A daemon that cannot write a slice — no
+// root, no systemd, a read-only /etc — still has a fleet to maintain, and
+// Ration below will hold it to the budget regardless. That is the half of this
+// that does not need the host's cooperation.
+func (r *Reconciler) applyBudget(ctx context.Context, budget model.Budget, result *Result) {
+	for _, executor := range r.executors {
+		budgeted, ok := executor.(Budgeted)
+		if !ok {
+			continue
+		}
+		if err := budgeted.ApplyBudget(ctx, budget); err != nil {
+			result.Errors = append(result.Errors,
+				fmt.Sprintf("hold the %s runners to the fleet budget: %v", executor.Runtime(), err))
+		}
+	}
+}
+
 func (r *Reconciler) rememberScaling(scaling map[string]Scale) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -213,6 +272,13 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 		result.Errors = append(result.Errors, fmt.Sprintf("read the pools: %v", err))
 		return result
 	}
+
+	// What the whole fleet is allowed to take from this host, which is a
+	// different question from what any one pool was promised. Read first,
+	// because it is both applied to the host below and used to decide how large
+	// the fleet is allowed to become.
+	budget := r.budget(ctx, &result)
+	r.applyBudget(ctx, budget, &result)
 
 	// The host is read before anything is decided: how many runners a pool
 	// should have depends on what its runners are doing, so the observation
@@ -296,19 +362,31 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	}
 	scaling := map[string]Scale{}
 	for _, pool := range pools {
-		fingerprint, ok := fingerprints[pool.Name]
-		if !ok {
+		if _, ok := fingerprints[pool.Name]; !ok {
 			continue // its credential could not be read; already reported
 		}
 		mine := byPool[pool.Name]
-		scale := Autoscale(pool, mine, states, r.lastBusy(pool.Name, mine, states), r.now())
-		scaling[pool.Name] = scale
+		scaling[pool.Name] = Autoscale(pool, mine, states, r.lastBusy(pool.Name, mine, states), r.now())
+	}
+
+	// Each pool has now said how large it would like to be. The budget is what
+	// decides how much of that the host can pay for, and it has to see every
+	// pool's answer at once — which is why it happens between sizing the pools
+	// and turning the sizes into runners, rather than inside either.
+	scaling = Ration(pools, scaling, budget)
+
+	for _, pool := range pools {
+		fingerprint, ok := fingerprints[pool.Name]
+		if !ok {
+			continue
+		}
+		scale := scaling[pool.Name]
 		if scale.ScaledUp {
 			result.ScaledUp = true
 		}
 		desired = append(desired,
 			SpecsForCredential(pool, fingerprint, r.recipeFor(pool),
-				DesiredNames(pool, mine, states, scale.Target), secrets[pool.Name])...)
+				DesiredNames(pool, byPool[pool.Name], states, scale.Target), secrets[pool.Name])...)
 	}
 	result.Scaling = scaling
 	r.rememberScaling(scaling)
