@@ -249,16 +249,30 @@ fill — over a chart of the same three across the last day, and under it a row
 per runner.
 
 Everything is read from the kernel, and each runtime is measured the way that
-runtime can be measured. A **container** is asked of Docker, minus the page
-cache, which is what makes a container that has cloned a large repository look
-about to die when it is fine. A **machine** is asked of systemd: every runner is
-a unit, every unit is a cgroup, and the accounting is already there — so nothing
-has to be read out of the guest, and a machine that has wandered off into swap
-is still counted. Processor figures are a share of the whole host, the same
-scale the meters use, so a runner's number and the host's can be read against
-each other. A runner that has only been seen once shows a dash rather than a
-zero: a rate needs two readings, and a machine that is busily booting is not
-idle.
+runtime can be measured. A **container** is asked of Docker. A **machine** is
+asked of systemd: every runner is a unit, every unit is a cgroup, and the
+accounting is already there — so nothing has to be read out of the guest, and a
+machine that has wandered off into swap is still counted. Both then have the
+page cache taken out of the figure, which is what makes a container that has
+cloned a large repository look about to die when it is fine, and matters more
+still for a machine: QEMU reads its disk through the host's cache, so a machine
+that has done nothing but boot is charged for the image it booted from. The
+subtraction happens in one place for both, because the two are shown side by
+side under one heading and a column that means something different from the one
+beside it is worse than a column that is merely wrong.
+
+Processor figures are a share of the whole host, the same scale the meters use,
+so a runner's number and the host's can be read against each other. A runner
+that has only been seen once shows a dash rather than a zero: a rate needs two
+readings, and a machine that is busily booting is not idle.
+
+A machine still costs more than a container at rest, and about a gigabyte of it
+is real: a guest boots a whole distribution, starts its own Docker daemon and
+its own runner, and none of that is shared with the host. Guests are given a
+balloon that reports free pages, so memory a job finishes with goes back to the
+host rather than staying resident until the machine is replaced — but a guest's
+own page cache is not free memory, and no amount of reporting reclaims it. The
+floor is the floor. What the balloon prevents is the ratchet above it.
 
 Beneath them is what the pools have **committed** — what they would take if
 every one of them grew to its ceiling at the same moment. That is arithmetic on

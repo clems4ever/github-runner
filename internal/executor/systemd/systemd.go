@@ -53,6 +53,10 @@ type Executor struct {
 	binary   string // what the unit runs: this daemon's own binary, in agent mode
 	user     string
 	unitPath string
+	// cgroupRoot is where the kernel's memory accounting is mounted. Only
+	// Usage reads it, and only for the page cache figure systemd will not
+	// report itself.
+	cgroupRoot string
 	// now is the clock, replaced in tests that need one that does not move.
 	now func() time.Time
 	// cpu remembers each unit's processor counter between samples, which is
@@ -72,16 +76,22 @@ func WithUnitPath(path string) Option { return func(e *Executor) { e.unitPath = 
 // WithClock replaces the clock, so a test can say how long a drain has taken.
 func WithClock(now func() time.Time) Option { return func(e *Executor) { e.now = now } }
 
+// WithCgroupRoot puts the kernel's accounting somewhere other than
+// /sys/fs/cgroup, so a test can lay out a memory.stat of its own rather than
+// depend on what the machine running it happens to have mounted.
+func WithCgroupRoot(path string) Option { return func(e *Executor) { e.cgroupRoot = path } }
+
 // New builds the executor.
 func New(layout paths.Layout, binary, user string, opts ...Option) *Executor {
 	e := &Executor{
-		layout:   layout,
-		cmd:      execCommander{},
-		binary:   binary,
-		user:     user,
-		unitPath: "/etc/systemd/system/" + UnitTemplate + ".service",
-		now:      time.Now,
-		cpu:      resources.NewRate(),
+		layout:     layout,
+		cmd:        execCommander{},
+		binary:     binary,
+		user:       user,
+		unitPath:   "/etc/systemd/system/" + UnitTemplate + ".service",
+		cgroupRoot: "/sys/fs/cgroup",
+		now:        time.Now,
+		cpu:        resources.NewRate(),
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -474,6 +484,17 @@ func (e *Executor) show(ctx context.Context, properties, units []string) (map[st
 // A unit that is not running has no cgroup and no figures. systemd says so by
 // printing "[not set]", which parses as nothing and is skipped: a stopped
 // runner using zero and a stopped runner we cannot measure are the same thing.
+//
+// MemoryCurrent alone is not the answer, though, which is why ControlGroup is
+// asked for beside it. What systemd reports is the cgroup's whole charge, page
+// cache included, and QEMU reads its disk through the host's cache — so a good
+// part of what a booted machine appears to hold is the qcow2 it booted from,
+// which the kernel would drop the moment anything wanted the memory. The
+// container executor has always taken that out. This did not, and the two sat
+// next to each other in one table looking like a fair comparison. memory.stat
+// is where the figure to subtract lives, and the kernel is the only one who
+// has it — hence the trip to the filesystem for a number systemd will not
+// report.
 func (e *Executor) Usage(ctx context.Context) ([]resources.RunnerUsage, error) {
 	runners, err := e.List(ctx)
 	if err != nil {
@@ -487,7 +508,7 @@ func (e *Executor) Usage(ctx context.Context) ([]resources.RunnerUsage, error) {
 	for _, runner := range runners {
 		units = append(units, unitName(runner.Name))
 	}
-	shown, err := e.show(ctx, []string{"MemoryCurrent", "CPUUsageNSec"}, units)
+	shown, err := e.show(ctx, []string{"MemoryCurrent", "CPUUsageNSec", "ControlGroup"}, units)
 	if err != nil {
 		return nil, fmt.Errorf("ask systemd what the machines are using: %w", err)
 	}
@@ -506,7 +527,7 @@ func (e *Executor) Usage(ctx context.Context) ([]resources.RunnerUsage, error) {
 			Runtime: string(model.RuntimeVM),
 		}
 		if memory, err := strconv.ParseInt(properties["MemoryCurrent"], 10, 64); err == nil {
-			row.MemoryBytes = memory
+			row.MemoryBytes = resources.WorkingSet(memory, e.cgroupStats(properties["ControlGroup"]))
 		}
 		if consumed, err := strconv.ParseUint(properties["CPUUsageNSec"], 10, 64); err == nil {
 			row.CPUPercent = e.cpu.Percent(runner.Name, consumed)
@@ -515,6 +536,48 @@ func (e *Executor) Usage(ctx context.Context) ([]resources.RunnerUsage, error) {
 	}
 	e.cpu.Keep(names)
 	return usage, nil
+}
+
+// cgroupStats is the kernel's own accounting for one unit, or nothing.
+//
+// Two paths, because the two cgroup versions put it in different places: the
+// unified hierarchy hangs memory.stat off the cgroup itself, and v1 has a
+// controller directory in front of it. Trying both costs one failed stat call
+// on the host that does not have it.
+//
+// Nothing is an ordinary answer, not an error. A unit that has just stopped
+// leaves a ControlGroup property behind for a moment after the directory is
+// gone, a daemon in a container may not see the host's hierarchy at all, and
+// neither is worth a warning on a page about memory. WorkingSet takes an empty
+// map and subtracts nothing, which is the same fallback the container path
+// already has when Docker omits the key — so both runtimes degrade the same
+// way, and both degrade towards the number they used to report.
+func (e *Executor) cgroupStats(controlGroup string) map[string]int64 {
+	if controlGroup == "" || controlGroup == "[not set]" {
+		return nil
+	}
+	for _, path := range []string{
+		filepath.Join(e.cgroupRoot, controlGroup, "memory.stat"),
+		filepath.Join(e.cgroupRoot, "memory", controlGroup, "memory.stat"),
+	} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		stats := map[string]int64{}
+		scanner := bufio.NewScanner(strings.NewReader(string(body)))
+		for scanner.Scan() {
+			key, value, ok := strings.Cut(strings.TrimSpace(scanner.Text()), " ")
+			if !ok {
+				continue
+			}
+			if n, err := strconv.ParseInt(value, 10, 64); err == nil {
+				stats[key] = n
+			}
+		}
+		return stats
+	}
+	return nil
 }
 
 // mapActiveState turns systemd's vocabulary into the three states the
