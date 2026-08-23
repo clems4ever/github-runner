@@ -130,6 +130,71 @@ describe('ResourcesPage', () => {
     expect(screen.getAllByText('more than the host has')).toHaveLength(2)
   })
 
+  // A host that has never set a budget has nothing to say about one, and a card
+  // of zeroes reading "uncapped, uncapped, uncapped" is a row somebody has to
+  // learn to ignore.
+  it('says nothing about a budget nobody set', async () => {
+    await renderPage(report({ budget: { cpus: 0, cpuWeight: 0, memoryMb: 0, hardMemory: false } }))
+    expect(screen.queryByText('Fleet budget')).not.toBeInTheDocument()
+  })
+
+  it('shows the budget against the host once there is one', async () => {
+    await renderPage(
+      report({ budget: { cpus: 4, cpuWeight: 0, memoryMb: 8192, hardMemory: false } }),
+    )
+
+    expect(screen.getByText('Fleet budget')).toBeInTheDocument()
+    expect(screen.getByText('4 of 8')).toBeInTheDocument()
+    expect(screen.getByText('8.0 GB of 16.0 GB')).toBeInTheDocument()
+  })
+
+  // The pools are configured for the busiest hour and the budget is what keeps
+  // that hour from taking the host, so a commitment above the budget is the
+  // ordinary way to run this. What the operator needs to know is the
+  // consequence: the pools will not reach their maximums.
+  it('says when the budget will hold the pools below their maximums', async () => {
+    await renderPage(
+      report({
+        committed: { runners: 8, cpus: 32, memoryBytes: 64 * 1024 ** 3, diskBytes: 0 },
+        budget: { cpus: 4, cpuWeight: 0, memoryMb: 8192, hardMemory: false },
+      }),
+    )
+
+    expect(screen.getAllByText('pools held below their maximums')).toHaveLength(2)
+  })
+
+  // The one setting that can cost somebody a job, said on the page they would
+  // read afterwards looking for a reason that is not in the job's own log.
+  it('says out loud when the fleet is set to kill a machine at the ceiling', async () => {
+    await renderPage(
+      report({ budget: { cpus: 0, cpuWeight: 0, memoryMb: 8192, hardMemory: true } }),
+    )
+
+    expect(screen.getByText('a machine is killed')).toBeInTheDocument()
+    expect(screen.getByText('mid-job')).toBeInTheDocument()
+  })
+
+  // A weight is not a cap, and a fleet that only yields under contention is
+  // still allowed the whole host.
+  it('shows a share without claiming anything is capped', async () => {
+    await renderPage(
+      report({ budget: { cpus: 0, cpuWeight: 20, memoryMb: 0, hardMemory: false } }),
+    )
+
+    expect(screen.getByText('Share when contended')).toBeInTheDocument()
+    expect(screen.getByText('20')).toBeInTheDocument()
+    expect(screen.getAllByText('uncapped')).toHaveLength(2)
+  })
+
+  // Containers are not in the group the budget is enforced in, and a host
+  // running both would otherwise read this as a fleet-wide ceiling.
+  it('says which runtime the budget covers', async () => {
+    await renderPage(
+      report({ budget: { cpus: 4, cpuWeight: 0, memoryMb: 0, hardMemory: false } }),
+    )
+    expect(screen.getByText(/Machine pools only/)).toBeInTheDocument()
+  })
+
   it('surfaces a runtime that could not be measured rather than showing it as empty', async () => {
     await renderPage(report({ warnings: ['is dockerd running?'] }))
     expect(screen.getByText('is dockerd running?')).toBeInTheDocument()

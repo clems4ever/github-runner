@@ -285,6 +285,68 @@ Readings are taken every fifteen seconds — `--resource-interval` moves that �
 and two days of them are kept, on the same retention as the activity history.
 Each point on the chart is the peak of its interval, for the same reason.
 
+### The fleet budget
+
+A pool's size is per runner. The commitment above is what happens when that is
+all you have: pools sized for their busiest hour, and no answer to what the host
+does when every one of them has its busiest hour at once.
+
+The **fleet budget**, on the Settings page, is the ceiling over all of them
+together. It is two things at once, and it needs to be both.
+
+On the host, every machine runner is a systemd unit inside one slice —
+`runner-fleet.slice` — and the budget is that slice's limits. The kernel
+accounts for the group, so ten idle machines leave their share to the one that
+is building, and no machine can take the host because the group it is in has
+already spent everything. This is enforcement, and it does not care whether the
+daemon is running.
+
+In the daemon, the same figures stop pools growing into a ceiling they would
+only be squeezed against. Without that, a host at its limit would keep creating
+machines that make every machine already on it worse, for ever, because nothing
+in the autoscaler has any idea the ceiling exists. Growth above the minimums is
+shared out a runner at a time, in name order, so a large pool does not empty the
+budget before a small one is looked at — and the pool that stops says so, on the
+Pools page, in the terms the budget was set in.
+
+**Minimums are never broken.** A pool with no runner cannot accept a job, so it
+can never discover that it needs one: a budget that scaled pools to nothing
+would not slow the fleet down, it would switch it off. If the minimums alone
+exceed the budget they are paid anyway, the slice contains the result, and every
+pool says which of the two problems this is.
+
+| | |
+| --- | --- |
+| **CPU** | processors across every machine together, as `CPUQuota` on the slice. Throughput, not a set of cores |
+| **Memory** | MiB across every machine together, as `MemoryHigh` |
+| **Share when contended** | `CPUWeight`: what the fleet gets when something else on this host wants the machine too. Not a cap — a fleet with only this set may still use the whole host |
+| **Kill at the ceiling** | off by default. See below |
+
+Memory is applied as pressure rather than as a wall. Past `MemoryHigh` the
+kernel reclaims from the fleet harder and the fleet gets slower; it does not
+fail anything. The alternative is `MemoryMax` and the out-of-memory killer,
+which picks the largest machine in the group rather than the one that overspent
+— so it costs somebody their job, and not necessarily the person whose job
+caused it. That is the switch, it is off, and turning it on puts `MemoryMax`
+five per cent above the ceiling so the reclaim has somewhere to happen first.
+
+Changing the budget applies to the machines that are already running: the limits
+are properties of a group that already holds them. Lowering it drains the excess
+rather than killing it, so no job is lost either way. Machines run inside the
+slice whether or not a budget is set — a unit joins its slice when it starts, so
+if membership were conditional, setting a budget would mean replacing the whole
+fleet before it meant anything. The one consequence: machines that were already
+running when a host first upgraded to a version that writes the slice stay
+outside it until they are next replaced, and the Resources page names them while
+that is true.
+
+The daemon itself is deliberately not in the slice. A fleet pressed against its
+memory ceiling must not be able to take down the only thing that can raise it.
+
+**Container pools are not covered.** They are not in the slice, so they are not
+charged against it either — a figure that meant "machines, and also containers
+that are not subject to it" would mean nothing.
+
 ### Virtual machines or containers
 
 A **virtual machine** gives a job its own kernel, its own Docker daemon, a disk
@@ -421,7 +483,8 @@ gracefully, as each finishes the job it is on.
 | `/var/lib/runner-fleet/` | golden images and VM disks |
 | `/var/lib/runner-fleet/consoles/` | the last console of each machine, kept after it is gone |
 | `gh-runner@NAME.service` | one runner |
-| `runner-fleetd.service` | the daemon |
+| `runner-fleet.slice` | the group every machine runner is in, and where the fleet budget's limits live |
+| `runner-fleetd.service` | the daemon, in `system.slice` and deliberately outside the budget |
 
 ## When a runner will not come up
 

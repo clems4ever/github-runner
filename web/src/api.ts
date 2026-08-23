@@ -208,6 +208,31 @@ export interface Commitment {
 }
 
 /**
+ * What the whole fleet may take from this host, as opposed to what any one
+ * pool was promised.
+ *
+ * Zero in any field is that dimension uncapped, which is what an install that
+ * has never been configured has.
+ */
+export interface Budget {
+  /** Processors across every machine together. 0 is no cap. */
+  cpus: number
+  /**
+   * The fleet's share when the host is contended, which is a different
+   * question from the cap. systemd's default is 100; 0 leaves it alone.
+   */
+  cpuWeight: number
+  /** MiB across every machine together. 0 is no cap. */
+  memoryMb: number
+  /**
+   * Whether to add a hard limit above the ceiling, past which the kernel kills
+   * a machine mid-job. Off by default: the ceiling on its own makes the fleet
+   * slower, and the alternative costs somebody their job.
+   */
+  hardMemory: boolean
+}
+
+/**
  * The host and its runners at one moment.
  *
  * `ready` is false for the first second after the daemon starts, before it has
@@ -220,6 +245,8 @@ export interface ResourceReport {
   runners?: RunnerUsage[]
   warnings?: string[]
   committed?: Commitment
+  /** What the fleet is allowed to take, beside what it has promised itself. */
+  budget?: Budget
 }
 
 /** One point of host history. Percentages, so three units share one axis. */
@@ -339,7 +366,9 @@ export const api = {
     request<void>(`/api/credentials/${id}/secret`, { method: 'PUT', body: JSON.stringify({ secret }) }),
   deleteCredential: (id: number) => request<void>(`/api/credentials/${id}`, { method: 'DELETE' }),
 
-  settings: () => request<{ authUser: string; version: string }>('/api/settings'),
+  settings: () => request<{ authUser: string; version: string; budget: Budget }>('/api/settings'),
+  setBudget: (budget: Budget) =>
+    request<Budget>('/api/settings/budget', { method: 'PUT', body: JSON.stringify(budget) }),
   setPassword: (user: string, password: string) =>
     request<void>('/api/settings/auth', { method: 'PUT', body: JSON.stringify({ user, password }) }),
 }

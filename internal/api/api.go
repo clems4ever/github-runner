@@ -133,6 +133,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("PUT /api/credentials/{id}/secret", s.rotateCredential)
 	api.HandleFunc("DELETE /api/credentials/{id}", s.deleteCredential)
 	api.HandleFunc("PUT /api/settings/auth", s.setPassword)
+	api.HandleFunc("PUT /api/settings/budget", s.setBudget)
 	api.HandleFunc("GET /api/settings", s.getSettings)
 
 	root := http.NewServeMux()
@@ -578,6 +579,14 @@ func (s *Server) resourceReport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	// The budget goes out beside the commitment deliberately: one is what the
+	// pools would take at full stretch and the other is what they are allowed
+	// to, and the interesting number is the gap between them.
+	budget, err := s.budget(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ready":     true,
 		"at":        report.At,
@@ -585,6 +594,7 @@ func (s *Server) resourceReport(w http.ResponseWriter, r *http.Request) {
 		"runners":   report.Runners,
 		"warnings":  report.Warnings,
 		"committed": model.Commit(pools),
+		"budget":    budget,
 	})
 }
 
@@ -699,7 +709,55 @@ func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"authUser": user, "version": s.version})
+	budget, err := s.budget(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"authUser": user, "version": s.version, "budget": budget,
+	})
+}
+
+// budget is what the whole fleet may take from this host.
+//
+// A stored budget that cannot be read is an error here, unlike in the
+// reconciler, where it is a warning and the fleet carries on. The difference is
+// who is asking: a daemon maintaining a fleet must not stop over a settings
+// row, and a person who has opened the settings page to look at the budget is
+// owed the truth about it.
+func (s *Server) budget(ctx context.Context) (model.Budget, error) {
+	stored, err := s.store.Setting(ctx, model.SettingFleetBudget)
+	if err != nil {
+		return model.Budget{}, err
+	}
+	return model.ParseBudget(stored)
+}
+
+func (s *Server) setBudget(w http.ResponseWriter, r *http.Request) {
+	var budget model.Budget
+	if err := decode(r, &budget); err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := budget.Validate(); err != nil {
+		writeError(w, errBadRequest("%s", err))
+		return
+	}
+	encoded, err := budget.Encode()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.store.SetSetting(r.Context(), model.SettingFleetBudget, encoded); err != nil {
+		writeError(w, err)
+		return
+	}
+	// The budget reaches the host on a reconcile pass — the slice is written
+	// there, and the pools are rationed there — so ask for one now rather than
+	// leaving the operator to wonder for half a minute whether it took.
+	s.nudge()
+	writeJSON(w, http.StatusOK, budget)
 }
 
 func (s *Server) setPassword(w http.ResponseWriter, r *http.Request) {

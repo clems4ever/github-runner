@@ -118,6 +118,10 @@ type fakeStore struct {
 	fingerprint string
 	tokenErr    error
 	samples     []model.Sample
+	// settings is the daemon's own configuration, which for the reconciler
+	// means the fleet budget and nothing else.
+	settings   map[string]string
+	settingErr error
 	// tallies is every pass's job accounting, in order, so a test can watch a
 	// job be picked up on one pass and still be running on the next.
 	tallies [][]model.JobSample
@@ -147,6 +151,25 @@ func (f *fakeStore) tallyOf(pool string) model.JobSample {
 }
 
 func (f *fakeStore) ListPools(ctx context.Context) ([]model.Pool, error) { return f.pools, nil }
+func (f *fakeStore) Setting(ctx context.Context, key string) (string, error) {
+	if f.settingErr != nil {
+		return "", f.settingErr
+	}
+	return f.settings[key], nil
+}
+
+// budget is how a test says what the whole fleet may take from the host.
+func (f *fakeStore) budget(t *testing.T, budget model.Budget) {
+	t.Helper()
+	encoded, err := budget.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.settings == nil {
+		f.settings = map[string]string{}
+	}
+	f.settings[model.SettingFleetBudget] = encoded
+}
 func (f *fakeStore) CredentialFingerprint(ctx context.Context, id int64) (string, error) {
 	if f.tokenErr != nil {
 		return "", f.tokenErr
@@ -492,6 +515,10 @@ func (s *splitStore) RecordSamples(ctx context.Context, at time.Time, samples []
 
 func (s *splitStore) RecordJobs(ctx context.Context, at time.Time, samples []model.JobSample) error {
 	return s.good.RecordJobs(ctx, at, samples)
+}
+
+func (s *splitStore) Setting(ctx context.Context, key string) (string, error) {
+	return s.good.Setting(ctx, key)
 }
 
 // Losing GitHub must not make the daemon destructive: without an answer about
