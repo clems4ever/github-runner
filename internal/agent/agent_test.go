@@ -182,6 +182,18 @@ func TestMachinesCanGiveMemoryBack(t *testing.T) {
 	if strings.Contains(args, "deflate-on-oom") || strings.Contains(args, "-balloon ") {
 		t.Errorf("the balloon is being driven, not just listening:\n%s", args)
 	}
+
+	// A machine already running when this shipped has no balloon and cannot
+	// grow one — the command line is fixed when QEMU starts. Nothing else can
+	// notice: the QEMU arguments are not part of the golden image, so the old
+	// machine and the new one hash to the same generation and the reconciler
+	// leaves it exactly where it is. The revision is the only lever that
+	// reaches this, and without it the fix arrives on an idle host never.
+	if model.SpecRevision < 5 {
+		t.Fatalf("spec revision %d: machines booted without a balloon are still what the"+
+			" pools asked for, so nothing replaces them and this fix reaches a host that"+
+			" is not busy only when somebody restarts the units by hand", model.SpecRevision)
+	}
 }
 
 func TestImageNameChangesWithItsContents(t *testing.T) {

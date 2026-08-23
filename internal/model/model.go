@@ -235,11 +235,22 @@ func (p *Pool) EffectiveLabels() []string {
 //	   this either cannot take work at all or fails every job that needs root
 //	4  the golden image's name covers the script that builds it, so revision 3
 //	   was installed on hosts that went on reusing an image built without it
+//	5  machines are booted with a balloon that reports free pages, so guest
+//	   memory a job has finished with goes back to the host — a machine built
+//	   before this holds its high-water mark until it is replaced
 //
 // It should need bumping less often now. The recipe is in the generation above,
 // so a release that changes how runners are built says so by itself; this is
 // for the changes no recipe can express.
-const SpecRevision = 4
+//
+// Revision 5 is the first that is not about a runner that cannot work, and it
+// is here because no recipe can reach it: the QEMU command line is not part of
+// the golden image, so a machine built the old way hashes identically to one
+// built the new way and would never be replaced. On a fleet whose pools are
+// ephemeral that resolves itself within a job or two — but "within a job or
+// two" is not the same as "on an idle host", where the machines waiting for
+// work are exactly the ones that would sit unfixed indefinitely.
+const SpecRevision = 5
 
 // Generation is a hash of everything a runner is built from. The reconciler
 // stamps it on each runner it creates and compares it later: a runner whose
