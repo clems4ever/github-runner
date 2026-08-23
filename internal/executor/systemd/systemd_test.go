@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,35 @@ func newExecutor(t *testing.T) (*Executor, *fakeCommander, paths.Layout) {
 	e := New(layout, "/usr/local/bin/runner-fleet", "runner-fleet",
 		WithCommander(cmd), WithUnitPath(layout.Etc+"/gh-runner@.service"))
 	return e, cmd, layout
+}
+
+// newExecutorWithCgroupRoot is newExecutor with the kernel's memory accounting
+// pointed at a directory the test owns, so that what Usage reads is what the
+// test wrote and not whatever the machine running it has mounted.
+func newExecutorWithCgroupRoot(t *testing.T) (*Executor, *fakeCommander, string) {
+	t.Helper()
+	layout := paths.Under(t.TempDir())
+	if err := layout.EnsureDirs(paths.CurrentOwner()); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	cmd := &fakeCommander{output: map[string]string{}}
+	e := New(layout, "/usr/local/bin/runner-fleet", "runner-fleet",
+		WithCommander(cmd), WithUnitPath(layout.Etc+"/gh-runner@.service"),
+		WithCgroupRoot(root))
+	return e, cmd, root
+}
+
+// writeCgroupStats lays out one unit's memory.stat under a cgroup root.
+func writeCgroupStats(t *testing.T, root, controlGroup, body string) {
+	t.Helper()
+	dir := filepath.Join(root, controlGroup)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "memory.stat"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // newExecutorAt is newExecutor with a clock that does not move, for the tests
@@ -736,6 +766,95 @@ func TestUsageSkipsWhatSystemdCannotAccountFor(t *testing.T) {
 	}
 	if len(usage) != 1 || usage[0].MemoryBytes != 0 || usage[0].CPUPercent != nil {
 		t.Fatalf("want the runner listed with nothing measured: %+v", usage)
+	}
+}
+
+// A machine is reported the way a container is: the charge, less the file cache
+// the kernel would drop rather than run out.
+//
+// This matters more for a machine than for a container, and the reason is in
+// the QEMU command line. The disk is opened cache=writeback, so every block a
+// guest reads to boot is host page cache — charged to the unit's cgroup, and
+// counted by MemoryCurrent. A freshly booted machine that has done nothing at
+// all therefore reports the better part of a gigabyte, most of which the kernel
+// would hand back the moment anything asked.
+//
+// The container executor has always taken this out; see
+// TestUsageSubtractsThePageCacheFromMemory in the docker package, which is the
+// same assertion against the same helper. The two runtimes appear side by side
+// in one table under one heading, so a difference here is not an inaccuracy in
+// one column — it is two columns that cannot be compared, which is worse,
+// because the table invites exactly that comparison.
+func TestUsageSubtractsThePageCacheFromMemory(t *testing.T) {
+	e, cmd, root := newExecutorWithCgroupRoot(t)
+	if err := e.Create(context.Background(), testSpec("web-1")); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show --timestamp=unix --property=Id,MemoryCurrent"] =
+		"Id=gh-runner@web-1.service\nMemoryCurrent=1073741824\nCPUUsageNSec=1\n" +
+			"ControlGroup=/system.slice/system-gh\\x2drunner.slice/gh-runner@web-1.service\n"
+	writeCgroupStats(t, root, "/system.slice/system-gh\\x2drunner.slice/gh-runner@web-1.service",
+		"anon 402653184\nfile 536870912\ninactive_file 536870912\nslab 1048576\n")
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 {
+		t.Fatalf("got %v", usage)
+	}
+	if usage[0].MemoryBytes != 536870912 {
+		t.Fatalf("memory: got %d, want 536870912 — a gigabyte charged, half of it "+
+			"the qcow2 this machine booted from", usage[0].MemoryBytes)
+	}
+}
+
+// cgroup v1 puts the same figure behind a controller directory and under a
+// different name. Both are read, so a host on either kernel gets the same
+// answer rather than one of them quietly reporting its cache as memory.
+func TestUsageUnderstandsBothCgroupVersions(t *testing.T) {
+	e, cmd, root := newExecutorWithCgroupRoot(t)
+	if err := e.Create(context.Background(), testSpec("web-1")); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show --timestamp=unix --property=Id,MemoryCurrent"] =
+		"Id=gh-runner@web-1.service\nMemoryCurrent=1000\nCPUUsageNSec=1\n" +
+			"ControlGroup=/system.slice/gh-runner@web-1.service\n"
+	writeCgroupStats(t, filepath.Join(root, "memory"), "/system.slice/gh-runner@web-1.service",
+		"total_inactive_file 400\n")
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 || usage[0].MemoryBytes != 600 {
+		t.Fatalf("the v1 hierarchy was not read: %+v", usage)
+	}
+}
+
+// A cgroup that cannot be read is not a runner that cannot be reported.
+//
+// It happens ordinarily: a unit systemd has just stopped keeps its ControlGroup
+// property for a moment after the directory is gone, and a daemon that cannot
+// see the host's hierarchy at all never has one. Reporting the raw charge is
+// the number this gave before any of this existed — too large, and far better
+// than a machine vanishing from the page, or one shown as using nothing.
+func TestUsageStillReportsAMachineWhoseCgroupCannotBeRead(t *testing.T) {
+	e, cmd, _ := newExecutorWithCgroupRoot(t)
+	if err := e.Create(context.Background(), testSpec("web-1")); err != nil {
+		t.Fatal(err)
+	}
+	cmd.output["systemctl show --timestamp=unix --property=Id,MemoryCurrent"] =
+		"Id=gh-runner@web-1.service\nMemoryCurrent=4096\nCPUUsageNSec=1\n" +
+			"ControlGroup=/system.slice/gh-runner@web-1.service\n"
+	// No memory.stat written: the directory is not there.
+
+	usage, err := e.Usage(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(usage) != 1 || usage[0].MemoryBytes != 4096 {
+		t.Fatalf("want the whole charge and a runner still on the page: %+v", usage)
 	}
 }
 

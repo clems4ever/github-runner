@@ -110,6 +110,26 @@ func QEMUArgs(o VMOptions) []string {
 		"-netdev", fmt.Sprintf("user,id=net0,hostfwd=tcp:127.0.0.1:%d-:22", o.SSHPort),
 		"-device", "virtio-net-pci,netdev=net0",
 		"-device", "virtio-rng-pci",
+		// A balloon, for one reason: so the guest can give memory back.
+		//
+		// Guest RAM is faulted in on demand — there is no -mem-prealloc above,
+		// so -m is a ceiling and not a reservation — but without this nothing
+		// ever goes the other way. Every page the guest touches once is a host
+		// page QEMU holds until it exits, so a job that links something large
+		// leaves its peak resident for the rest of the machine's life: free
+		// inside the guest, and still charged to the host. On a box running
+		// several pools that is the difference between a fleet that settles
+		// after a busy morning and one that only settles when the machines are
+		// replaced.
+		//
+		// free-page-reporting is the half of virtio-balloon that needs nothing
+		// watching it. The guest volunteers pages it has already freed and the
+		// host drops them; nobody inflates the balloon, so nothing here can
+		// take memory away from a job in flight. It reports free pages and only
+		// free pages — the guest's page cache is not free, so the ~1 GiB a
+		// booted machine sits at is not what this recovers. What it recovers is
+		// the peak afterwards.
+		"-device", "virtio-balloon,free-page-reporting=on",
 		"-display", "none",
 		"-serial", "file:" + o.Console,
 		// The monitor is how the agent asks for a clean shutdown: an ACPI

@@ -336,9 +336,9 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 //
 // The memory figure is deliberately not "usage": that includes the page cache,
 // so a container that has read a large repository reports most of its limit
-// used and looks about to die. Docker's own CLI subtracts the inactive file
-// cache before printing, and so does this — under both names the two cgroup
-// versions give it.
+// used and looks about to die. resources.WorkingSet is where that is taken out,
+// and it lives there rather than here because the machine executor has to do
+// the identical thing to the identical number — see its own Usage.
 type containerStats struct {
 	CPU struct {
 		Usage struct {
@@ -352,17 +352,7 @@ type containerStats struct {
 }
 
 func (s containerStats) memory() int64 {
-	used := s.Memory.Usage
-	for _, key := range []string{"inactive_file", "total_inactive_file"} {
-		if cache, ok := s.Memory.Stats[key]; ok {
-			used -= cache
-			break
-		}
-	}
-	if used < 0 {
-		return 0
-	}
-	return used
+	return resources.WorkingSet(s.Memory.Usage, s.Memory.Stats)
 }
 
 // Usage reports what each container runner is consuming.

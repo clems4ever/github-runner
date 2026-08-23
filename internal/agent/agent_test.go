@@ -157,6 +157,33 @@ func TestQEMUArgs(t *testing.T) {
 	}
 }
 
+// Guest memory is a ratchet without this, and a silent one.
+//
+// -m is a ceiling rather than a reservation — there is no -mem-prealloc — so a
+// machine only takes what its guest touches. But nothing gives it back: a page
+// the guest touches once is a host page QEMU holds until it exits, so the peak
+// of the heaviest job a machine ever ran stays resident for the rest of that
+// machine's life. free-page-reporting is the guest volunteering pages it has
+// freed so the host can drop them.
+//
+// Spelled out here because losing it costs nothing that any test would notice —
+// every machine still boots, every job still passes, and the host simply
+// creeps.
+func TestMachinesCanGiveMemoryBack(t *testing.T) {
+	args := strings.Join(QEMUArgs(VMOptions{Name: "web-1", CPUs: 2, MemoryMB: 4096}), " ")
+
+	if !strings.Contains(args, "virtio-balloon,free-page-reporting=on") {
+		t.Errorf("no balloon reporting free pages, so this machine will never return "+
+			"memory to the host:\n%s", args)
+	}
+	// And nothing that would inflate it. The balloon is here to receive what the
+	// guest offers, not to squeeze a machine with a job on it — taking memory
+	// from underneath a compiler is how a passing job becomes an OOM kill.
+	if strings.Contains(args, "deflate-on-oom") || strings.Contains(args, "-balloon ") {
+		t.Errorf("the balloon is being driven, not just listening:\n%s", args)
+	}
+}
+
 func TestImageNameChangesWithItsContents(t *testing.T) {
 	base := ImageSpec{Variant: "default"}
 	same := ImageSpec{Variant: "default"}
