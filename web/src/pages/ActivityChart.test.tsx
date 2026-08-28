@@ -41,6 +41,8 @@ const pool = (name: string): Pool => ({
   memoryMb: 4096,
   diskGb: 40,
   image: 'default',
+  packages: [],
+  recipe: '',
   credentialId: 1,
   enabled: true,
   createdAt: '',

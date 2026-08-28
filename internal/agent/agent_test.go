@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -493,5 +494,184 @@ func TestAMachineHasNoMintedToken(t *testing.T) {
 	}
 	if got := c.RegistrationToken(); got != "" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// The recipe is part of what the image is, not a step that runs on top of one.
+// An image built from a different recipe is a different image, and one built
+// from the same recipe is the same image — which is what makes editing the
+// field rebuild once rather than every pass, and leaving it alone rebuild
+// nothing.
+func TestTheImageNameCoversTheRecipe(t *testing.T) {
+	plain := ImageSpec{Variant: "default"}
+	withRecipe := ImageSpec{Variant: "default", Recipe: "echo hello\n"}
+	edited := ImageSpec{Variant: "default", Recipe: "echo goodbye\n"}
+
+	if withRecipe.Name() == plain.Name() {
+		t.Fatal("a recipe left the image called what it was called without one")
+	}
+	if withRecipe.Name() == edited.Name() {
+		t.Fatal("two different recipes named the same image")
+	}
+	if withRecipe.Name() != (ImageSpec{Variant: "default", Recipe: "echo hello\n"}).Name() {
+		t.Fatal("the same recipe named two images")
+	}
+	// And a pool that has no recipe is left exactly where it was, so upgrading
+	// the daemon does not rebuild an image for a fleet that changed nothing.
+	if plain.Name() != (ImageSpec{Variant: "default", Recipe: ""}).Name() {
+		t.Fatal("an empty recipe is not the same as no recipe")
+	}
+}
+
+func TestBuildUserDataRunsThePoolsRecipe(t *testing.T) {
+	data := buildUserData(ImageSpec{Variant: "runyard", Recipe: "install-the-toolchain\n"}, "ssh-ed25519 KEY")
+
+	for _, want := range []string{
+		"path: " + recipePath,
+		"install-the-toolchain",
+		// Run by the build script, after the base provisioning.
+		"if [ -x " + recipePath + " ]",
+	} {
+		if !strings.Contains(data, want) {
+			t.Errorf("the build configuration is missing %q:\n%s", want, data)
+		}
+	}
+
+	// And the order: a recipe that ran before the packages were in would be a
+	// recipe that cannot use them.
+	provisioning := strings.Index(data, "/usr/local/bin/provision.sh\n")
+	recipe := strings.Index(data, "if [ -x "+recipePath+" ]")
+	if provisioning < 0 || recipe < 0 || recipe < provisioning {
+		t.Error("the recipe does not run after the base provisioning")
+	}
+}
+
+// A pool with no recipe must produce a document with no recipe in it, rather
+// than an empty file the build script would try to run.
+func TestBuildUserDataWithoutARecipe(t *testing.T) {
+	data := buildUserData(ImageSpec{Variant: "default"}, "ssh-ed25519 KEY")
+	if strings.Contains(data, "path: "+recipePath) {
+		t.Errorf("an empty recipe was written into the image anyway:\n%s", data)
+	}
+}
+
+// The failure this exists for: a script that exits non-zero never reaches the
+// power-off that tells the host the build is over, so the host waits on a
+// machine that is already dead until the stale-lock timer fires. Ours changed
+// twice a year and could be read; a recipe is somebody else's shell.
+func TestTheBuildPowersOffEvenWhenItFails(t *testing.T) {
+	script := buildScript()
+
+	for _, want := range []string{"trap finish EXIT", "systemctl poweroff --no-block", "set -euo pipefail"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("the build script is missing %q", want)
+		}
+	}
+	// The power-off has to be in the trap. At the end of the script it is
+	// exactly what it was before: unreachable on the path that needs it.
+	trap := strings.Index(script, "finish() {")
+	poweroff := strings.Index(script, "systemctl poweroff")
+	closing := strings.Index(script, "trap finish EXIT")
+	if trap < 0 || poweroff < trap || poweroff > closing {
+		t.Error("the power-off is outside the trap, so a failed build still hangs")
+	}
+	// And it says which it was, on the console, which is all the host can see.
+	for _, marker := range []string{ImageReadyMarker, ImageFailedMarker} {
+		if !strings.Contains(script, marker) {
+			t.Errorf("the build never says %q, so the host cannot tell what happened", marker)
+		}
+	}
+}
+
+// A guest that powered off is not a guest that succeeded: it powers off when
+// its recipe fails too. Publishing an image on the strength of a clean exit is
+// how a half-provisioned disk becomes what every job in the pool boots.
+func TestABuildIsOnlyDoneWhenItSaysSo(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		log  string
+		want bool
+	}{
+		{"finished", "cloud-init ran\n" + ImageReadyMarker + "\n", true},
+		{"failed", "cloud-init ran\n" + ImageFailedMarker + "\nthe image build failed with status 1\n", false},
+		{"stopped saying nothing", "cloud-init ran\n", false},
+		{"no console at all", "", false},
+	} {
+		if got := buildSucceeded([]byte(tc.log)); got != tc.want {
+			t.Errorf("%s: buildSucceeded = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The console is the only account of what a recipe did, and the directory it
+// is written in is deleted as the build returns. The error used to name a file
+// that no longer existed.
+func TestAFailedBuildsConsoleOutlivesIt(t *testing.T) {
+	work := t.TempDir()
+	images := t.TempDir()
+	console := filepath.Join(work, "console.log")
+	if err := os.WriteFile(console, []byte("the recipe said no\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	read, saved := keepBuildConsole(console, images)
+	if !strings.Contains(string(read), "the recipe said no") {
+		t.Fatalf("the console was read as %q", read)
+	}
+	if err := os.RemoveAll(work); err != nil {
+		t.Fatal(err)
+	}
+
+	kept, err := os.ReadFile(saved)
+	if err != nil {
+		t.Fatalf("the console the error names is not there: %v", err)
+	}
+	if !strings.Contains(string(kept), "the recipe said no") {
+		t.Fatalf("the console was kept but says %q", kept)
+	}
+}
+
+func TestConfigCarriesWhatTheImageBakesIn(t *testing.T) {
+	recipe := "#!/usr/bin/env bash\nset -euo pipefail\ninstall-the-toolchain\n"
+	for key, value := range map[string]string{
+		"FLEET_RUNNER":          "web-1",
+		"FLEET_URL":             "https://github.com/o/r",
+		"FLEET_SCOPE":           "o/r",
+		"FLEET_CREDENTIAL_FILE": "/run/runner-fleet/credentials/1",
+		"FLEET_PACKAGES":        "nftables,conntrack",
+		"FLEET_RECIPE_BASE64":   base64.StdEncoding.EncodeToString([]byte(recipe)),
+	} {
+		t.Setenv(key, value)
+	}
+
+	c, err := ConfigFromEnv("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(c.Packages, ",") != "nftables,conntrack" {
+		t.Fatalf("packages are %v", c.Packages)
+	}
+	if c.Recipe != recipe {
+		t.Fatalf("the recipe arrived as %q", c.Recipe)
+	}
+}
+
+// A recipe that cannot be decoded is an error, not an empty recipe. Carrying
+// on would build an image missing everything the pool asked to bake in, boot
+// it, and run jobs on it — green until the first job that needed what is not
+// there, by which time nobody is looking at this.
+func TestAnUndecodableRecipeStopsTheRunner(t *testing.T) {
+	for key, value := range map[string]string{
+		"FLEET_RUNNER":          "web-1",
+		"FLEET_URL":             "https://github.com/o/r",
+		"FLEET_SCOPE":           "o/r",
+		"FLEET_CREDENTIAL_FILE": "/run/runner-fleet/credentials/1",
+		"FLEET_RECIPE_BASE64":   "this is not base64 !!",
+	} {
+		t.Setenv(key, value)
+	}
+
+	if _, err := ConfigFromEnv(""); err == nil {
+		t.Fatal("a runner started with a recipe it could not read, and would have built an image without it")
 	}
 }

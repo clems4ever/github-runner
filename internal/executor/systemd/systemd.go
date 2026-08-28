@@ -10,6 +10,7 @@ package systemd
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/exec"
@@ -143,7 +144,7 @@ func (e *Executor) Runtime() model.Runtime { return model.RuntimeVM }
 // the old image are then no longer what the pool asked for, and are replaced
 // gracefully, which is the whole reason the reconciler asks.
 func (e *Executor) Recipe(pool model.Pool) string {
-	return agent.ImageSpec{Variant: pool.Image}.Name()
+	return agent.ImageSpec{Variant: pool.Image, Packages: pool.Packages, Recipe: pool.Recipe}.Name()
 }
 
 // EnsureUnit writes the template unit and reloads systemd if it changed.
@@ -370,6 +371,17 @@ func RenderEnv(spec reconcile.Spec, layout paths.Layout) string {
 	fmt.Fprintf(&b, "FLEET_MEMORY_MB=%d\n", spec.MemoryMB)
 	fmt.Fprintf(&b, "FLEET_DISK_GB=%d\n", spec.DiskGB)
 	fmt.Fprintf(&b, "FLEET_IMAGE=%s\n", spec.Image)
+	if len(spec.Packages) > 0 {
+		fmt.Fprintf(&b, "FLEET_PACKAGES=%s\n", strings.Join(spec.Packages, ","))
+	}
+	// Base64, and not because a recipe is secret — it is not, and anyone who
+	// can read this file can read the credential path beside it. It is because
+	// a recipe is a shell script with newlines in it, and this file is parsed
+	// a line at a time by systemd on the way in and by the daemon's own
+	// readEnv on the way back out. One encoded line cannot break either.
+	if spec.Recipe != "" {
+		fmt.Fprintf(&b, "FLEET_RECIPE_BASE64=%s\n", base64.StdEncoding.EncodeToString([]byte(spec.Recipe)))
+	}
 	// The token itself is never in here. This points at a file on tmpfs that
 	// the daemon rewrites, so the credential never reaches a disk and a runner
 	// can still mint a registration token on its own after a reboot.

@@ -36,6 +36,8 @@ function pool(over: Partial<Pool>): Pool {
     memoryMb: 4096,
     diskGb: 0,
     image: 'default',
+    packages: [],
+    recipe: '',
     credentialId: 3,
     enabled: true,
     createdAt: '',

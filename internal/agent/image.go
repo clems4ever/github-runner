@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -18,6 +19,16 @@ func cloudImageURL() string {
 // goldenSizeGB is how big the golden image is grown before provisioning. A
 // machine's own disk is an overlay on this and can be larger, never smaller.
 const goldenSizeGB = 20
+
+// buildTimeout bounds one image build.
+//
+// A build that fails now says so and powers off, but one that HANGS says
+// nothing — a recipe waiting on a prompt, a download against a host that
+// accepted the connection and then went quiet. Without a deadline that is a
+// machine burning two vCPU until somebody notices, and a pool that never gets
+// a runner. Under the stale-lock timer, so the build that is still holding the
+// lock is the one that gives up first.
+const buildTimeout = 40 * time.Minute
 
 // EnsureImage returns the golden image for a spec, building it if this host
 // does not have it yet.
@@ -51,6 +62,9 @@ func EnsureImage(ctx context.Context, spec ImageSpec, imagesDir, publicKey strin
 
 	log.Info("building the golden image; this takes a few minutes and happens once per host",
 		"image", filepath.Base(golden))
+
+	ctx, cancel := context.WithTimeout(ctx, buildTimeout)
+	defer cancel()
 
 	work := filepath.Join(imagesDir, "build")
 	if err := os.RemoveAll(work); err != nil {
@@ -100,10 +114,31 @@ func EnsureImage(ctx context.Context, spec ImageSpec, imagesDir, publicKey strin
 	if err != nil {
 		return "", err
 	}
-	if err := cmd.Wait(); err != nil {
-		if ignoreCleanExit(err) != nil {
-			return "", fmt.Errorf("the image build failed; the console is at %s: %w", options.Console, err)
-		}
+	waitErr := cmd.Wait()
+
+	// Read and kept before the working directory goes, because the console is
+	// the only account of what happened inside the machine and the errors
+	// below both name it and read it. It used to name a file this function had
+	// already deleted.
+	console, saved := keepBuildConsole(options.Console, imagesDir)
+
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("the image build did not finish within %s; the console is at %s: %w",
+			buildTimeout, saved, ctx.Err())
+	}
+	if waitErr != nil && ignoreCleanExit(waitErr) != nil {
+		return "", fmt.Errorf("the image build failed; the console is at %s: %w", saved, waitErr)
+	}
+
+	// A guest that powered off is not a guest that succeeded. It powers off
+	// when its recipe fails too — deliberately, so a failure is not a hang —
+	// and it would power off if something inside it panicked. The marker on
+	// the console is the build saying it got to the end, and without it a
+	// half-provisioned image would be published and booted by every job in the
+	// pool.
+	if !buildSucceeded(console) {
+		return "", fmt.Errorf("the image build did not report that it finished; the console is at %s "+
+			"(a recipe that exits non-zero fails the build)", saved)
 	}
 
 	// Published only once the guest has powered itself off, so an interrupted
@@ -113,6 +148,32 @@ func EnsureImage(ctx context.Context, spec ImageSpec, imagesDir, publicKey strin
 	}
 	log.Info("golden image ready", "image", filepath.Base(golden))
 	return golden, nil
+}
+
+// buildSucceeded reports whether the guest said it finished. A console that
+// could not be read says nothing, and nothing is not success.
+func buildSucceeded(console []byte) bool {
+	return bytes.Contains(console, []byte(ImageReadyMarker))
+}
+
+// keepBuildConsole reads a finished build's console and copies it somewhere it
+// will still exist when somebody reads the error, returning both. The working
+// directory it came from is removed as EnsureImage returns.
+//
+// Beside the images rather than with the runners' consoles, because it is
+// about an image and not about a runner, and because a failed build has no
+// runner to file it under. Best effort: if the copy cannot be made, the
+// original path is still the most useful thing to name.
+func keepBuildConsole(console, imagesDir string) ([]byte, string) {
+	out, err := os.ReadFile(console)
+	if err != nil {
+		return nil, console
+	}
+	saved := filepath.Join(imagesDir, "last-build-console.log")
+	if err := os.WriteFile(saved, out, 0o600); err != nil {
+		return out, console
+	}
+	return out, saved
 }
 
 // lock takes an exclusive lock, waiting for whoever holds it.

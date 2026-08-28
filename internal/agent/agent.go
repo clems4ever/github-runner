@@ -79,7 +79,7 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 		return err
 	}
 
-	spec := ImageSpec{Variant: c.Image}
+	spec := ImageSpec{Variant: c.Image, Packages: c.Packages, Recipe: c.Recipe}
 	golden, err := EnsureImage(ctx, spec, filepath.Join(c.StateDir, "images"), publicKey, log)
 	if err != nil {
 		return err

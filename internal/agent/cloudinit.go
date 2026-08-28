@@ -49,6 +49,11 @@ var basePackages = []string{
 type ImageSpec struct {
 	Variant  string // the pool's image field: "default", or a name of its own
 	Packages []string
+	// Recipe is the pool's own provisioning, run as root in the build machine
+	// after the packages are in and the base provisioning has finished. It is
+	// for what apt cannot give: a toolchain at a version no archive carries, a
+	// pinned linter, a warm build cache.
+	Recipe string
 }
 
 // provision is the script an image is built with, as a variable so that a test
@@ -72,6 +77,11 @@ func (s ImageSpec) Name() string {
 	h.Write([]byte(UbuntuRelease))
 	h.Write([]byte(RunnerVersion))
 	h.Write([]byte(provision()))
+	h.Write([]byte(buildScript()))
+	// The pool's own provisioning is part of the image's identity for exactly
+	// the reason the script above is: editing it has to produce a different
+	// image, or the edit ships and the host goes on booting the old one.
+	h.Write([]byte(s.Recipe))
 	for _, pkg := range s.EffectivePackages() {
 		h.Write([]byte(pkg))
 		h.Write([]byte{0})
@@ -125,14 +135,86 @@ write_files:
     owner: 'root:root'
     content: |
 %s
+%s
+  - path: /usr/local/bin/build.sh
+    permissions: '0755'
+    owner: 'root:root'
+    content: |
+%s
 
 runcmd:
-  - [ /usr/local/bin/provision.sh ]
-`, publicKey, packages.String(), indent(provisionScript(), "      "))
+  - [ /usr/local/bin/build.sh ]
+`, publicKey, packages.String(), indent(provisionScript(), "      "),
+		recipeFile(spec.Recipe), indent(buildScript(), "      "))
 }
 
-// provisionScript runs inside the build VM. It ends by powering the machine
-// off, which is how the builder knows it finished rather than hung.
+// recipeFile is the pool's own provisioning as a write_files entry, or nothing
+// at all when the pool has none — which is the case that has to keep producing
+// exactly the document it produced before this existed.
+func recipeFile(recipe string) string {
+	if recipe == "" {
+		return ""
+	}
+	return fmt.Sprintf(`
+  - path: %s
+    permissions: '0755'
+    owner: 'root:root'
+    content: |
+%s
+`, recipePath, indent(recipe, "      "))
+}
+
+// recipePath is where a pool's recipe lands inside the build machine.
+const recipePath = "/usr/local/bin/recipe.sh"
+
+// Console markers. The host cannot look inside the disk a build is writing —
+// it is a qcow2 nobody has mounted — so the serial console is the whole of
+// what it knows. A build that does not say it finished did not finish.
+const (
+	ImageReadyMarker  = "runner-fleet: image ready"
+	ImageFailedMarker = "runner-fleet: image build failed"
+)
+
+// buildScript is what cloud-init actually runs: the base provisioning, then
+// the pool's recipe if it has one, and a power-off either way.
+//
+// The power-off is in a trap rather than at the end for one reason. Powering
+// off is how the host learns a build is over, and before this a script that
+// exited non-zero never reached it — the machine sat at a login prompt and the
+// host waited on a build that was already dead, for as long as the stale-lock
+// timer takes. That was survivable while the script was ours and changed twice
+// a year. A recipe is somebody else's shell, edited in a text box.
+func buildScript() string {
+	return fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+
+finish() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo '%[2]s' > /dev/console
+    echo "the image build failed with status $status" > /dev/console
+  fi
+  systemctl poweroff --no-block
+}
+trap finish EXIT
+
+/usr/local/bin/provision.sh
+
+if [ -x %[3]s ]; then
+  echo "running this pool's recipe" > /dev/console
+  %[3]s
+fi
+
+# Written last and read by nothing inside the machine: it is here so that a
+# disk can be told apart from one a half-finished build left behind.
+touch /var/lib/runner-fleet-image-ready
+echo '%[1]s' > /dev/console
+`, ImageReadyMarker, ImageFailedMarker, recipePath)
+}
+
+// provisionScript is the base provisioning every image gets, run inside the
+// build machine. What comes after it — the pool's own recipe, the readiness
+// marker and the power-off — is buildScript's.
 func provisionScript() string {
 	return fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
@@ -201,10 +283,6 @@ do
   systemctl disable "$unit" 2>/dev/null || true
 done
 apt-get clean
-
-touch /var/lib/runner-fleet-image-ready
-# Powering off is the signal that the build finished.
-systemctl poweroff --no-block
 `, RunnerVersion)
 }
 

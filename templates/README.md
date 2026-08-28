@@ -55,7 +55,8 @@ jobs:
 be something it is not.
 
 One thing to know before importing it: a machine pool builds a golden image the
-first time it needs one, and the image is a hash of its package list. The list
+first time it needs one, and the image is a hash of everything it is built from
+— the package list, and now the build script and the pool's recipe too. The list
 gained `shellcheck` when the `installer` job moved onto the fleet, so the first
 machine after upgrading spends a few minutes building an image before its runner
 appears. That happens once.
@@ -82,6 +83,8 @@ appears. That happens once.
       "memoryMb": 4096,
       "diskGb": 40,
       "image": "default",
+      "packages": ["nftables", "conntrack"],
+      "recipe": "#!/usr/bin/env bash\nset -euo pipefail\ncurl -fsSL https://example.invalid/tool | tar -C /usr/local -xz\n",
       "enabled": true
     }
   ]
@@ -94,7 +97,15 @@ Everything else takes the same default as the editor, except that a pool is
 enabled and ephemeral unless it says otherwise — a template that said nothing
 and imported a fleet switched off would be a surprise.
 
-`diskGb` applies to machines only; containers have no disk of their own.
+`diskGb` applies to machines only; containers have no disk of their own, and so
+do `packages` and `recipe` — a container pool names a prebuilt image instead,
+and an import that gives it either is refused rather than quietly dropping them.
+
+`recipe` is a shell script in a JSON string, which means its newlines are `\n`.
+That is a poor way to write one and a fine way to move one: author it in the
+pool editor, export the template, and the file that comes out is the pool that
+went in. It is stored and exported in the clear — a template is something people
+paste into issues, so nothing in a recipe should be secret.
 
 Every template in this directory is imported by the test suite
 (`internal/template` and `internal/api`), so one that stops working fails the

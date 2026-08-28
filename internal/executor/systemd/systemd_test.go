@@ -2,6 +2,7 @@ package systemd
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -893,5 +894,87 @@ func TestPropertiesAreMatchedByNameNotByPosition(t *testing.T) {
 	}
 	if len(usage) != 1 || usage[0].Name != "web-2" || usage[0].MemoryBytes != 512 {
 		t.Fatalf("the answer landed on the wrong runner: %+v", usage)
+	}
+}
+
+// A recipe is a shell script and this file is parsed a line at a time — by
+// systemd on the way in, and by the daemon's own readEnv on the way back out.
+// Encoded, it is one line whichever way it is read.
+func TestTheEnvironmentFileCarriesWhatTheImageBakesIn(t *testing.T) {
+	_, _, layout := newExecutor(t)
+
+	spec := testSpec("web-1")
+	spec.Packages = []string{"nftables", "conntrack"}
+	spec.Recipe = "#!/usr/bin/env bash\nset -euo pipefail\necho hello\n"
+
+	env := RenderEnv(spec, layout)
+	if !strings.Contains(env, "FLEET_PACKAGES=nftables,conntrack") {
+		t.Errorf("the package list is missing:\n%s", env)
+	}
+
+	var encoded string
+	for _, line := range strings.Split(env, "\n") {
+		if value, ok := strings.CutPrefix(line, "FLEET_RECIPE_BASE64="); ok {
+			encoded = value
+		}
+	}
+	if encoded == "" {
+		t.Fatalf("the recipe is missing:\n%s", env)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("the recipe did not survive the environment file: %v", err)
+	}
+	if string(decoded) != spec.Recipe {
+		t.Fatalf("the recipe came back as %q", decoded)
+	}
+	// The point of encoding it: no line of the file is part of the script.
+	if strings.Contains(env, "echo hello") {
+		t.Fatalf("the recipe was written as itself, so its newlines are now the file's:\n%s", env)
+	}
+}
+
+// A pool with nothing extra writes the file it wrote before either field
+// existed, so upgrading does not change what every runner is built from.
+func TestAPoolThatBakesNothingWritesNothingExtra(t *testing.T) {
+	_, _, layout := newExecutor(t)
+
+	env := RenderEnv(testSpec("web-1"), layout)
+	for _, unwanted := range []string{"FLEET_PACKAGES", "FLEET_RECIPE_BASE64"} {
+		if strings.Contains(env, unwanted) {
+			t.Errorf("%s was written for a pool that asked for nothing:\n%s", unwanted, env)
+		}
+	}
+}
+
+// What makes an edit reach the fleet. The reconciler replaces runners whose
+// recipe no longer matches their pool's, so a recipe that did not change the
+// image's name would be a recipe that shipped and did nothing — which is the
+// bug the image name was made to cover in the first place.
+func TestEditingWhatIsBakedInBuildsADifferentImage(t *testing.T) {
+	e, _, _ := newExecutor(t)
+
+	plain := model.Pool{Runtime: model.RuntimeVM, Image: "default"}
+	withPackages := plain
+	withPackages.Packages = []string{"ffmpeg"}
+	withRecipe := plain
+	withRecipe.Recipe = "echo hello\n"
+	edited := plain
+	edited.Recipe = "echo goodbye\n"
+
+	base := e.Recipe(plain)
+	for name, pool := range map[string]model.Pool{
+		"a package list": withPackages,
+		"a recipe":       withRecipe,
+	} {
+		if e.Recipe(pool) == base {
+			t.Errorf("%s left the image called %s, so the host would keep booting the old one", name, base)
+		}
+	}
+	if e.Recipe(withRecipe) == e.Recipe(edited) {
+		t.Error("two different recipes named the same image")
+	}
+	if e.Recipe(plain) != e.Recipe(model.Pool{Runtime: model.RuntimeVM, Image: "default"}) {
+		t.Error("the same pool named two images, so every pass would rebuild")
 	}
 }

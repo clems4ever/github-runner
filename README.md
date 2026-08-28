@@ -70,6 +70,7 @@ A pool named `web` with a maximum of three gives you `web-1`, `web-2` and
 | **Maximum runners** | how far it may grow under load; equal to the minimum for a fixed size |
 | **Labels** | what a workflow targets with `runs-on` |
 | **Size** | vCPUs, memory, and disk for VM pools |
+| **Image** | for VM pools, what is baked into it: extra packages and a recipe |
 
 Every runner also registers with labels describing what it is — `vm` or
 `container`, plus `nestedvirt` and `ephemeral` when they apply — so a workflow
@@ -91,6 +92,50 @@ the label is part of what a runner is built from, so each is replaced with a
 correctly labelled one as it finishes its current job.
 
 ![The pool editor](docs/img/pool-editor.png)
+
+### What a machine pool bakes in
+
+A machine boots from a golden image built once on the host, and every runner in
+the pool is a copy-on-write overlay on it. Anything already in that image costs
+a job nothing; anything a job installs, it installs again on the next job, and
+on every job after that.
+
+Two fields decide what is in it. **Extra packages** are apt packages, added to
+the ones every runner gets. A **recipe** is a shell script run as root while the
+image is built, after the packages are in — for what apt cannot give: a
+toolchain at a version no archive carries, a linter pinned to the version the
+project is linted with, a warm build cache.
+
+```bash
+# Go, at the version go.mod declares, in the layout actions/setup-go looks in
+# — so the step finds it and does nothing.
+GO_VERSION=1.25.0
+install -d /opt/hostedtoolcache/go/${GO_VERSION}
+curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" | tar -xz -C /tmp
+mv /tmp/go /opt/hostedtoolcache/go/${GO_VERSION}/x64
+touch /opt/hostedtoolcache/go/${GO_VERSION}/x64.complete
+```
+
+An image is named by everything it is built from — the release, the runner
+version, the build script, the package list and the recipe — so the two fields
+behave the way anyone editing them would hope:
+
+- change either, and the next machine builds a new image and the pool's runners
+  are replaced as they finish their jobs
+- change them back, and the old image is almost certainly still on the host, so
+  nothing is rebuilt
+- leave them alone, and no machine ever rebuilds anything
+
+The recipe runs as root in a throwaway machine with no credential in it, and
+what it writes is a disk every job in the pool will boot. It is not a place for
+secrets: it is stored in the clear, and it ends up in an image any job can read.
+
+A build that fails says so and stops — a recipe that exits non-zero fails the
+build, and the pool keeps running the image it already had. The console of the
+last failed build is kept at `/var/lib/runner-fleet/images/last-build-console.log`,
+which is where a recipe that did not work explains itself. Both fields are for
+machine pools; a container pool names a prebuilt image in its image field
+instead, and is refused these rather than quietly ignoring them.
 
 ### Templates
 
@@ -551,11 +596,10 @@ that drive the daemon over HTTP against a real database. Booting a guest needs
 
 ## Roadmap
 
-**Per-repository images.** A repository's toolchain baked into its own image, so
-a job does not pay for the install every time. The pieces are already in place:
-a pool carries an image field, image names are content-addressed by their
-package list, and container pools can already name any image. What is missing is
-letting a pool carry a package list and building the variant on demand.
+**Prebuilt images.** A pool builds its image on the host that needs it, once.
+That is the right trade for one host and the wrong one for ten, which would each
+spend the same minutes building the same disk. A pool naming an image by URL and
+digest would let CI build it once and every host pull it.
 
 ## Licence
 

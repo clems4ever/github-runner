@@ -33,21 +33,27 @@ const (
 // a pool, once per runner, so an executor never has to reach back into the
 // database.
 type Spec struct {
-	Name         string
-	Pool         string
-	PoolID       int64
-	Generation   string
-	Runtime      model.Runtime
-	URL          string
-	ScopeKind    model.ScopeKind
-	Scope        string
-	Labels       []string
-	Ephemeral    bool
-	Nested       bool
-	CPUs         int
-	MemoryMB     int
-	DiskGB       int
-	Image        string
+	Name       string
+	Pool       string
+	PoolID     int64
+	Generation string
+	Runtime    model.Runtime
+	URL        string
+	ScopeKind  model.ScopeKind
+	Scope      string
+	Labels     []string
+	Ephemeral  bool
+	Nested     bool
+	CPUs       int
+	MemoryMB   int
+	DiskGB     int
+	Image      string
+	// Packages and Recipe are what this pool bakes into its machine image on
+	// top of the base one. They travel with the spec because the agent builds
+	// the image, not the daemon — which is also what lets a machine come back
+	// after a reboot with the daemon still down.
+	Packages     []string
+	Recipe       string
 	CredentialID int64
 	// How the runner authenticates. An app's agent signs its own assertion and
 	// buys an installation token, so it needs the app id as well as the key —
@@ -282,6 +288,8 @@ func SpecsForCredential(p model.Pool, credentialFingerprint, recipe string, name
 			MemoryMB:       p.MemoryMB,
 			DiskGB:         p.DiskGB,
 			Image:          p.Image,
+			Packages:       p.Packages,
+			Recipe:         p.Recipe,
 			CredentialID:   p.CredentialID,
 			CredentialKind: secret.Kind,
 			AppID:          secret.AppID,

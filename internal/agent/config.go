@@ -9,6 +9,7 @@
 package agent
 
 import (
+	"encoding/base64"
 	"fmt"
 	"os"
 	"strconv"
@@ -21,21 +22,26 @@ import (
 // environment file the systemd executor writes and the variables the Docker
 // executor sets, and nothing else reads them.
 type Config struct {
-	Runner         string
-	Pool           string
-	Generation     string
-	URL            string
-	ScopeKind      model.ScopeKind
-	Scope          string
-	Labels         []string
-	Group          string
-	Ephemeral      bool
-	Nested         bool
-	Runtime        model.Runtime
-	CPUs           int
-	MemoryMB       int
-	DiskGB         int
-	Image          string
+	Runner     string
+	Pool       string
+	Generation string
+	URL        string
+	ScopeKind  model.ScopeKind
+	Scope      string
+	Labels     []string
+	Group      string
+	Ephemeral  bool
+	Nested     bool
+	Runtime    model.Runtime
+	CPUs       int
+	MemoryMB   int
+	DiskGB     int
+	Image      string
+	// Packages and Recipe are what this runner's pool bakes into its image on
+	// top of the base one. The agent builds the image, so it is the agent that
+	// has to know them.
+	Packages       []string
+	Recipe         string
 	CredentialFile string
 	StateDir       string
 	// How to authenticate. A GitHub App's agent signs its own assertion with
@@ -74,6 +80,20 @@ func ConfigFromEnv(name string) (Config, error) {
 	}
 	if labels := os.Getenv("FLEET_LABELS"); labels != "" {
 		c.Labels = strings.Split(labels, ",")
+	}
+	if packages := os.Getenv("FLEET_PACKAGES"); packages != "" {
+		c.Packages = strings.Split(packages, ",")
+	}
+	// A recipe that cannot be decoded is an error and not an empty recipe.
+	// Carrying on would build an image missing everything the pool asked to
+	// bake in, boot it, and run jobs on it — green until the first job that
+	// needed what is not there, and by then nobody is looking at this.
+	if encoded := os.Getenv("FLEET_RECIPE_BASE64"); encoded != "" {
+		recipe, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return c, fmt.Errorf("%s: FLEET_RECIPE_BASE64 is not valid base64: %w", c.Runner, err)
+		}
+		c.Recipe = string(recipe)
 	}
 
 	// Read once and removed from the environment here, before anything else

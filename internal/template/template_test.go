@@ -381,3 +381,74 @@ func has(labels []string, want string) bool {
 	}
 	return false
 }
+
+// A template is the portable form of a pool, and a pool whose runners have the
+// toolchain baked in is not portable without what bakes it.
+func TestATemplateCarriesWhatAPoolBakesIn(t *testing.T) {
+	recipe := "#!/usr/bin/env bash\nset -euo pipefail\ninstall-the-toolchain\n"
+	pools := []model.Pool{{
+		Name: "ci-vm", ScopeKind: model.ScopeRepository, Scope: "o/r", Runtime: model.RuntimeVM,
+		MinReplicas: 1, MaxReplicas: 3, CPUs: 4, MemoryMB: 8192, DiskGB: 40, Image: "default",
+		Packages: []string{"conntrack", "nftables"}, Recipe: recipe,
+		CredentialID: 1, Enabled: true,
+	}}
+
+	doc := Export(pools)
+	if strings.Join(doc.Pools[0].Packages, ",") != "conntrack,nftables" {
+		t.Fatalf("the export dropped the packages: %+v", doc.Pools[0])
+	}
+	if doc.Pools[0].Recipe != recipe {
+		t.Fatalf("the export changed the recipe: %q", doc.Pools[0].Recipe)
+	}
+
+	// Through JSON, which is the form it is actually moved in.
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Document
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := Apply(back, Options{CredentialID: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported[0].Recipe != recipe {
+		t.Fatalf("the recipe came back as %q", imported[0].Recipe)
+	}
+	if strings.Join(imported[0].Packages, ",") != "conntrack,nftables" {
+		t.Fatalf("the packages came back as %v", imported[0].Packages)
+	}
+}
+
+// A pool that bakes nothing exports nothing, so the templates in this
+// repository do not grow two empty fields.
+func TestATemplateOmitsWhatAPoolDoesNotBake(t *testing.T) {
+	doc := Export([]model.Pool{{
+		Name: "ci-container", ScopeKind: model.ScopeRepository, Scope: "o/r",
+		Runtime: model.RuntimeContainer, MinReplicas: 1, MaxReplicas: 1,
+		CPUs: 2, MemoryMB: 4096, Image: "default", CredentialID: 1, Enabled: true,
+	}})
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unwanted := range []string{"packages", "recipe"} {
+		if strings.Contains(string(raw), unwanted) {
+			t.Errorf("%q is in a template for a pool that has none:\n%s", unwanted, raw)
+		}
+	}
+}
+
+// A container pool cannot bake anything, and an import that says otherwise is
+// refused before anything is written rather than having the fields dropped.
+func TestImportingARecipeOntoAContainerPoolIsRefused(t *testing.T) {
+	doc := Document{Version: Version, Pools: []Pool{{
+		Name: "ci-container", Scope: "o/r", Runtime: model.RuntimeContainer,
+		Recipe: "echo hello\n",
+	}}}
+	if _, err := Apply(doc, Options{CredentialID: 1}); err == nil {
+		t.Fatal("a container pool was imported with a recipe it cannot run")
+	}
+}
