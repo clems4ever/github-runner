@@ -50,6 +50,10 @@ const (
 	MaxMemoryMB = 512 * 1024
 	MinDiskGB   = 10
 	MaxDiskGB   = 4000
+	// MaxRecipeBytes bounds a pool's image recipe. It is a shell script, not a
+	// program: something that needs more than this wants to be fetched by the
+	// recipe rather than pasted into it.
+	MaxRecipeBytes = 64 * 1024
 )
 
 var (
@@ -58,6 +62,10 @@ var (
 	poolNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}[a-z0-9]$|^[a-z0-9]$`)
 	labelRe    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$`)
 	segmentRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	// What Debian policy allows in a package name. Checked because these are
+	// interpolated into the cloud-init the image is built from, where a name
+	// with a newline in it is not a failed install but a different document.
+	packageRe = regexp.MustCompile(`^[a-z0-9][a-z0-9+.-]{1,63}$`)
 )
 
 // CredentialKind is how a credential proves who it is.
@@ -121,12 +129,24 @@ type Pool struct {
 	MinReplicas int `json:"minReplicas"`
 	// MaxReplicas is the ceiling. Equal to the minimum, the pool is a fixed
 	// size and never scales.
-	MaxReplicas  int       `json:"maxReplicas"`
-	Labels       []string  `json:"labels"`
-	CPUs         int       `json:"cpus"`
-	MemoryMB     int       `json:"memoryMb"`
-	DiskGB       int       `json:"diskGb"`
-	Image        string    `json:"image"`
+	MaxReplicas int      `json:"maxReplicas"`
+	Labels      []string `json:"labels"`
+	CPUs        int      `json:"cpus"`
+	MemoryMB    int      `json:"memoryMb"`
+	DiskGB      int      `json:"diskGb"`
+	Image       string   `json:"image"`
+	// Packages are apt packages baked into this pool's image on top of the
+	// ones every runner gets. A job that installs the same package every time
+	// pays for it every time; this is where it stops paying.
+	Packages []string `json:"packages"`
+	// Recipe is a shell script run as root while the image is built, after the
+	// packages are in. It is for everything apt cannot give: a toolchain at a
+	// version no archive carries, a pinned linter, a warm build cache.
+	//
+	// It is part of the image's identity — see the executor's Recipe — so
+	// editing it builds a new image and drains the runners built from the old
+	// one, and leaving it alone reuses what is already on the host.
+	Recipe       string    `json:"recipe"`
 	CredentialID int64     `json:"credentialId"`
 	Enabled      bool      `json:"enabled"`
 	CreatedAt    time.Time `json:"createdAt"`
@@ -350,6 +370,27 @@ func (p *Pool) Validate() error {
 			return fmt.Errorf("label %q: use letters, digits, dot, dash and underscore, up to 63 characters", label)
 		}
 	}
+
+	// Both are how a machine's image is built, and a container has no image of
+	// this kind — it names one that somebody else built. Refused rather than
+	// ignored: a pool that quietly bakes nothing is a pool whose jobs install
+	// the toolchain every time and nobody knows why.
+	if p.Runtime != RuntimeVM {
+		if len(p.Packages) > 0 {
+			return fmt.Errorf("packages are for machine pools: a container pool names a prebuilt image in its image field instead")
+		}
+		if p.Recipe != "" {
+			return fmt.Errorf("a recipe is for machine pools: a container pool names a prebuilt image in its image field instead")
+		}
+	}
+	for _, pkg := range p.Packages {
+		if !packageRe.MatchString(pkg) {
+			return fmt.Errorf("package %q: use a Debian package name — lower-case letters, digits, plus, dot and dash", pkg)
+		}
+	}
+	if len(p.Recipe) > MaxRecipeBytes {
+		return fmt.Errorf("recipe is %d bytes: the limit is %d, and a recipe that long wants to fetch what it needs rather than carry it", len(p.Recipe), MaxRecipeBytes)
+	}
 	return nil
 }
 
@@ -381,6 +422,18 @@ func (p *Pool) Defaults() {
 		p.Image = DefaultImage(p.Runtime)
 	}
 	sort.Strings(p.Labels)
+	// Sorted for the same reason the labels are: what is stored should not
+	// depend on the order somebody typed it in. The image's name does not —
+	// ImageSpec sorts and deduplicates before hashing — but a pool that reads
+	// back differently from how it was written is confusing on its own.
+	sort.Strings(p.Packages)
+	// A recipe pasted from an editor that ends its lines with CRLF would
+	// otherwise reach the build machine with a carriage return on the end of
+	// every command, where bash treats it as part of the argument: the error
+	// is "no such file or directory" naming a file that plainly exists.
+	// Normalised on the way in, so what is stored is what runs and what the
+	// image's name was computed from.
+	p.Recipe = strings.ReplaceAll(p.Recipe, "\r\n", "\n")
 }
 
 // Sample is one observation of a pool: how many runners it had and how many

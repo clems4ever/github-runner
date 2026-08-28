@@ -60,7 +60,12 @@ type Pool struct {
 	MemoryMB    int             `json:"memoryMb,omitempty"`
 	DiskGB      int             `json:"diskGb,omitempty"`
 	Image       string          `json:"image,omitempty"`
-	Enabled     *bool           `json:"enabled,omitempty"`
+	// What a machine pool bakes into its image. A template is the portable
+	// form of a pool, and a pool whose runners have the toolchain baked in is
+	// not portable without them.
+	Packages []string `json:"packages,omitempty"`
+	Recipe   string   `json:"recipe,omitempty"`
+	Enabled  *bool    `json:"enabled,omitempty"`
 }
 
 // Options are the answers the document does not carry.
@@ -174,6 +179,8 @@ func Apply(doc Document, opts Options) ([]model.Pool, error) {
 			MemoryMB:     entry.MemoryMB,
 			DiskGB:       entry.DiskGB,
 			Image:        entry.Image,
+			Packages:     entry.Packages,
+			Recipe:       entry.Recipe,
 			CredentialID: opts.CredentialID,
 			Enabled:      value(entry.Enabled, true),
 		}
@@ -217,6 +224,8 @@ func Export(pools []model.Pool) Document {
 			CPUs:        pool.CPUs,
 			MemoryMB:    pool.MemoryMB,
 			Image:       pool.Image,
+			Packages:    pool.Packages,
+			Recipe:      pool.Recipe,
 			Enabled:     &enabled,
 		}
 		// A container has no disk of its own, and a disk size on one would be
@@ -226,6 +235,9 @@ func Export(pools []model.Pool) Document {
 		}
 		if len(entry.Labels) == 0 {
 			entry.Labels = nil
+		}
+		if len(entry.Packages) == 0 {
+			entry.Packages = nil
 		}
 		doc.Pools = append(doc.Pools, entry)
 	}

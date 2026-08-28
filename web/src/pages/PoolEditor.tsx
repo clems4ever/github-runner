@@ -13,6 +13,7 @@ import {
   Switch,
   TagsInput,
   Text,
+  Textarea,
   TextInput,
 } from '@mantine/core'
 import { useForm } from '@mantine/form'
@@ -266,11 +267,42 @@ export function PoolEditor({
           </Group>
         </div>
 
+        <Divider label="Image" labelPosition="left" />
+
         <TextInput
           label="Image"
-          description="Which image these runners boot. Per-repository images will select one here."
+          description={
+            isVM
+              ? 'Names this pool\u2019s image. Two pools that bake the same thing share one; a name of its own gives this pool one of its own.'
+              : 'The container image these runners run. It has to carry the Actions runner.'
+          }
           {...form.getInputProps('image')}
         />
+
+        {/*
+          Machines only. A container does not build an image, it runs one
+          somebody else built, and the daemon refuses both of these on a
+          container pool rather than ignoring them.
+        */}
+        {isVM && (
+          <>
+            <TagsInput
+              label="Extra packages"
+              description="apt packages baked in, so a job does not install them every time"
+              placeholder="nftables, conntrack"
+              value={values.packages ?? []}
+              onChange={(value) => form.setFieldValue('packages', value)}
+            />
+            <Textarea
+              label="Recipe"
+              description="Shell, run as root while the image is built \u2014 for what apt cannot give: a pinned toolchain, a linter, a warm build cache. Editing it builds a new image and replaces this pool's runners as they finish."
+              placeholder={'curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz'}
+              rows={10}
+              styles={{ input: { fontFamily: 'var(--mantine-font-family-monospace)' } }}
+              {...form.getInputProps('recipe')}
+            />
+          </>
+        )}
 
         {refusal && (
           <Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />} title="GitHub refused this">

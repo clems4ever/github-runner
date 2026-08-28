@@ -449,7 +449,12 @@ func TestUpgradingADatabaseFromBeforeScopedHistory(t *testing.T) {
 
 	// Every migration up to but not including the scope column: the schema as
 	// it stood when samples knew only which pool they came from.
-	before := len(migrations) - 2
+	//
+	// Found by what it does rather than counted back from the end. Counting
+	// back meant that appending an unrelated migration silently moved this
+	// test to a different schema, and it then failed for a reason that had
+	// nothing to do with the change that broke it.
+	before := migrationBefore(t, "ALTER TABLE samples ADD COLUMN scope")
 	old, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
@@ -499,6 +504,19 @@ func TestUpgradingADatabaseFromBeforeScopedHistory(t *testing.T) {
 	if len(points) != 1 || points[0].Busy != 2 {
 		t.Fatalf("got %+v, want the old sample attributed to its pool's scope", points)
 	}
+}
+
+// migrationBefore is the number of migrations that ran before the one
+// containing needle, which is the schema as it stood just before it.
+func migrationBefore(t *testing.T, needle string) int {
+	t.Helper()
+	for i, statement := range migrations {
+		if strings.Contains(statement, needle) {
+			return i
+		}
+	}
+	t.Fatalf("no migration contains %q; this test builds a schema that no longer exists", needle)
+	return 0
 }
 
 func TestActivityBucketsThePeaks(t *testing.T) {
@@ -1098,5 +1116,106 @@ func TestHostHistorySurvivesAMeasurementThatFailed(t *testing.T) {
 	}
 	if len(points) != 1 || points[0].DiskPercent != 0 {
 		t.Fatalf("got %+v", points)
+	}
+}
+
+// A recipe is a shell script: newlines, quotes, commas. The labels beside it
+// are a comma-joined column, and a recipe stored the same way would come back
+// as a list of fragments.
+func TestAPoolsImageInputsSurviveTheDatabase(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	cred := credential(t, s)
+
+	p := samplePool(cred.ID)
+	p.Packages = []string{"nftables", "conntrack"}
+	p.Recipe = "#!/usr/bin/env bash\nset -euo pipefail\necho 'one, two'\n"
+
+	created, err := s.CreatePool(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := s.Pool(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(read.Packages, "|") != "conntrack|nftables" {
+		t.Fatalf("the packages came back as %v", read.Packages)
+	}
+	if read.Recipe != p.Recipe {
+		t.Fatalf("the recipe came back as %q", read.Recipe)
+	}
+
+	// And an edit reaches the database, because that is what rebuilds the image.
+	read.Recipe = "echo something else\n"
+	read.Packages = nil
+	updated, err := s.UpdatePool(ctx, read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Recipe != "echo something else\n" || len(updated.Packages) != 0 {
+		t.Fatalf("the edit did not stick: %+v", updated)
+	}
+}
+
+// Every pool that existed before these columns did has neither, which is
+// exactly what it had: the image field named a variant and the variant was
+// always built the same way. An upgrade that changed that would rebuild every
+// image on the host and replace every runner in the fleet.
+func TestUpgradingADatabaseFromBeforeImageInputs(t *testing.T) {
+	dir := t.TempDir()
+	ring, err := secrets.LoadOrCreateKey(filepath.Join(dir, "master.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "fleet.db")
+
+	before := migrationBefore(t, "ALTER TABLE pools ADD COLUMN packages")
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range append([]string{
+		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
+		fmt.Sprintf(`INSERT INTO schema_version (version) VALUES (%d)`, before),
+	}, migrations[:before]...) {
+		if _, err := old.Exec(statement); err != nil {
+			t.Fatalf("building the old schema: %v", err)
+		}
+	}
+	if _, err := old.Exec(
+		`INSERT INTO credentials (name, sealed, hint, created_at) VALUES ('pat', 'x', '…1234', '2026-01-01T00:00:00Z')`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(
+		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, replicas, labels,
+			cpus, memory_mb, disk_gb, image, credential_id, enabled, created_at, updated_at,
+			min_replicas, max_replicas)
+		 VALUES ('web','repository','acme/site','vm',0,1,3,'fast',2,4096,40,'default',1,1,
+			'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',3,3)`,
+	); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	s, err := Open(path, ring)
+	if err != nil {
+		t.Fatalf("upgrading: %v", err)
+	}
+	defer s.Close()
+
+	pools, err := s.ListPools(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pools) != 1 {
+		t.Fatalf("got %d pools", len(pools))
+	}
+	if len(pools[0].Packages) != 0 || pools[0].Recipe != "" {
+		t.Fatalf("an upgraded pool bakes something nobody asked for: %+v", pools[0])
+	}
+	if pools[0].Name != "web" || pools[0].Image != "default" || pools[0].CPUs != 2 {
+		t.Fatalf("the upgrade changed the pool: %+v", pools[0])
 	}
 }

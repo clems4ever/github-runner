@@ -318,3 +318,84 @@ func TestAPoolThatIsSwitchedOffPromisesNothing(t *testing.T) {
 		t.Fatalf("a disabled pool was counted: %+v", total)
 	}
 }
+
+// Both fields are how a machine's image is built, and a container has no image
+// of this kind — it names one somebody else built. Refused rather than ignored:
+// a pool that quietly bakes nothing is a pool whose jobs install the toolchain
+// every time and nobody knows why.
+func TestAContainerPoolCannotBakeAnything(t *testing.T) {
+	base := Pool{
+		Name: "web", ScopeKind: ScopeRepository, Scope: "o/r", Runtime: RuntimeContainer,
+		MinReplicas: 1, MaxReplicas: 1, CPUs: 2, MemoryMB: 4096, CredentialID: 1,
+	}
+
+	withPackages := base
+	withPackages.Packages = []string{"ffmpeg"}
+	if err := withPackages.Validate(); err == nil {
+		t.Error("a container pool was given a package list to bake, which it cannot")
+	}
+
+	withRecipe := base
+	withRecipe.Recipe = "echo hello\n"
+	if err := withRecipe.Validate(); err == nil {
+		t.Error("a container pool was given a recipe, which it cannot run")
+	}
+
+	// And the same pool as a machine is fine.
+	asVM := withPackages
+	asVM.Runtime = RuntimeVM
+	asVM.DiskGB = 40
+	if err := asVM.Validate(); err != nil {
+		t.Errorf("a machine pool was refused what it can do: %v", err)
+	}
+}
+
+// Package names are interpolated into the cloud-init the image is built from,
+// where a name with a newline in it is not a failed install but a different
+// document.
+func TestPackageNamesAreCheckedBeforeTheyReachTheImage(t *testing.T) {
+	pool := Pool{
+		Name: "web", ScopeKind: ScopeRepository, Scope: "o/r", Runtime: RuntimeVM,
+		MinReplicas: 1, MaxReplicas: 1, CPUs: 2, MemoryMB: 4096, DiskGB: 40, CredentialID: 1,
+	}
+
+	for _, bad := range []string{"ffmpeg\n  - evil", "Ffmpeg", "", "-leading-dash", "with space"} {
+		p := pool
+		p.Packages = []string{bad}
+		if err := p.Validate(); err == nil {
+			t.Errorf("package %q was accepted", bad)
+		}
+	}
+	for _, good := range []string{"ffmpeg", "docker.io", "g++-12", "libxmlsec1-dev", "python3-pip"} {
+		p := pool
+		p.Packages = []string{good}
+		if err := p.Validate(); err != nil {
+			t.Errorf("package %q was refused: %v", good, err)
+		}
+	}
+
+	oversize := pool
+	oversize.Recipe = strings.Repeat("x", MaxRecipeBytes+1)
+	if err := oversize.Validate(); err == nil {
+		t.Error("a recipe over the limit was accepted")
+	}
+}
+
+// A recipe pasted from an editor that ends its lines with CRLF would otherwise
+// reach the build machine with a carriage return on the end of every command,
+// where bash treats it as part of the argument: the error is "no such file or
+// directory" naming a file that plainly exists.
+func TestDefaultsNormaliseARecipeAndSortThePackages(t *testing.T) {
+	p := Pool{Recipe: "set -e\r\necho hello\r\n", Packages: []string{"nftables", "conntrack"}}
+	p.Defaults()
+
+	if strings.Contains(p.Recipe, "\r") {
+		t.Fatalf("the recipe kept its carriage returns: %q", p.Recipe)
+	}
+	if p.Recipe != "set -e\necho hello\n" {
+		t.Fatalf("the recipe became %q", p.Recipe)
+	}
+	if strings.Join(p.Packages, ",") != "conntrack,nftables" {
+		t.Fatalf("the packages are %v, and what is stored should not depend on the order somebody typed", p.Packages)
+	}
+}

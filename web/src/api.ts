@@ -24,6 +24,10 @@ export interface Pool {
   memoryMb: number
   diskGb: number
   image: string
+  /** apt packages baked into this pool's image, on top of the ones every runner gets. */
+  packages: string[]
+  /** A shell script run as root while the image is built, after the packages are in. */
+  recipe: string
   credentialId: number
   enabled: boolean
   createdAt: string
@@ -389,6 +393,8 @@ export function emptyPool(credentialId: number): Partial<Pool> {
     memoryMb: 4096,
     diskGb: 40,
     image: 'default',
+    packages: [],
+    recipe: '',
     credentialId,
     enabled: true,
   }
