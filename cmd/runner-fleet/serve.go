@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/clems4ever/github-runner/internal/api"
+	"github.com/clems4ever/github-runner/internal/builds"
 	"github.com/clems4ever/github-runner/internal/executor/docker"
 	"github.com/clems4ever/github-runner/internal/executor/systemd"
 	"github.com/clems4ever/github-runner/internal/github"
@@ -121,8 +122,11 @@ func serveCommand(args []string) error {
 		Store:     db,
 		Fleet:     reconciler,
 		Resources: sampler,
-		UI:        uiAssets(log),
-		Version:   version,
+		// The agents write their image builds beside the images themselves,
+		// which is the only place both they and the daemon can see.
+		Builds:  builds.New(layout.ImagesDir()),
+		UI:      uiAssets(log),
+		Version: version,
 		// Asked when a pool is saved, so a credential that cannot serve it is
 		// caught while someone is looking at the form rather than a minute
 		// later in a log.

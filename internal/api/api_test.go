@@ -14,6 +14,8 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/agent"
+	"github.com/clems4ever/github-runner/internal/builds"
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -46,6 +48,15 @@ type stubResources struct {
 
 func (r *stubResources) Latest() (resources.Report, bool) { return r.report, r.ready }
 
+// stubBuilds stands in for the images directory, which only exists on a host
+// that builds machines.
+type stubBuilds struct {
+	list []builds.Build
+	err  error
+}
+
+func (b *stubBuilds) List() ([]builds.Build, error) { return b.list, b.err }
+
 type harness struct {
 	t           *testing.T
 	server      *httptest.Server
@@ -53,6 +64,7 @@ type harness struct {
 	fleet       *stubFleet
 	nudges      int
 	resources   *stubResources
+	builds      *stubBuilds
 	credID      int64
 	checkAccess func(context.Context, int64, github.Scope) error
 }
@@ -70,9 +82,9 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	h := &harness{t: t, store: db, fleet: &stubFleet{}, resources: &stubResources{}}
+	h := &harness{t: t, store: db, fleet: &stubFleet{}, resources: &stubResources{}, builds: &stubBuilds{}}
 	srv := New(Options{
-		Store: db, Fleet: h.fleet, Resources: h.resources, Version: "test",
+		Store: db, Fleet: h.fleet, Resources: h.resources, Builds: h.builds, Version: "test",
 		UI:    fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html>fleet</html>")}},
 		Nudge: func() { h.nudges++ },
 		CheckAccess: func(ctx context.Context, id int64, scope github.Scope) error {
@@ -922,5 +934,80 @@ func TestResourceHistoryRefusesAWindowItCannotServe(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+// The endpoint the fleet page asks every few seconds for the reason a pool has
+// no runners.
+func TestImageBuildsAreServed(t *testing.T) {
+	h := newHarness(t)
+	pool := h.samplePool()
+	pool["name"] = "web"
+	h.do("POST", "/api/pools", pool).Body.Close()
+
+	h.builds.list = []builds.Build{{
+		Image: "runner-fleet-noble-abc", Pool: "web", Runner: "web-1",
+		Phase: agent.BuildRunning, Detail: "running this pool's recipe", Seconds: 252,
+	}}
+
+	var got []builds.Build
+	h.decode(h.do("GET", "/api/image-builds", nil), &got)
+	if len(got) != 1 {
+		t.Fatalf("got %d builds", len(got))
+	}
+	if got[0].Detail != "running this pool's recipe" || got[0].Seconds != 252 {
+		t.Fatalf("got %+v", got[0])
+	}
+}
+
+// A build belonging to a pool somebody deleted is not news. Without this the
+// record would outlive the pool and sit on the page for ever, because a failed
+// build is deliberately kept until the build that fixes it replaces it — and
+// for a deleted pool, that build never comes.
+func TestABuildForAPoolThatIsGoneIsNotReported(t *testing.T) {
+	h := newHarness(t)
+	h.builds.list = []builds.Build{{
+		Image: "img", Pool: "deleted-last-week", Runner: "x-1",
+		Phase: agent.BuildFailed, Error: "the recipe exited 1",
+	}}
+
+	var got []builds.Build
+	h.decode(h.do("GET", "/api/image-builds", nil), &got)
+	if len(got) != 0 {
+		t.Fatalf("a deleted pool's build is still being reported: %+v", got)
+	}
+}
+
+// A container-only fleet has no host directory to read and no builds to
+// report, and that is an empty list rather than an error the page has to
+// handle.
+func TestADaemonWithNoImagesDirectory(t *testing.T) {
+	h := newHarness(t)
+	h.builds.err = errors.New("should not be asked")
+	// Rebuilt without a builds source at all, which is how a daemon that
+	// cannot build machines is configured.
+	srv := New(Options{Store: h.store, Fleet: h.fleet})
+	if err := srv.Auth().SetPassword(context.Background(), "admin", "correct-horse"); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(srv.Handler())
+	defer server.Close()
+
+	req, _ := http.NewRequest("GET", server.URL+"/api/image-builds", nil)
+	req.SetBasicAuth("admin", "correct-horse")
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d", resp.StatusCode)
+	}
+	var got []builds.Build
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %+v", got)
 	}
 }

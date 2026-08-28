@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/builds"
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -59,11 +60,18 @@ type Resources interface {
 	Latest() (resources.Report, bool)
 }
 
+// Builds is what the API needs to say why a pool has no runners yet: what the
+// agents on this host have written about the images they are building.
+type Builds interface {
+	List() ([]builds.Build, error)
+}
+
 // Server is the HTTP surface.
 type Server struct {
 	store     Store
 	fleet     Fleet
 	resources Resources
+	builds    Builds
 	auth      *Authenticator
 	ui        fs.FS
 	version   string
@@ -84,7 +92,10 @@ type Options struct {
 	Fleet Fleet
 	// Resources may be nil, which is a daemon that serves everything else and
 	// says it has not measured the host.
-	Resources   Resources
+	Resources Resources
+	// Builds may be nil, which is a daemon with no host to read: it reports
+	// that nothing is building, which is true of a container-only fleet.
+	Builds      Builds
 	UI          fs.FS
 	Version     string
 	Nudge       func()
@@ -97,6 +108,7 @@ func New(opts Options) *Server {
 		store:     opts.Store,
 		fleet:     opts.Fleet,
 		resources: opts.Resources,
+		builds:    opts.Builds,
 		auth:      NewAuthenticator(opts.Store),
 		ui:        opts.UI,
 		version:   opts.Version,
@@ -126,6 +138,7 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/reconcile", s.reconcileNow)
 	api.HandleFunc("GET /api/activity", s.activity)
 	api.HandleFunc("GET /api/jobs", s.jobs)
+	api.HandleFunc("GET /api/image-builds", s.imageBuilds)
 	api.HandleFunc("GET /api/resources", s.resourceReport)
 	api.HandleFunc("GET /api/resources/history", s.resourceHistory)
 	api.HandleFunc("GET /api/credentials", s.listCredentials)
@@ -561,6 +574,40 @@ func (s *Server) reconcileNow(w http.ResponseWriter, r *http.Request) {
 // just stolen from the next one — and every open browser tab would be doing
 // it. The response says when the reading was taken, so nobody has to guess how
 // fresh it is.
+// imageBuilds reports the golden images this host is building, and what last
+// happened to the ones it has built.
+//
+// Filtered to the pools that still exist, because a build belonging to a pool
+// somebody deleted is not news — and a failed build is kept until it is
+// superseded, so without this it would be kept for ever.
+func (s *Server) imageBuilds(w http.ResponseWriter, r *http.Request) {
+	if s.builds == nil {
+		writeJSON(w, http.StatusOK, []builds.Build{})
+		return
+	}
+	found, err := s.builds.List()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	pools, err := s.store.ListPools(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	live := map[string]bool{}
+	for _, pool := range pools {
+		live[pool.Name] = true
+	}
+	out := make([]builds.Build, 0, len(found))
+	for _, build := range found {
+		if live[build.Pool] {
+			out = append(out, build)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) resourceReport(w http.ResponseWriter, r *http.Request) {
 	if s.resources == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ready": false})
