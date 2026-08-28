@@ -80,7 +80,8 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 	}
 
 	spec := ImageSpec{Variant: c.Image, Packages: c.Packages, Recipe: c.Recipe}
-	golden, err := EnsureImage(ctx, spec, filepath.Join(c.StateDir, "images"), publicKey, log)
+	golden, err := EnsureImage(ctx, spec, filepath.Join(c.StateDir, "images"), publicKey,
+		BuildFor{Pool: c.Pool, Runner: c.Runner}, log)
 	if err != nil {
 		return err
 	}

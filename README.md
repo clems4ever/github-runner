@@ -131,11 +131,39 @@ what it writes is a disk every job in the pool will boot. It is not a place for
 secrets: it is stored in the clear, and it ends up in an image any job can read.
 
 A build that fails says so and stops — a recipe that exits non-zero fails the
-build, and the pool keeps running the image it already had. The console of the
-last failed build is kept at `/var/lib/runner-fleet/images/last-build-console.log`,
-which is where a recipe that did not work explains itself. Both fields are for
+build, and the pool keeps running the image it already had. Both fields are for
 machine pools; a container pool names a prebuilt image in its image field
 instead, and is refused these rather than quietly ignoring them.
+
+### Watching one build
+
+A build happens in a runner's own unit, on the host, before the machine it is
+for exists — so the fleet page used to show a pool short of its minimum with
+nothing to say why, for the several minutes it takes. It says now:
+
+![A build that failed, and the pool it explains](docs/img/image-build-in-context.png)
+
+The panel sits above the fleet, because a pool that is short of runners because
+its image is building is the explanation for everything under it. While a build
+runs it reports what the build itself is printing:
+
+![A build in progress](docs/img/image-build-running.png)
+
+The first build on a host spends its first minutes fetching the image every
+build starts from, with no machine booted and so nothing on a console to read.
+That is reported as what it is, including that it happens once:
+
+![The download the first build starts with](docs/img/image-build-fetching.png)
+
+A build that has stopped printing is not said to be stuck — the daemon cannot
+know that — only that it has gone quiet, which is what it can honestly report
+and is enough to stop somebody waiting on it:
+
+![A build that has gone quiet](docs/img/image-build-silent.png)
+
+What each pool's last build did stays on the page until the next build of that
+pool's image replaces it. So a failure is still there in the morning, and
+fixing the recipe clears it without anybody dismissing anything.
 
 ### Templates
 

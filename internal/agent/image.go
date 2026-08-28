@@ -40,7 +40,7 @@ const buildTimeout = 40 * time.Minute
 // This is also where per-repository images will arrive: a pool naming its own
 // variant already gets its own image name, so the remaining work is letting a
 // pool carry a package list rather than inheriting the default one.
-func EnsureImage(ctx context.Context, spec ImageSpec, imagesDir, publicKey string, log *slog.Logger) (string, error) {
+func EnsureImage(ctx context.Context, spec ImageSpec, imagesDir, publicKey string, by BuildFor, log *slog.Logger) (image string, err error) {
 	if err := os.MkdirAll(imagesDir, 0o700); err != nil {
 		return "", err
 	}
@@ -62,6 +62,15 @@ func EnsureImage(ctx context.Context, spec ImageSpec, imagesDir, publicKey strin
 
 	log.Info("building the golden image; this takes a few minutes and happens once per host",
 		"image", filepath.Base(golden))
+
+	// From here on the build is worth reporting: everything above this line
+	// either found the image or is the moment before one is built. The record
+	// is finished on every path out, including a panic, because a record left
+	// saying "running" is a fleet page that lies for as long as nobody
+	// restarts anything.
+	journal := startBuild(imagesDir, filepath.Base(golden), by.Pool, by.Runner, time.Now())
+	savedConsole := ""
+	defer func() { journal.finish(err, savedConsole, time.Now()) }()
 
 	ctx, cancel := context.WithTimeout(ctx, buildTimeout)
 	defer cancel()
@@ -110,6 +119,10 @@ func EnsureImage(ctx context.Context, spec ImageSpec, imagesDir, publicKey strin
 		Console:   filepath.Join(work, "console.log"),
 	}
 
+	// The machine is about to boot, which is when a console starts existing
+	// and the build stops being a silent download.
+	journal.phase(BuildRunning)
+
 	cmd, err := bootVM(ctx, options)
 	if err != nil {
 		return "", err
@@ -121,6 +134,7 @@ func EnsureImage(ctx context.Context, spec ImageSpec, imagesDir, publicKey strin
 	// below both name it and read it. It used to name a file this function had
 	// already deleted.
 	console, saved := keepBuildConsole(options.Console, imagesDir)
+	savedConsole = saved
 
 	if ctx.Err() != nil {
 		return "", fmt.Errorf("the image build did not finish within %s; the console is at %s: %w",

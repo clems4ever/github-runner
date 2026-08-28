@@ -34,6 +34,41 @@ export interface Pool {
   updatedAt: string
 }
 
+/**
+ * Where a golden image build has got to.
+ *
+ * `fetching` is the stock Ubuntu image coming down, which happens once per
+ * host and has no console to show for itself. `running` is the machine
+ * provisioning itself, which is where a pool's recipe runs.
+ */
+export type BuildPhase = 'fetching' | 'running' | 'done' | 'failed'
+
+/**
+ * One golden image build, as the host reports it.
+ *
+ * A machine pool with no runners is either starting one or building the image
+ * it would boot, and those look identical from the outside. This is the
+ * difference.
+ */
+export interface ImageBuild {
+  image: string
+  pool: string
+  /** The runner whose agent is doing the build; the others wait on it. */
+  runner: string
+  phase: BuildPhase
+  /** What it is doing, in its own words: the last line its console printed. */
+  detail?: string
+  error?: string
+  /** Where the whole console of a failed build was kept. */
+  console?: string
+  /** It has printed nothing for a long time. Not the same as dead. */
+  silent?: boolean
+  startedAt: string
+  endedAt?: string
+  /** How long it has been running, or how long it took. */
+  seconds: number
+}
+
 export type RunnerState = 'running' | 'stopping' | 'stopped'
 export type JobState = 'busy' | 'idle' | 'starting' | 'offline' | 'unknown'
 
@@ -354,6 +389,9 @@ export const api = {
     ),
 
   /** What the host and its runners are using, as of the daemon's last reading. */
+  /** What this host is building, and what last happened to each pool's image. */
+  imageBuilds: () => request<ImageBuild[]>('/api/image-builds'),
+
   resources: () => request<ResourceReport>('/api/resources'),
   /** What the host has been using, over a window. */
   resourceHistory: (hours: number) =>

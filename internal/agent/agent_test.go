@@ -1,11 +1,16 @@
 package agent
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/clems4ever/github-runner/internal/model"
 )
@@ -674,4 +679,94 @@ func TestAnUndecodableRecipeStopsTheRunner(t *testing.T) {
 	if _, err := ConfigFromEnv(""); err == nil {
 		t.Fatal("a runner started with a recipe it could not read, and would have built an image without it")
 	}
+}
+
+// The record the daemon reads. A build happens in a runner's own unit, before
+// the machine it is for exists, so nothing else on this host can say what is
+// happening — and the fleet page shows a pool short of a runner with no
+// explanation attached to it.
+func TestABuildIsWrittenDownWhereTheDaemonCanReadIt(t *testing.T) {
+	dir := t.TempDir()
+	spec := ImageSpec{Variant: "default", Recipe: "echo hello\n"}
+
+	// Cancelled before it starts, so this fails in the first command it runs
+	// rather than downloading an operating system. Which command fails does
+	// not matter: what is being tested is that failing at all is recorded.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := EnsureImage(ctx, spec, dir, "ssh-ed25519 KEY",
+		BuildFor{Pool: "web", Runner: "web-1"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil {
+		t.Fatal("a build with a cancelled context reported success")
+	}
+
+	body, readErr := os.ReadFile(filepath.Join(BuildsDir(dir), spec.Name()+".json"))
+	if readErr != nil {
+		t.Fatalf("the build left no record: %v", readErr)
+	}
+	var record BuildRecord
+	if err := json.Unmarshal(body, &record); err != nil {
+		t.Fatalf("the record is not readable: %v", err)
+	}
+
+	if record.Phase != BuildFailed {
+		t.Errorf("a failed build recorded phase %q", record.Phase)
+	}
+	if record.Error == "" {
+		t.Error("the record says it failed without saying why, which is the whole point of it")
+	}
+	if record.EndedAt == nil {
+		t.Error("a finished build has no end, so the page would show it running for ever")
+	}
+	// Whose it is. A hash on the page tells nobody anything.
+	if record.Pool != "web" || record.Runner != "web-1" {
+		t.Errorf("got pool %q runner %q", record.Pool, record.Runner)
+	}
+	if record.Image != spec.Name() {
+		t.Errorf("the record names image %q", record.Image)
+	}
+}
+
+// Written when the build STARTS, not when it ends. A record that appeared at
+// the end would say nothing for the entire time somebody is waiting, which is
+// the only time anybody looks.
+func TestABuildIsVisibleWhileItIsStillHappening(t *testing.T) {
+	dir := t.TempDir()
+	started := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+
+	startBuild(dir, "some-image", "web", "web-1", started)
+
+	body, err := os.ReadFile(filepath.Join(BuildsDir(dir), "some-image.json"))
+	if err != nil {
+		t.Fatalf("nothing was written until the build finished: %v", err)
+	}
+	var record BuildRecord
+	if err := json.Unmarshal(body, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.Phase != BuildFetching {
+		t.Errorf("a build that has just started is in phase %q", record.Phase)
+	}
+	if !record.StartedAt.Equal(started) {
+		t.Errorf("it started at %s", record.StartedAt)
+	}
+	if record.EndedAt != nil {
+		t.Error("a build that has not finished has an end time")
+	}
+}
+
+// Reporting is worth an image; it is not worth a fleet. A directory that
+// cannot be written must not be the reason a pool has no runners.
+func TestABuildThatCannotBeWrittenDownStillBuilds(t *testing.T) {
+	// A file where the directory would go: MkdirAll fails, every write fails.
+	dir := t.TempDir()
+	if err := os.WriteFile(BuildsDir(dir), []byte("in the way"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	journal := startBuild(dir, "img", "web", "web-1", time.Now())
+	journal.phase(BuildRunning)
+	journal.finish(nil, "", time.Now())
+	// Reaching here without a panic is the test.
 }

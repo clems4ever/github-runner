@@ -29,6 +29,7 @@ import {
   api,
   type Credential,
   type Health,
+  type ImageBuild,
   type Pool,
   type ResourceReport,
   type Runner,
@@ -67,17 +68,20 @@ export function App() {
   const [credentials, setCredentials] = useState<Credential[]>([])
   const [health, setHealth] = useState<Health | null>(null)
   const [resources, setResources] = useState<ResourceReport | null>(null)
+  const [imageBuilds, setImageBuilds] = useState<ImageBuild[]>([])
   const [loading, setLoading] = useState(true)
 
   const refresh = useCallback(async () => {
     try {
-      const [poolList, runnerList, credentialList, healthInfo, resourceReport] = await Promise.all([
-        api.pools(),
-        api.runners(),
-        api.credentials(),
-        api.health(),
-        api.resources(),
-      ])
+      const [poolList, runnerList, credentialList, healthInfo, resourceReport, builds] =
+        await Promise.all([
+          api.pools(),
+          api.runners(),
+          api.credentials(),
+          api.health(),
+          api.resources(),
+          api.imageBuilds(),
+        ])
       setPools(poolList)
       setRunners(runnerList.runners ?? [])
       setWarnings(runnerList.warnings ?? [])
@@ -85,6 +89,7 @@ export function App() {
       setCredentials(credentialList)
       setHealth(healthInfo)
       setResources(resourceReport)
+      setImageBuilds(builds)
     } catch (error) {
       notifications.show({
         color: 'red',
@@ -186,6 +191,7 @@ export function App() {
             credentials={credentials}
             scaling={scaling}
             warnings={warnings}
+            imageBuilds={imageBuilds}
             loading={loading}
             onChange={refresh}
           />
