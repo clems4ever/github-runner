@@ -79,8 +79,11 @@ func (l Layout) ImagesDir() string { return filepath.Join(l.State, "images") }
 // VMDir is one VM's working directory.
 func (l Layout) VMDir(name string) string { return filepath.Join(l.State, "vms", name) }
 
+// SSHDir holds the key that reaches every VM this host runs.
+func (l Layout) SSHDir() string { return filepath.Join(l.State, "ssh") }
+
 // SSHKey is the key that reaches every VM this host runs.
-func (l Layout) SSHKey() string { return filepath.Join(l.State, "ssh", "id_ed25519") }
+func (l Layout) SSHKey() string { return filepath.Join(l.SSHDir(), "id_ed25519") }
 
 // EnsureDirs creates what must exist before anything else runs, and hands the
 // ones the runners use to the account they run as.
@@ -94,7 +97,8 @@ func (l Layout) EnsureDirs(owner Owner) error {
 	// 0700 throughout: these hold credentials, configuration naming private
 	// repositories, and disk images a job has written to. Ownership, not the
 	// mode, is what decides who that one user is.
-	for _, dir := range []string{l.Etc, l.RunnersDir(), l.State, l.ImagesDir(), l.Run, l.CredentialsDir()} {
+	for _, dir := range []string{l.Etc, l.RunnersDir(), l.State, l.ImagesDir(), l.SSHDir(),
+		l.Run, l.CredentialsDir()} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
@@ -116,5 +120,9 @@ func (l Layout) EnsureDirs(owner Owner) error {
 // found by the test that reads the file as the other user rather than looking
 // at its mode.
 func (l Layout) AgentDirs() []string {
-	return []string{l.State, l.ImagesDir(), l.Run, l.CredentialsDir()}
+	// The ssh directory is in the list because the daemon now makes the key
+	// itself, while building an image, and a machine's agent reads the public
+	// half of it when it boots one. A root-owned 0700 directory is a key
+	// nobody else can reach.
+	return []string{l.State, l.ImagesDir(), l.SSHDir(), l.Run, l.CredentialsDir()}
 }

@@ -200,10 +200,10 @@ func freePort() (int, error) {
 	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
-// ensureSSHKey creates the key that reaches every machine on this host. It is
+// EnsureSSHKey creates the key that reaches every machine on this host. It is
 // for looking inside a runner that is misbehaving; nothing in the normal path
 // uses it.
-func ensureSSHKey(path string) (string, error) {
+func EnsureSSHKey(path string) (string, error) {
 	if pub, err := os.ReadFile(path + ".pub"); err == nil {
 		return strings.TrimSpace(string(pub)), nil
 	}

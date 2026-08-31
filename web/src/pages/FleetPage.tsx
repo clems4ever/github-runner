@@ -16,10 +16,9 @@ import {
   Tooltip,
 } from '@mantine/core'
 import { IconAlertTriangle, IconServerOff } from '@tabler/icons-react'
-import type { Credential, ImageBuild, JobState, Pool, Runner, RunnerState, Scale } from '../api'
+import type { Credential, JobState, Pool, Runner, RunnerState, Scale } from '../api'
 import { Field, useNarrow } from '../responsive'
 import { ActivityChart } from './ActivityChart'
-import { ImageBuilds } from './ImageBuilds'
 import { PoolEditor } from './PoolEditor'
 
 /**
@@ -36,7 +35,6 @@ export function FleetPage({
   credentials,
   scaling,
   warnings,
-  imageBuilds,
   loading,
   onChange,
 }: {
@@ -45,7 +43,6 @@ export function FleetPage({
   credentials: Credential[]
   scaling: Record<string, Scale>
   warnings: string[]
-  imageBuilds: ImageBuild[]
   loading: boolean
   onChange: () => Promise<void>
 }) {
@@ -116,11 +113,6 @@ export function FleetPage({
           </Stack>
         </Card>
       )}
-
-      {/* Above the warnings and above the fleet, because a pool that is short
-          of runners because its image is building is the explanation for
-          everything below it. */}
-      <ImageBuilds builds={imageBuilds} />
 
       {warnings.map((warning) => (
         <Alert key={warning} color="yellow" icon={<IconAlertTriangle size={18} />} variant="light">

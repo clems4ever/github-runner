@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"github.com/clems4ever/github-runner/internal/api"
-	"github.com/clems4ever/github-runner/internal/builds"
 	"github.com/clems4ever/github-runner/internal/executor/docker"
 	"github.com/clems4ever/github-runner/internal/executor/systemd"
 	"github.com/clems4ever/github-runner/internal/github"
+	"github.com/clems4ever/github-runner/internal/imagebuild"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -90,6 +90,23 @@ func serveCommand(args []string) error {
 		resources.NewReporter(resources.NewHostCollector(layout.State), vm, containers),
 		db, log)
 
+	// Golden images are built here, in the daemon, before the runners that
+	// would boot them exist. That is what lets a build be reported while it
+	// happens, kept afterwards, and attempted once rather than retried for
+	// ever by a unit that cannot know any better.
+	builder := imagebuild.New(imagebuild.Options{
+		ImagesDir: layout.ImagesDir(),
+		SSHKey:    layout.SSHKey(),
+		Store:     db,
+		Owner:     owner,
+		Log:       log,
+	})
+	// Before anything can ask for a build, so that builds interrupted by this
+	// restart are settled and not confused with the ones about to be queued.
+	if err := builder.Adopt(context.Background()); err != nil {
+		log.Warn("could not read what this host has built", "error", err)
+	}
+
 	// The reconciler is told how to reach GitHub and how to hand a credential
 	// to a runner. Both are injected rather than reached for directly, which
 	// is what lets the fleet's rules be tested without either.
@@ -104,7 +121,13 @@ func serveCommand(args []string) error {
 			})
 		},
 		credentialWriter(layout, owner),
-		log)
+		log).
+		// A machine pool gets no runners until the image they would boot has
+		// been built, and asking is what starts the first build.
+		WithImages(func(ctx context.Context, pool model.Pool) (bool, string) {
+			status := builder.Ensure(ctx, pool)
+			return status.Ready, status.Summary
+		})
 
 	// A buffered channel of one: several changes arriving together collapse
 	// into a single extra pass rather than queueing up.
@@ -122,11 +145,9 @@ func serveCommand(args []string) error {
 		Store:     db,
 		Fleet:     reconciler,
 		Resources: sampler,
-		// The agents write their image builds beside the images themselves,
-		// which is the only place both they and the daemon can see.
-		Builds:  builds.New(layout.ImagesDir()),
-		UI:      uiAssets(log),
-		Version: version,
+		Images:    builder,
+		UI:        uiAssets(log),
+		Version:   version,
 		// Asked when a pool is saved, so a credential that cannot serve it is
 		// caught while someone is looking at the form rather than a minute
 		// later in a log.
@@ -183,6 +204,10 @@ func serveCommand(args []string) error {
 		}
 		serving <- nil
 	}()
+
+	// One image at a time, in a goroutine of its own: a build takes minutes
+	// and the fleet has to go on being reconciled while it happens.
+	go builder.Run(ctx)
 
 	go reconcileLoop(ctx, reconciler, *interval, nudge, log)
 	// On a clock of its own rather than on the reconciler's. A pass that scaled

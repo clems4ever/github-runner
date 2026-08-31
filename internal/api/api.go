@@ -13,14 +13,15 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/clems4ever/github-runner/internal/builds"
 	"github.com/clems4ever/github-runner/internal/github"
+	"github.com/clems4ever/github-runner/internal/imagebuild"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
 	"github.com/clems4ever/github-runner/internal/resources"
@@ -60,10 +61,20 @@ type Resources interface {
 	Latest() (resources.Report, bool)
 }
 
-// Builds is what the API needs to say why a pool has no runners yet: what the
-// agents on this host have written about the images they are building.
-type Builds interface {
-	List() ([]builds.Build, error)
+// Images is what the API needs to show a pool's golden image: where it stands,
+// what every attempt at it did, and how to ask for another.
+//
+// A machine pool has no runners until its image is built, so this is not
+// decoration — it is the answer to "why is this pool empty", and it belongs to
+// the pool rather than to the host.
+type Images interface {
+	Status(pool model.Pool) imagebuild.Status
+	// Forget drops a deleted pool's builds, and the consoles they left on the
+	// host.
+	Forget(ctx context.Context, pool string) error
+	History(ctx context.Context, pool string, limit int) ([]imagebuild.Build, error)
+	Log(ctx context.Context, id int64, maxBytes int64) (string, error)
+	Rebuild(ctx context.Context, pool model.Pool) (imagebuild.Build, error)
 }
 
 // Server is the HTTP surface.
@@ -71,7 +82,7 @@ type Server struct {
 	store     Store
 	fleet     Fleet
 	resources Resources
-	builds    Builds
+	images    Images
 	auth      *Authenticator
 	ui        fs.FS
 	version   string
@@ -93,9 +104,10 @@ type Options struct {
 	// Resources may be nil, which is a daemon that serves everything else and
 	// says it has not measured the host.
 	Resources Resources
-	// Builds may be nil, which is a daemon with no host to read: it reports
-	// that nothing is building, which is true of a container-only fleet.
-	Builds      Builds
+	// Images may be nil, which is a daemon that builds nothing: every pool
+	// reports that there is no image of its own to build, which is what a
+	// container-only fleet is.
+	Images      Images
 	UI          fs.FS
 	Version     string
 	Nudge       func()
@@ -108,7 +120,7 @@ func New(opts Options) *Server {
 		store:     opts.Store,
 		fleet:     opts.Fleet,
 		resources: opts.Resources,
-		builds:    opts.Builds,
+		images:    opts.Images,
 		auth:      NewAuthenticator(opts.Store),
 		ui:        opts.UI,
 		version:   opts.Version,
@@ -138,7 +150,10 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/reconcile", s.reconcileNow)
 	api.HandleFunc("GET /api/activity", s.activity)
 	api.HandleFunc("GET /api/jobs", s.jobs)
-	api.HandleFunc("GET /api/image-builds", s.imageBuilds)
+	api.HandleFunc("GET /api/pool-images", s.poolImages)
+	api.HandleFunc("GET /api/pools/{id}/image", s.poolImage)
+	api.HandleFunc("POST /api/pools/{id}/image/builds", s.buildPoolImage)
+	api.HandleFunc("GET /api/image-builds/{id}/log", s.imageBuildLog)
 	api.HandleFunc("GET /api/resources", s.resourceReport)
 	api.HandleFunc("GET /api/resources/history", s.resourceHistory)
 	api.HandleFunc("GET /api/credentials", s.listCredentials)
@@ -274,14 +289,25 @@ func (s *Server) updatePool(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deletePool(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r)
+	pool, err := s.poolFor(r)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if err := s.store.DeletePool(r.Context(), id); err != nil {
+	if err := s.store.DeletePool(r.Context(), pool.ID); err != nil {
 		writeError(w, err)
 		return
+	}
+	// Its image builds go with it. They are filed under the pool, so once it
+	// is gone there is nowhere left to read them from, and their logs are
+	// consoles worth megabytes each.
+	if s.images != nil {
+		if err := s.images.Forget(r.Context(), pool.Name); err != nil {
+			// Not a reason to report the deletion as failed: the pool is gone,
+			// which is what was asked for.
+			slog.Warn("could not forget a deleted pool's image builds",
+				"pool", pool.Name, "error", err)
+		}
 	}
 	// The runners are not touched here. The next pass drains them, which is
 	// what keeps deleting a pool from failing a job that is in flight.
@@ -562,6 +588,144 @@ func (s *Server) reconcileNow(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
+// Images
+// ---------------------------------------------------------------------------
+
+// poolImages says where every pool's image stands, which is what the pools
+// table shows against each row.
+func (s *Server) poolImages(w http.ResponseWriter, r *http.Request) {
+	pools, err := s.store.ListPools(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	out := make([]imagebuild.Status, 0, len(pools))
+	for _, pool := range pools {
+		out = append(out, s.imageStatus(pool))
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// poolImage is one pool's image and every attempt this host has made at it.
+//
+// The history is the part that used to be missing. A build that failed was
+// replaced by the next attempt at the same thing, so the account of what a
+// recipe did survived only until something tried again — which, when a unit
+// was retrying every two seconds, was no time at all.
+func (s *Server) poolImage(w http.ResponseWriter, r *http.Request) {
+	pool, err := s.poolFor(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+
+	body := map[string]any{"status": s.imageStatus(pool), "builds": []imagebuild.Build{}}
+	if s.images == nil {
+		writeJSON(w, http.StatusOK, body)
+		return
+	}
+	history, err := s.images.History(r.Context(), pool.Name, 0)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if history != nil {
+		body["builds"] = history
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// buildPoolImage is somebody asking for a build: the first one for a pool that
+// is switched off, or another after one failed.
+//
+// Asked for rather than automatic, because a build that failed is not tried
+// again on its own. A recipe that cannot work should say so once and wait for
+// somebody to change it.
+func (s *Server) buildPoolImage(w http.ResponseWriter, r *http.Request) {
+	pool, err := s.poolFor(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if s.images == nil {
+		writeError(w, errBadRequest("this daemon does not build images"))
+		return
+	}
+	build, err := s.images.Rebuild(r.Context(), pool)
+	if errors.Is(err, imagebuild.ErrBusy) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	// The fleet is told, so a pool waiting on this image picks its runners up
+	// as soon as it finishes rather than at the next tick.
+	s.nudge()
+	writeJSON(w, http.StatusAccepted, build)
+}
+
+// imageBuildLog is the whole account of one build: what the daemon did, and
+// everything the build machine printed, in order.
+//
+// Text rather than JSON, and the end of it rather than all of it. This is a
+// console — it is read, not parsed — and a browser has no business holding the
+// eight megabytes an apt run can produce.
+func (s *Server) imageBuildLog(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if s.images == nil {
+		writeError(w, errBadRequest("this daemon does not build images"))
+		return
+	}
+	// How much of the end of it to send. The default is generous; a page
+	// polling a build in progress asks for less.
+	var bytes int64
+	if raw := r.URL.Query().Get("bytes"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			writeError(w, errBadRequest("bytes must be a number of bytes"))
+			return
+		}
+		bytes = int64(parsed)
+	}
+
+	log, err := s.images.Log(r.Context(), id, bytes)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(log))
+}
+
+// imageStatus is where a pool's image stands, or the answer a daemon that
+// builds nothing gives.
+func (s *Server) imageStatus(pool model.Pool) imagebuild.Status {
+	if s.images == nil {
+		return imagebuild.Status{
+			Pool: pool.Name, State: imagebuild.StateNone, Ready: true,
+			Summary: "this daemon does not build images",
+		}
+	}
+	return s.images.Status(pool)
+}
+
+// poolFor is the pool a request names.
+func (s *Server) poolFor(r *http.Request) (model.Pool, error) {
+	id, err := pathID(r)
+	if err != nil {
+		return model.Pool{}, err
+	}
+	return s.store.Pool(r.Context(), id)
+}
+
+// ---------------------------------------------------------------------------
 // Resources
 // ---------------------------------------------------------------------------
 
@@ -574,40 +738,6 @@ func (s *Server) reconcileNow(w http.ResponseWriter, r *http.Request) {
 // just stolen from the next one — and every open browser tab would be doing
 // it. The response says when the reading was taken, so nobody has to guess how
 // fresh it is.
-// imageBuilds reports the golden images this host is building, and what last
-// happened to the ones it has built.
-//
-// Filtered to the pools that still exist, because a build belonging to a pool
-// somebody deleted is not news — and a failed build is kept until it is
-// superseded, so without this it would be kept for ever.
-func (s *Server) imageBuilds(w http.ResponseWriter, r *http.Request) {
-	if s.builds == nil {
-		writeJSON(w, http.StatusOK, []builds.Build{})
-		return
-	}
-	found, err := s.builds.List()
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	pools, err := s.store.ListPools(r.Context())
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	live := map[string]bool{}
-	for _, pool := range pools {
-		live[pool.Name] = true
-	}
-	out := make([]builds.Build, 0, len(found))
-	for _, build := range found {
-		if live[build.Pool] {
-			out = append(out, build)
-		}
-	}
-	writeJSON(w, http.StatusOK, out)
-}
-
 func (s *Server) resourceReport(w http.ResponseWriter, r *http.Request) {
 	if s.resources == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ready": false})

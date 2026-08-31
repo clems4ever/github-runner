@@ -66,6 +66,19 @@ func registrationToken(ctx context.Context, c Config) (string, error) {
 }
 
 func runVM(ctx context.Context, c Config, log *slog.Logger) error {
+	// The image is the daemon's to build, and it builds it before it creates
+	// this runner at all. So a machine that finds one missing does not build
+	// one: it says which image it wanted and stops, and its unit is told not to
+	// restart it. A runner that quietly built its own image was how a broken
+	// recipe used to turn into a unit rebuilding a fleet's worth of it, every
+	// two seconds, with the account of each attempt thrown away.
+	spec := ImageSpec{Variant: c.Image, Packages: c.Packages, Recipe: c.Recipe}
+	golden, built := GoldenImage(spec, filepath.Join(c.StateDir, "images"))
+	if !built {
+		return fmt.Errorf("%w: %s. The daemon builds it; this runner should not have been started yet",
+			ErrImageNotBuilt, filepath.Base(golden))
+	}
+
 	dir := filepath.Join(c.StateDir, "vms", c.Runner)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -74,14 +87,7 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 	// left behind goes with it, which is the entire point of the runtime.
 	defer os.RemoveAll(dir)
 
-	publicKey, err := ensureSSHKey(filepath.Join(c.StateDir, "ssh", "id_ed25519"))
-	if err != nil {
-		return err
-	}
-
-	spec := ImageSpec{Variant: c.Image, Packages: c.Packages, Recipe: c.Recipe}
-	golden, err := EnsureImage(ctx, spec, filepath.Join(c.StateDir, "images"), publicKey,
-		BuildFor{Pool: c.Pool, Runner: c.Runner}, log)
+	publicKey, err := EnsureSSHKey(filepath.Join(c.StateDir, "ssh", "id_ed25519"))
 	if err != nil {
 		return err
 	}

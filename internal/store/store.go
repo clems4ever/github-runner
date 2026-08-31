@@ -155,6 +155,28 @@ var migrations = []string{
 	// alone named a variant and the variant was always built the same way.
 	`ALTER TABLE pools ADD COLUMN packages TEXT NOT NULL DEFAULT ''`,
 	`ALTER TABLE pools ADD COLUMN recipe TEXT NOT NULL DEFAULT ''`,
+	// Every attempt at building a pool's golden image, and where the account
+	// of it was kept.
+	//
+	// In the database rather than in a file beside the image, which is where
+	// this used to live: a file per image held the latest attempt and nothing
+	// else, so the failure somebody was reading was replaced by the next
+	// attempt at the same thing — and a build that worked erased the one that
+	// had explained why the pool was empty all morning. A row per attempt
+	// keeps the history that question is answered from.
+	`CREATE TABLE image_builds (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		pool       TEXT NOT NULL,
+		image      TEXT NOT NULL,
+		phase      TEXT NOT NULL,
+		trigger    TEXT NOT NULL DEFAULT '',
+		error      TEXT NOT NULL DEFAULT '',
+		log        TEXT NOT NULL DEFAULT '',
+		started_at TEXT NOT NULL,
+		ended_at   TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE INDEX image_builds_pool ON image_builds(pool, id)`,
+	`CREATE INDEX image_builds_image ON image_builds(image, id)`,
 }
 
 // SampleRetention is how much history the daemon keeps. Two days covers "what
