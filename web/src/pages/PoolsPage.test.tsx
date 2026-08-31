@@ -5,7 +5,14 @@ import { notifications } from '@mantine/notifications'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PoolsPage } from './PoolsPage'
 import { pretendNarrow } from '../test-setup'
-import { api, type Credential, type Pool, type Runner, type Scale } from '../api'
+import {
+  api,
+  type Credential,
+  type Pool,
+  type PoolImage,
+  type Runner,
+  type Scale,
+} from '../api'
 
 const CREDENTIALS: Credential[] = [
   { id: 1, name: 'fleet app', kind: 'app', appId: 42, hint: 'app 42', createdAt: '' },
@@ -49,6 +56,7 @@ function renderPage(
   pools: Pool[],
   runners: Runner[] = [],
   scaling: Record<string, Scale> = {},
+  images: Record<string, PoolImage> = {},
 ) {
   const onChange = vi.fn().mockResolvedValue(undefined)
   return {
@@ -59,6 +67,7 @@ function renderPage(
           credentials={CREDENTIALS}
           runners={runners}
           scaling={scaling}
+          images={images}
           onChange={onChange}
         />
       </MantineProvider>,
@@ -72,6 +81,21 @@ afterEach(() => {
 })
 
 describe('PoolsPage', () => {
+  // A machine pool takes no jobs until its image is built, so whether it is
+  // built belongs on the row rather than in a banner over the fleet page.
+  it('says where each pool image stands', () => {
+    renderPage([pool()], [], {}, {
+      web: {
+        pool: 'web',
+        image: 'runner-noble-default-abc123',
+        state: 'failed',
+        ready: false,
+        summary: 'its image did not build',
+      },
+    })
+    expect(screen.getByTestId('image-badge')).toHaveTextContent('failed')
+  })
+
   it('lists the pools in a table on a wide screen', () => {
     renderPage([pool()])
     expect(screen.getByRole('table')).toBeInTheDocument()

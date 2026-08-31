@@ -120,8 +120,8 @@ An image is named by everything it is built from — the release, the runner
 version, the build script, the package list and the recipe — so the two fields
 behave the way anyone editing them would hope:
 
-- change either, and the next machine builds a new image and the pool's runners
-  are replaced as they finish their jobs
+- change either, and the daemon builds a new image; the pool's runners drain as
+  they finish their jobs and come back on the new one
 - change them back, and the old image is almost certainly still on the host, so
   nothing is rebuilt
 - leave them alone, and no machine ever rebuilds anything
@@ -130,40 +130,56 @@ The recipe runs as root in a throwaway machine with no credential in it, and
 what it writes is a disk every job in the pool will boot. It is not a place for
 secrets: it is stored in the clear, and it ends up in an image any job can read.
 
-A build that fails says so and stops — a recipe that exits non-zero fails the
-build, and the pool keeps running the image it already had. Both fields are for
-machine pools; a container pool names a prebuilt image in its image field
-instead, and is refused these rather than quietly ignoring them.
+A build that fails says so and stops. A recipe that exits non-zero fails the
+build, the pool gets no runners, and nothing tries again until somebody asks or
+the recipe changes. Both fields are for machine pools; a container pool names a
+prebuilt image in its image field instead, and is refused these rather than
+quietly ignoring them.
 
-### Watching one build
+### Waiting for an image
 
-A build happens in a runner's own unit, on the host, before the machine it is
-for exists — so the fleet page used to show a pool short of its minimum with
-nothing to say why, for the several minutes it takes. It says now:
+**A machine pool takes no jobs until the image its runners boot has been
+built.** That is the whole rule, and every pool says where it stands on its own
+row:
 
-![A build that failed, and the pool it explains](docs/img/image-build-in-context.png)
+![Where each pool's image stands](docs/img/pool-images.png)
 
-The panel sits above the fleet, because a pool that is short of runners because
-its image is building is the explanation for everything under it. While a build
-runs it reports what the build itself is printing:
+The daemon builds it, once per host per image, before it creates a single
+runner. Enabling a pool for the first time starts the build; a pool that is
+switched off can be built ahead of time from the same panel, so that turning it
+on is instant. Either way there is never a runner registered with GitHub on an
+image that does not exist, and never a job running on the image the pool used to
+ask for.
+
+A build takes minutes and says what it is doing while it does them:
 
 ![A build in progress](docs/img/image-build-running.png)
 
 The first build on a host spends its first minutes fetching the image every
 build starts from, with no machine booted and so nothing on a console to read.
-That is reported as what it is, including that it happens once:
+That is reported as what it is, including that it happens once. After that the
+log is the build machine's own console, copied in as it is printed — so the log
+somebody is watching and the log that is kept are the same file.
 
-![The download the first build starts with](docs/img/image-build-fetching.png)
+When a build fails, the pool stays empty and says so, with the console that
+explains it:
 
-A build that has stopped printing is not said to be stuck — the daemon cannot
-know that — only that it has gone quiet, which is what it can honestly report
-and is enough to stop somebody waiting on it:
+![A build that failed](docs/img/image-build-failed.png)
 
-![A build that has gone quiet](docs/img/image-build-silent.png)
+**It is not tried again on its own.** A recipe that cannot work should fail once
+and wait, rather than rebuild every few seconds until somebody notices — which
+is what a unit with a restart policy does, and what this used to be. There are
+two ways forward and the panel names both: fix the recipe, which is a different
+image and builds by itself, or press **Build now** to try the same one again.
 
-What each pool's last build did stays on the page until the next build of that
-pool's image replaces it. So a failure is still there in the morning, and
-fixing the recipe clears it without anybody dismissing anything.
+Every attempt is kept, with its whole log, against the pool it was for:
+
+![The attempts at one pool's image](docs/img/image-build-history.png)
+
+That is what makes a fixed recipe reviewable in the morning: the failure is
+still there, underneath the build that fixed it, and so is what each of them
+printed. The last twenty attempts per pool are kept, and they go when the pool
+does.
 
 ### Templates
 
@@ -553,7 +569,8 @@ gracefully, as each finishes the job it is on.
 | `/etc/runner-fleet/master.key` | the encryption key |
 | `/etc/runner-fleet/runners/` | one environment file per VM runner |
 | `/run/runner-fleet/credentials/` | decrypted tokens, on tmpfs |
-| `/var/lib/runner-fleet/` | golden images and VM disks |
+| `/var/lib/runner-fleet/` | golden images, their build logs, and VM disks |
+| `/var/lib/runner-fleet/images/logs/` | the whole log of each image build, one file per attempt |
 | `/var/lib/runner-fleet/consoles/` | the last console of each machine, kept after it is gone |
 | `gh-runner@NAME.service` | one runner |
 | `runner-fleet.slice` | the group every machine runner is in, and where the fleet budget's limits live |

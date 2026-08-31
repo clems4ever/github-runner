@@ -35,38 +35,52 @@ export interface Pool {
 }
 
 /**
- * Where a golden image build has got to.
+ * Where a pool's golden image stands on this host.
  *
- * `fetching` is the stock Ubuntu image coming down, which happens once per
- * host and has no console to show for itself. `running` is the machine
- * provisioning itself, which is where a pool's recipe runs.
+ * A machine pool has no runners until its image is built, so this is not
+ * decoration: it is the difference between a pool that is empty because it is
+ * idle and one that is empty because its recipe does not work.
  */
-export type BuildPhase = 'fetching' | 'running' | 'done' | 'failed'
+export type ImageState = 'ready' | 'unbuilt' | 'queued' | 'building' | 'failed' | 'none'
+
+/** Where one attempt at building an image got to. */
+export type ImagePhase = 'queued' | 'fetching' | 'running' | 'succeeded' | 'failed'
 
 /**
- * One golden image build, as the host reports it.
+ * One attempt at building a pool's image, kept with everything it printed.
  *
- * A machine pool with no runners is either starting one or building the image
- * it would boot, and those look identical from the outside. This is the
- * difference.
+ * Kept, and not only while it matters: the log of the build that failed last
+ * Tuesday is the evidence for what a recipe did.
  */
 export interface ImageBuild {
-  image: string
+  id: number
   pool: string
-  /** The runner whose agent is doing the build; the others wait on it. */
-  runner: string
-  phase: BuildPhase
-  /** What it is doing, in its own words: the last line its console printed. */
-  detail?: string
+  image: string
+  phase: ImagePhase
+  /** Who asked: the daemon needing an image, or somebody pressing the button. */
+  trigger: 'automatic' | 'requested' | string
   error?: string
-  /** Where the whole console of a failed build was kept. */
-  console?: string
-  /** It has printed nothing for a long time. Not the same as dead. */
-  silent?: boolean
   startedAt: string
   endedAt?: string
-  /** How long it has been running, or how long it took. */
+  /** How long it has been going, or how long it took. */
   seconds: number
+  /** The last thing its log said. */
+  detail?: string
+  /** It has printed nothing for a long time. Not the same as dead. */
+  silent?: boolean
+  /** There is something to read. */
+  hasLog: boolean
+}
+
+/** A pool's image: where it stands, and the attempt that says so. */
+export interface PoolImage {
+  pool: string
+  image: string
+  state: ImageState
+  /** Whether this pool may have runners at all. */
+  ready: boolean
+  summary: string
+  build?: ImageBuild
 }
 
 export type RunnerState = 'running' | 'stopping' | 'stopped'
@@ -388,9 +402,26 @@ export const api = {
       `/api/jobs?days=${days}`,
     ),
 
+  /** Where every pool's image stands, which is what the pools table shows. */
+  poolImages: () => request<PoolImage[]>('/api/pool-images'),
+  /** One pool's image and every attempt this host has made at it. */
+  poolImage: (id: number) =>
+    request<{ status: PoolImage; builds: ImageBuild[] }>(`/api/pools/${id}/image`),
+  /**
+   * Ask for a build. A failed one is never retried on its own — a recipe that
+   * cannot work should fail once, not for ever — so this is how it is tried
+   * again.
+   */
+  buildPoolImage: (id: number) =>
+    request<ImageBuild>(`/api/pools/${id}/image/builds`, { method: 'POST' }),
+  /** The whole account of one build. It is a console: read, not parsed. */
+  imageBuildLog: async (id: number): Promise<string> => {
+    const response = await fetch(`/api/image-builds/${id}/log`)
+    if (!response.ok) throw new ApiError(response.statusText, response.status)
+    return response.text()
+  },
+
   /** What the host and its runners are using, as of the daemon's last reading. */
-  /** What this host is building, and what last happened to each pool's image. */
-  imageBuilds: () => request<ImageBuild[]>('/api/image-builds'),
 
   resources: () => request<ResourceReport>('/api/resources'),
   /** What the host has been using, over a window. */

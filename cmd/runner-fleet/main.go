@@ -27,10 +27,18 @@ import (
 var version = "dev"
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "runner-fleet: "+err.Error())
-		os.Exit(1)
+	err := run(os.Args[1:])
+	if err == nil {
+		return
 	}
+	fmt.Fprintln(os.Stderr, "runner-fleet: "+err.Error())
+	// A runner whose image is not built is not a runner that failed at
+	// something it could retry. It exits with a code of its own so that its
+	// unit knows not to start it again — see agent.ExitImageNotBuilt.
+	if errors.Is(err, agent.ErrImageNotBuilt) {
+		os.Exit(agent.ExitImageNotBuilt)
+	}
+	os.Exit(1)
 }
 
 func run(args []string) error {

@@ -309,6 +309,11 @@ EnvironmentFile=%s/%%i.env
 ExecStart=%s agent --name %%i
 
 Restart=always
+# Except when the image it would boot has not been built. That is the daemon's
+# to fix — by building it, or by not asking for this runner at all — and a unit
+# that retried it would be back to rebuilding a broken recipe every two seconds
+# with nobody reading the result.
+RestartPreventExitStatus=%d
 # Two seconds, not fifteen. An ephemeral runner is replaced after every single
 # job, so this delay is paid by every job on the host — it was a third of the
 # gap between one finishing and the next being able to start. The start limiter
@@ -330,7 +335,7 @@ TimeoutStopSec=3660
 
 [Install]
 WantedBy=multi-user.target
-`, e.layout.RunnersDir(), e.user, Slice, e.layout.RunnersDir(), e.binary)
+`, e.layout.RunnersDir(), e.user, Slice, e.layout.RunnersDir(), e.binary, agent.ExitImageNotBuilt)
 }
 
 func unitName(runner string) string { return UnitTemplate + runner + ".service" }

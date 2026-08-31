@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -14,9 +16,8 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/clems4ever/github-runner/internal/agent"
-	"github.com/clems4ever/github-runner/internal/builds"
 	"github.com/clems4ever/github-runner/internal/github"
+	"github.com/clems4ever/github-runner/internal/imagebuild"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/reconcile"
 	"github.com/clems4ever/github-runner/internal/resources"
@@ -48,14 +49,51 @@ type stubResources struct {
 
 func (r *stubResources) Latest() (resources.Report, bool) { return r.report, r.ready }
 
-// stubBuilds stands in for the images directory, which only exists on a host
-// that builds machines.
-type stubBuilds struct {
-	list []builds.Build
-	err  error
+// stubImages stands in for the builder, which only exists on a host that
+// builds machines.
+type stubImages struct {
+	state   map[string]imagebuild.State
+	history []imagebuild.Build
+	log     string
+	// asked is the pools somebody pressed the button for, and forgotten the
+	// ones that were deleted.
+	asked     []string
+	forgotten []string
+	busy      bool
+	err       error
 }
 
-func (b *stubBuilds) List() ([]builds.Build, error) { return b.list, b.err }
+func (i *stubImages) Status(pool model.Pool) imagebuild.Status {
+	state := i.state[pool.Name]
+	if state == "" {
+		state = imagebuild.StateUnbuilt
+	}
+	return imagebuild.Status{
+		Pool: pool.Name, Image: "runner-noble-default-abc123", State: state,
+		Ready: state == imagebuild.StateReady, Summary: "as it stands",
+	}
+}
+
+func (i *stubImages) History(ctx context.Context, pool string, limit int) ([]imagebuild.Build, error) {
+	return i.history, i.err
+}
+
+func (i *stubImages) Log(ctx context.Context, id int64, maxBytes int64) (string, error) {
+	return i.log, i.err
+}
+
+func (i *stubImages) Forget(ctx context.Context, pool string) error {
+	i.forgotten = append(i.forgotten, pool)
+	return nil
+}
+
+func (i *stubImages) Rebuild(ctx context.Context, pool model.Pool) (imagebuild.Build, error) {
+	if i.busy {
+		return imagebuild.Build{}, imagebuild.ErrBusy
+	}
+	i.asked = append(i.asked, pool.Name)
+	return imagebuild.Build{ImageBuild: model.ImageBuild{ID: 7, Pool: pool.Name, Phase: model.ImageQueued}}, nil
+}
 
 type harness struct {
 	t           *testing.T
@@ -64,7 +102,7 @@ type harness struct {
 	fleet       *stubFleet
 	nudges      int
 	resources   *stubResources
-	builds      *stubBuilds
+	images      *stubImages
 	credID      int64
 	checkAccess func(context.Context, int64, github.Scope) error
 }
@@ -82,9 +120,10 @@ func newHarness(t *testing.T) *harness {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	h := &harness{t: t, store: db, fleet: &stubFleet{}, resources: &stubResources{}, builds: &stubBuilds{}}
+	h := &harness{t: t, store: db, fleet: &stubFleet{}, resources: &stubResources{},
+		images: &stubImages{state: map[string]imagebuild.State{}}}
 	srv := New(Options{
-		Store: db, Fleet: h.fleet, Resources: h.resources, Builds: h.builds, Version: "test",
+		Store: db, Fleet: h.fleet, Resources: h.resources, Images: h.images, Version: "test",
 		UI:    fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html>fleet</html>")}},
 		Nudge: func() { h.nudges++ },
 		CheckAccess: func(ctx context.Context, id int64, scope github.Scope) error {
@@ -147,6 +186,17 @@ func (h *harness) samplePool() map[string]any {
 		"runtime": "vm", "minReplicas": 2, "maxReplicas": 4, "labels": []string{"gpu"},
 		"credentialId": h.credID, "enabled": true,
 	}
+}
+
+// createPool makes one and hands back what the daemon stored, which is where
+// its id comes from.
+func (h *harness) createPool(name string) model.Pool {
+	h.t.Helper()
+	body := h.samplePool()
+	body["name"] = name
+	var created model.Pool
+	h.decode(h.do("POST", "/api/pools", body), &created)
+	return created
 }
 
 // Nothing but health may be reachable without credentials: this daemon can
@@ -937,55 +987,123 @@ func TestResourceHistoryRefusesAWindowItCannotServe(t *testing.T) {
 	}
 }
 
-// The endpoint the fleet page asks every few seconds for the reason a pool has
-// no runners.
-func TestImageBuildsAreServed(t *testing.T) {
+// The signal the pools table shows against every row: whether this pool's
+// image is built, and so whether it can take a job at all.
+func TestEveryPoolSaysWhereItsImageStands(t *testing.T) {
 	h := newHarness(t)
 	pool := h.samplePool()
 	pool["name"] = "web"
 	h.do("POST", "/api/pools", pool).Body.Close()
+	h.images.state["web"] = imagebuild.StateBuilding
 
-	h.builds.list = []builds.Build{{
-		Image: "runner-fleet-noble-abc", Pool: "web", Runner: "web-1",
-		Phase: agent.BuildRunning, Detail: "running this pool's recipe", Seconds: 252,
-	}}
-
-	var got []builds.Build
-	h.decode(h.do("GET", "/api/image-builds", nil), &got)
+	var got []imagebuild.Status
+	h.decode(h.do("GET", "/api/pool-images", nil), &got)
 	if len(got) != 1 {
-		t.Fatalf("got %d builds", len(got))
+		t.Fatalf("got %d statuses", len(got))
 	}
-	if got[0].Detail != "running this pool's recipe" || got[0].Seconds != 252 {
+	if got[0].Pool != "web" || got[0].State != imagebuild.StateBuilding || got[0].Ready {
 		t.Fatalf("got %+v", got[0])
 	}
 }
 
-// A build belonging to a pool somebody deleted is not news. Without this the
-// record would outlive the pool and sit on the page for ever, because a failed
-// build is deliberately kept until the build that fixes it replaces it — and
-// for a deleted pool, that build never comes.
-func TestABuildForAPoolThatIsGoneIsNotReported(t *testing.T) {
+// The history is the part that was missing. A failed build used to be replaced
+// by the next attempt at the same thing, so what a recipe did survived only
+// until something tried again.
+func TestAPoolsImageCarriesEveryAttemptAtIt(t *testing.T) {
 	h := newHarness(t)
-	h.builds.list = []builds.Build{{
-		Image: "img", Pool: "deleted-last-week", Runner: "x-1",
-		Phase: agent.BuildFailed, Error: "the recipe exited 1",
-	}}
+	created := h.createPool("web")
+	h.images.history = []imagebuild.Build{
+		{ImageBuild: model.ImageBuild{ID: 2, Pool: "web", Phase: model.ImageSucceeded}},
+		{ImageBuild: model.ImageBuild{ID: 1, Pool: "web", Phase: model.ImageFailed,
+			Error: "the recipe exited 1"}, HasLog: true},
+	}
 
-	var got []builds.Build
-	h.decode(h.do("GET", "/api/image-builds", nil), &got)
-	if len(got) != 0 {
-		t.Fatalf("a deleted pool's build is still being reported: %+v", got)
+	var got struct {
+		Status imagebuild.Status  `json:"status"`
+		Builds []imagebuild.Build `json:"builds"`
+	}
+	h.decode(h.do("GET", fmt.Sprintf("/api/pools/%d/image", created.ID), nil), &got)
+	if len(got.Builds) != 2 {
+		t.Fatalf("got %d builds", len(got.Builds))
+	}
+	if got.Builds[1].Error != "the recipe exited 1" {
+		t.Fatalf("the failure was not kept: %+v", got.Builds[1])
 	}
 }
 
-// A container-only fleet has no host directory to read and no builds to
-// report, and that is an empty list rather than an error the page has to
-// handle.
-func TestADaemonWithNoImagesDirectory(t *testing.T) {
+// A build that failed is not retried on its own, so there has to be a way to
+// ask for another one.
+func TestABuildCanBeAskedFor(t *testing.T) {
 	h := newHarness(t)
-	h.builds.err = errors.New("should not be asked")
-	// Rebuilt without a builds source at all, which is how a daemon that
-	// cannot build machines is configured.
+	created := h.createPool("web")
+
+	resp := h.do("POST", fmt.Sprintf("/api/pools/%d/image/builds", created.ID), nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if len(h.images.asked) != 1 || h.images.asked[0] != "web" {
+		t.Fatalf("the builder was asked for %v", h.images.asked)
+	}
+	// The fleet is told, so the pool picks its runners up as soon as the image
+	// is there rather than at the next tick.
+	if h.nudges == 0 {
+		t.Error("nothing asked the fleet to reconcile after a build was requested")
+	}
+}
+
+// Two of the same build is a working directory two processes are fighting
+// over. Asking again while one is running is refused, not queued.
+func TestABuildAlreadyHappeningIsRefused(t *testing.T) {
+	h := newHarness(t)
+	created := h.createPool("web")
+	h.images.busy = true
+
+	resp := h.do("POST", fmt.Sprintf("/api/pools/%d/image/builds", created.ID), nil)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+// A deleted pool's builds are unreachable — the history is filed under the
+// pool — and each of their logs is a console worth megabytes.
+func TestDeletingAPoolForgetsItsBuilds(t *testing.T) {
+	h := newHarness(t)
+	created := h.createPool("web")
+
+	h.do("DELETE", fmt.Sprintf("/api/pools/%d", created.ID), nil).Body.Close()
+	if len(h.images.forgotten) != 1 || h.images.forgotten[0] != "web" {
+		t.Fatalf("the builder was told to forget %v", h.images.forgotten)
+	}
+}
+
+// The log is a console. It is read, not parsed.
+func TestABuildLogIsServedAsText(t *testing.T) {
+	h := newHarness(t)
+	h.images.log = "==> building runner-noble-default-abc123\ncloud-init running\n"
+
+	resp := h.do("GET", "/api/image-builds/3/log", nil)
+	defer resp.Body.Close()
+	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain") {
+		t.Fatalf("content type %q", got)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "cloud-init running") {
+		t.Fatalf("got %q", body)
+	}
+}
+
+// A container-only fleet builds nothing, and every pool on it says so rather
+// than the page having to handle an error.
+func TestADaemonThatBuildsNothing(t *testing.T) {
+	h := newHarness(t)
+	h.createPool("web")
+	// Rebuilt without a builder at all, which is how a daemon that cannot
+	// build machines is configured.
 	srv := New(Options{Store: h.store, Fleet: h.fleet})
 	if err := srv.Auth().SetPassword(context.Background(), "admin", "correct-horse"); err != nil {
 		t.Fatal(err)
@@ -993,7 +1111,7 @@ func TestADaemonWithNoImagesDirectory(t *testing.T) {
 	server := httptest.NewServer(srv.Handler())
 	defer server.Close()
 
-	req, _ := http.NewRequest("GET", server.URL+"/api/image-builds", nil)
+	req, _ := http.NewRequest("GET", server.URL+"/api/pool-images", nil)
 	req.SetBasicAuth("admin", "correct-horse")
 	resp, err := server.Client().Do(req)
 	if err != nil {
@@ -1003,11 +1121,11 @@ func TestADaemonWithNoImagesDirectory(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("got %d", resp.StatusCode)
 	}
-	var got []builds.Build
+	var got []imagebuild.Status
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 0 {
+	if len(got) != 1 || got[0].State != imagebuild.StateNone || !got[0].Ready {
 		t.Fatalf("got %+v", got)
 	}
 }

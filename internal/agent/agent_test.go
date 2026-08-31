@@ -1,14 +1,16 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -608,32 +610,109 @@ func TestABuildIsOnlyDoneWhenItSaysSo(t *testing.T) {
 	}
 }
 
-// The console is the only account of what a recipe did, and the directory it
-// is written in is deleted as the build returns. The error used to name a file
-// that no longer existed.
-func TestAFailedBuildsConsoleOutlivesIt(t *testing.T) {
-	work := t.TempDir()
-	images := t.TempDir()
-	console := filepath.Join(work, "console.log")
-	if err := os.WriteFile(console, []byte("the recipe said no\n"), 0o600); err != nil {
+// The log is what somebody watching a build reads, and it has to be the same
+// file that is kept afterwards: a console copied in only once the build has
+// failed is a console nobody could have watched.
+func TestTheConsoleReachesTheLogWhileTheBuildIsStillRunning(t *testing.T) {
+	console := filepath.Join(t.TempDir(), "console.log")
+	var log lockedBuffer
+
+	stop := followConsole(console, &log)
+	if err := os.WriteFile(console, []byte("cloud-init running\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	read, saved := keepBuildConsole(console, images)
-	if !strings.Contains(string(read), "the recipe said no") {
-		t.Fatalf("the console was read as %q", read)
-	}
-	if err := os.RemoveAll(work); err != nil {
-		t.Fatal(err)
+	// Before the build ends, which is the whole point.
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(log.String(), "cloud-init running") {
+		if time.Now().After(deadline) {
+			t.Fatalf("nothing reached the log while the build was running: %q", log.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	kept, err := os.ReadFile(saved)
+	// And the last thing the machine said before it powered off is not lost to
+	// the tick the copier never got to.
+	f, err := os.OpenFile(console, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		t.Fatalf("the console the error names is not there: %v", err)
+		t.Fatal(err)
 	}
-	if !strings.Contains(string(kept), "the recipe said no") {
-		t.Fatalf("the console was kept but says %q", kept)
+	if _, err := f.WriteString(ImageReadyMarker + "\n"); err != nil {
+		t.Fatal(err)
 	}
+	f.Close()
+
+	whole := stop()
+	if !strings.Contains(string(whole), ImageReadyMarker) {
+		t.Errorf("the last words of the build were lost: %q", whole)
+	}
+	if !strings.Contains(log.String(), ImageReadyMarker) {
+		t.Errorf("the log ends before the build did: %q", log.String())
+	}
+}
+
+// A build that cannot start still has to say so in the log, because the log is
+// the only thing a person opens.
+func TestAFailedBuildSaysSoInItsLog(t *testing.T) {
+	var log lockedBuffer
+
+	// Cancelled before it starts, so this fails on the first command it runs
+	// rather than downloading an operating system.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := BuildImage(ctx, BuildOptions{
+		Spec:      ImageSpec{Variant: "default", Recipe: "echo hello\n"},
+		ImagesDir: t.TempDir(),
+		PublicKey: "ssh-ed25519 KEY",
+		Journal:   &log,
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err == nil {
+		t.Fatal("a build with a cancelled context reported success")
+	}
+	if !strings.Contains(log.String(), "building runner-") {
+		t.Errorf("the log does not say what was being built: %q", log.String())
+	}
+}
+
+// A runner does not build its own image. The daemon builds it first, and a
+// machine that finds one missing says which one and stops — the alternative is
+// a unit rebuilding a broken recipe every two seconds.
+func TestARunnerRefusesToStartWithoutItsImage(t *testing.T) {
+	state := t.TempDir()
+	err := runVM(context.Background(), Config{
+		Runner: "web-1", Pool: "web", StateDir: state,
+		Image: "default", Recipe: "echo hello\n",
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	if !errors.Is(err, ErrImageNotBuilt) {
+		t.Fatalf("a runner with no image failed with %v", err)
+	}
+	// Named, because "an image is missing" on a host with six of them is not
+	// something anybody can act on.
+	want := ImageSpec{Variant: "default", Recipe: "echo hello\n"}.Name()
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("the error does not name the image it wanted: %v", err)
+	}
+}
+
+// lockedBuffer is a journal a test can read while a build is writing to it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func TestConfigCarriesWhatTheImageBakesIn(t *testing.T) {
@@ -679,94 +758,4 @@ func TestAnUndecodableRecipeStopsTheRunner(t *testing.T) {
 	if _, err := ConfigFromEnv(""); err == nil {
 		t.Fatal("a runner started with a recipe it could not read, and would have built an image without it")
 	}
-}
-
-// The record the daemon reads. A build happens in a runner's own unit, before
-// the machine it is for exists, so nothing else on this host can say what is
-// happening — and the fleet page shows a pool short of a runner with no
-// explanation attached to it.
-func TestABuildIsWrittenDownWhereTheDaemonCanReadIt(t *testing.T) {
-	dir := t.TempDir()
-	spec := ImageSpec{Variant: "default", Recipe: "echo hello\n"}
-
-	// Cancelled before it starts, so this fails in the first command it runs
-	// rather than downloading an operating system. Which command fails does
-	// not matter: what is being tested is that failing at all is recorded.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	_, err := EnsureImage(ctx, spec, dir, "ssh-ed25519 KEY",
-		BuildFor{Pool: "web", Runner: "web-1"}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err == nil {
-		t.Fatal("a build with a cancelled context reported success")
-	}
-
-	body, readErr := os.ReadFile(filepath.Join(BuildsDir(dir), spec.Name()+".json"))
-	if readErr != nil {
-		t.Fatalf("the build left no record: %v", readErr)
-	}
-	var record BuildRecord
-	if err := json.Unmarshal(body, &record); err != nil {
-		t.Fatalf("the record is not readable: %v", err)
-	}
-
-	if record.Phase != BuildFailed {
-		t.Errorf("a failed build recorded phase %q", record.Phase)
-	}
-	if record.Error == "" {
-		t.Error("the record says it failed without saying why, which is the whole point of it")
-	}
-	if record.EndedAt == nil {
-		t.Error("a finished build has no end, so the page would show it running for ever")
-	}
-	// Whose it is. A hash on the page tells nobody anything.
-	if record.Pool != "web" || record.Runner != "web-1" {
-		t.Errorf("got pool %q runner %q", record.Pool, record.Runner)
-	}
-	if record.Image != spec.Name() {
-		t.Errorf("the record names image %q", record.Image)
-	}
-}
-
-// Written when the build STARTS, not when it ends. A record that appeared at
-// the end would say nothing for the entire time somebody is waiting, which is
-// the only time anybody looks.
-func TestABuildIsVisibleWhileItIsStillHappening(t *testing.T) {
-	dir := t.TempDir()
-	started := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
-
-	startBuild(dir, "some-image", "web", "web-1", started)
-
-	body, err := os.ReadFile(filepath.Join(BuildsDir(dir), "some-image.json"))
-	if err != nil {
-		t.Fatalf("nothing was written until the build finished: %v", err)
-	}
-	var record BuildRecord
-	if err := json.Unmarshal(body, &record); err != nil {
-		t.Fatal(err)
-	}
-	if record.Phase != BuildFetching {
-		t.Errorf("a build that has just started is in phase %q", record.Phase)
-	}
-	if !record.StartedAt.Equal(started) {
-		t.Errorf("it started at %s", record.StartedAt)
-	}
-	if record.EndedAt != nil {
-		t.Error("a build that has not finished has an end time")
-	}
-}
-
-// Reporting is worth an image; it is not worth a fleet. A directory that
-// cannot be written must not be the reason a pool has no runners.
-func TestABuildThatCannotBeWrittenDownStillBuilds(t *testing.T) {
-	// A file where the directory would go: MkdirAll fails, every write fails.
-	dir := t.TempDir()
-	if err := os.WriteFile(BuildsDir(dir), []byte("in the way"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	journal := startBuild(dir, "img", "web", "web-1", time.Now())
-	journal.phase(BuildRunning)
-	journal.finish(nil, "", time.Now())
-	// Reaching here without a panic is the test.
 }

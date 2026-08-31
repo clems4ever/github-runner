@@ -37,11 +37,13 @@ import {
   scaled,
   type Credential,
   type Pool,
+  type PoolImage,
   type Runner,
   type Scale,
 } from '../api'
 import { Field, useNarrow } from '../responsive'
 import { ImportPools } from './ImportPools'
+import { ImageBadge, PoolImagePanel } from './PoolImage'
 import { PoolEditor } from './PoolEditor'
 
 export function PoolsPage({
@@ -49,18 +51,25 @@ export function PoolsPage({
   credentials,
   runners,
   scaling,
+  images,
   onChange,
 }: {
   pools: Pool[]
   credentials: Credential[]
   runners: Runner[]
   scaling: Record<string, Scale>
+  /** Where each pool's image stands, by pool name. */
+  images: Record<string, PoolImage>
   onChange: () => Promise<void>
 }) {
   const narrow = useNarrow()
   const [editing, setEditing] = useState<Partial<Pool> | null>(null)
   const [deleting, setDeleting] = useState<Pool | null>(null)
   const [importing, setImporting] = useState(false)
+  // Whose image is being looked at. A machine pool has no runners until its
+  // image is built, so this is the answer to the most common question the
+  // table raises.
+  const [image, setImage] = useState<Pool | null>(null)
   // Growing is applied where it is clicked; shrinking is asked about first,
   // so this holds the pool as it would be once the operator agrees.
   const [shrinking, setShrinking] = useState<Pool | null>(null)
@@ -166,6 +175,8 @@ export function PoolsPage({
               key={pool.id}
               pool={pool}
               live={runnersOf(pool).length}
+              image={images[pool.name]}
+              onOpenImage={() => setImage(pool)}
               decision={scaling[pool.name]}
               scaling={pending === pool.id}
               onChange={onChange}
@@ -185,6 +196,7 @@ export function PoolsPage({
                 <Table.Th>Scope</Table.Th>
                 <Table.Th>Runtime</Table.Th>
                 <Table.Th>Runners</Table.Th>
+                <Table.Th w={130}>Image</Table.Th>
                 <Table.Th>Labels</Table.Th>
                 <Table.Th>Size</Table.Th>
                 <Table.Th w={100}>Enabled</Table.Th>
@@ -214,6 +226,9 @@ export function PoolsPage({
                         onScaleUp={applyScale}
                         onScaleDown={setShrinking}
                       />
+                    </Table.Td>
+                    <Table.Td>
+                      <ImageBadge status={images[pool.name]} onOpen={() => setImage(pool)} />
                     </Table.Td>
                     <Table.Td>
                       <LabelBadges pool={pool} />
@@ -260,6 +275,8 @@ export function PoolsPage({
           />
         )}
       </Modal>
+
+      <PoolImagePanel pool={image} opened={image !== null} onClose={() => setImage(null)} />
 
       <Modal
         opened={importing}
@@ -348,6 +365,8 @@ export function PoolsPage({
 function PoolCard({
   pool,
   live,
+  image,
+  onOpenImage,
   decision,
   scaling,
   onChange,
@@ -358,6 +377,8 @@ function PoolCard({
 }: {
   pool: Pool
   live: number
+  image?: PoolImage
+  onOpenImage: () => void
   decision?: Scale
   scaling: boolean
   onChange: () => Promise<void>
@@ -393,6 +414,9 @@ function PoolCard({
             onScaleUp={onScaleUp}
             onScaleDown={onScaleDown}
           />
+        </Field>
+        <Field label="Image">
+          <ImageBadge status={image} onOpen={onOpenImage} />
         </Field>
         <Field label="Labels">
           <LabelBadges pool={pool} />

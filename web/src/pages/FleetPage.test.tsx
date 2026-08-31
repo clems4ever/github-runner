@@ -44,7 +44,6 @@ async function renderPage(
         credentials={credentials}
         scaling={scaling}
         warnings={warnings}
-        imageBuilds={[]}
         loading={false}
         onChange={onChange}
       />

@@ -717,3 +717,80 @@ func TestARunnerOnItsWayUpIsNotReportedAsUnknown(t *testing.T) {
 		})
 	}
 }
+
+// The rule that stops a pool taking a job it cannot run: no runner exists
+// until the image it would boot has been built.
+//
+// A machine cannot boot an image that is not there, so what used to happen was
+// a runner that built one itself while GitHub was told the pool was up — and a
+// pool whose recipe had just changed kept working on the image it had before,
+// which is the wrong image by definition.
+func TestAPoolWaitsForItsImage(t *testing.T) {
+	h := newHarness(testPool("web", 2))
+	ready := false
+	h.rec.WithImages(func(ctx context.Context, pool model.Pool) (bool, string) {
+		return ready, "its image is still building"
+	})
+	ctx := context.Background()
+
+	result := h.rec.Once(ctx)
+	if len(h.vm.calls) != 0 {
+		t.Fatalf("runners were created before the image existed: %v", h.vm.calls)
+	}
+	// And the pool says why, in the words a person reads rather than as an
+	// empty row.
+	if got := result.Scaling["web"]; got.Target != 0 || got.Reason != "its image is still building" {
+		t.Fatalf("the pool reports %+v", got)
+	}
+
+	ready = true
+	h.rec.Once(ctx)
+	if got := strings.Join(h.vm.calls, "; "); got != "create web-1; create web-2" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// The same rule from the other side: a pool whose image stops being the one it
+// asks for — because its recipe was edited and the new image has not been
+// built — drains rather than going on working with the old one.
+//
+// Drained, not killed: each runner finishes the job it is on first.
+func TestAPoolDrainsWhenItsImageIsNoLongerBuilt(t *testing.T) {
+	h := newHarness(testPool("web", 2))
+	ready := true
+	h.rec.WithImages(func(ctx context.Context, pool model.Pool) (bool, string) {
+		return ready, "its image did not build"
+	})
+	ctx := context.Background()
+	h.rec.Once(ctx)
+
+	h.vm.calls = nil
+	ready = false
+	h.rec.Once(ctx)
+	if got := strings.Join(h.vm.calls, "; "); got != "drain web-1; drain web-2" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+// A container pool has no image of this kind — it runs one somebody else
+// published — and must not be held back by a builder that has nothing to say
+// about it.
+func TestAContainerPoolIsNeverHeldBackByAnImageBuild(t *testing.T) {
+	pool := testPool("ci", 1)
+	pool.Runtime = model.RuntimeContainer
+	pool.Defaults()
+	h := newHarness(pool)
+	asked := 0
+	h.rec.WithImages(func(ctx context.Context, p model.Pool) (bool, string) {
+		asked++
+		return false, "nothing has been built"
+	})
+
+	h.rec.Once(context.Background())
+	if asked != 0 {
+		t.Fatalf("a container pool was asked about a golden image %d times", asked)
+	}
+	if got := strings.Join(h.docker.calls, "; "); got != "create ci-1" {
+		t.Fatalf("got %q", got)
+	}
+}

@@ -73,12 +73,25 @@ type ClientFactory func(secret model.Secret) (GitHubClient, error)
 // the daemon's help — on tmpfs, so it never reaches a disk.
 type CredentialWriter func(id int64, secret string) error
 
+// ImageReady is asked, for every machine pool that wants runners, whether the
+// golden image those runners would boot has been built on this host — and asks
+// for it to be built when it has not.
+//
+// It is a function rather than a dependency so that the fleet's rules stay
+// testable without a hypervisor: a reconciler with none behaves as though every
+// image were ready, which is what a container-only host is.
+//
+// The reason it comes back with is shown to a person, so it is a sentence
+// about the pool and not about the builder.
+type ImageReady func(ctx context.Context, pool model.Pool) (ready bool, why string)
+
 // Reconciler drives the fleet towards what the store asks for.
 type Reconciler struct {
 	store       Fleet
 	executors   map[model.Runtime]Executor
 	newClient   ClientFactory
 	writeSecret CredentialWriter
+	images      ImageReady
 	log         *slog.Logger
 
 	// pass serialises whole reconcile passes. The daemon's loop is not the
@@ -152,6 +165,35 @@ func (r *Reconciler) lastBusy(pool string, runners []Runner, states map[string]g
 	return r.busySince[pool]
 }
 
+// holdForImage keeps a pool at no runners until the image they would boot has
+// been built on this host.
+//
+// This is what makes a build something that happens BEFORE a pool works rather
+// than underneath it. A machine cannot boot an image that does not exist, so
+// the old behaviour was a runner that built one itself while GitHub was told
+// the pool was there — and a pool whose recipe had changed went on taking jobs
+// on the image it had before, which is the wrong image by definition.
+//
+// Holding a pool at nothing drains what it already has. That is the point: the
+// runners of a pool whose image is not built are running something other than
+// what the pool asks for, and they finish the job they are on before they go.
+func (r *Reconciler) holdForImage(ctx context.Context, pool model.Pool, scale Scale) Scale {
+	if r.images == nil || !pool.Enabled || pool.Runtime != model.RuntimeVM {
+		return scale
+	}
+	ready, why := r.images(ctx, pool)
+	if ready {
+		return scale
+	}
+	if why == "" {
+		why = "its golden image has not been built on this host yet"
+	}
+	scale.Target = 0
+	scale.ScaledUp = false
+	scale.Reason = why
+	return scale
+}
+
 // budget is what the whole fleet may take from this host.
 //
 // A budget that cannot be read, or that has been stored in a shape this daemon
@@ -217,6 +259,13 @@ func (r *Reconciler) Scaling() map[string]Scale {
 // WithClock replaces the clock, for tests.
 func (r *Reconciler) WithClock(now func() time.Time) *Reconciler {
 	r.now = now
+	return r
+}
+
+// WithImages makes the fleet wait for its images: a machine pool gets no
+// runners until the one they would boot exists.
+func (r *Reconciler) WithImages(ready ImageReady) *Reconciler {
+	r.images = ready
 	return r
 }
 
@@ -366,7 +415,8 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			continue // its credential could not be read; already reported
 		}
 		mine := byPool[pool.Name]
-		scaling[pool.Name] = Autoscale(pool, mine, states, r.lastBusy(pool.Name, mine, states), r.now())
+		scale := Autoscale(pool, mine, states, r.lastBusy(pool.Name, mine, states), r.now())
+		scaling[pool.Name] = r.holdForImage(ctx, pool, scale)
 	}
 
 	// Each pool has now said how large it would like to be. The budget is what

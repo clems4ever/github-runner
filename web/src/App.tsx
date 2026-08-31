@@ -29,8 +29,8 @@ import {
   api,
   type Credential,
   type Health,
-  type ImageBuild,
   type Pool,
+  type PoolImage,
   type ResourceReport,
   type Runner,
   type Scale,
@@ -68,19 +68,22 @@ export function App() {
   const [credentials, setCredentials] = useState<Credential[]>([])
   const [health, setHealth] = useState<Health | null>(null)
   const [resources, setResources] = useState<ResourceReport | null>(null)
-  const [imageBuilds, setImageBuilds] = useState<ImageBuild[]>([])
+  // Where each pool's image stands, by pool. A machine pool has no runners
+  // until its image is built, so this belongs to the pools table rather than
+  // to a banner over the fleet.
+  const [images, setImages] = useState<Record<string, PoolImage>>({})
   const [loading, setLoading] = useState(true)
 
   const refresh = useCallback(async () => {
     try {
-      const [poolList, runnerList, credentialList, healthInfo, resourceReport, builds] =
+      const [poolList, runnerList, credentialList, healthInfo, resourceReport, poolImages] =
         await Promise.all([
           api.pools(),
           api.runners(),
           api.credentials(),
           api.health(),
           api.resources(),
-          api.imageBuilds(),
+          api.poolImages(),
         ])
       setPools(poolList)
       setRunners(runnerList.runners ?? [])
@@ -89,7 +92,7 @@ export function App() {
       setCredentials(credentialList)
       setHealth(healthInfo)
       setResources(resourceReport)
-      setImageBuilds(builds)
+      setImages(Object.fromEntries(poolImages.map((image) => [image.pool, image])))
     } catch (error) {
       notifications.show({
         color: 'red',
@@ -191,7 +194,6 @@ export function App() {
             credentials={credentials}
             scaling={scaling}
             warnings={warnings}
-            imageBuilds={imageBuilds}
             loading={loading}
             onChange={refresh}
           />
@@ -202,6 +204,7 @@ export function App() {
             credentials={credentials}
             runners={runners}
             scaling={scaling}
+            images={images}
             onChange={refresh}
           />
         )}
