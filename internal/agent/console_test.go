@@ -153,7 +153,7 @@ func TestAMachineRunnerMayUpdateItself(t *testing.T) {
 	// The version has to be one somebody keeps current, so it is named here:
 	// a bump is a deliberate act, and the weekly workflow opens the pull
 	// request that prompts it.
-	if RunnerVersion < "2.336.0" {
+	if RunnerVersion < "2.337.0" {
 		t.Errorf("the image carries runner %s, and GitHub deprecates old ones server-side", RunnerVersion)
 	}
 }

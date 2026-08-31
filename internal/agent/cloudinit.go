@@ -27,7 +27,7 @@ const UbuntuRelease = "noble"
 // a newer one exists. Any one of those three would have been enough; the point
 // of having all three is that the failure is silent and the clock is somebody
 // else's.
-const RunnerVersion = "2.336.0"
+const RunnerVersion = "2.337.0"
 
 // basePackages is what a job can reasonably expect to find: the toolchain that
 // workflows written for GitHub-hosted runners assume, plus Docker and QEMU so a
