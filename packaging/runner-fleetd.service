@@ -19,11 +19,37 @@ RestartSec=5
 KillMode=control-group
 TimeoutStopSec=30
 
+# /run/runner-fleet, made by systemd rather than by the daemon.
+#
+# /run is a tmpfs, so this directory is gone after every boot. The daemon
+# creates it itself (paths.EnsureDirs) -- but it never gets the chance, because
+# ReadWritePaths= below needs every path it names to EXIST when the mount
+# namespace is built, and that happens before ExecStart. The unit then fails at
+# step NAMESPACE with status 226, restarting for ever and naming a binary that
+# is perfectly present:
+#
+#   Failed to set up mount namespacing: /run/runner-fleet: No such file or directory
+#   Failed at step NAMESPACE spawning /usr/local/bin/runner-fleet: No such file or directory
+#
+# RuntimeDirectory= is created before the namespace is set up, which is early
+# enough, and it is re-made on every boot. It is also implicitly writable, so
+# the path comes off ReadWritePaths= rather than being named twice.
+RuntimeDirectory=runner-fleet
+# 0700, matching paths.EnsureDirs. MkdirAll leaves an existing directory's mode
+# alone, so the 0755 default would simply stay 0755 -- the daemon would not
+# narrow it. Ownership is still the daemon's to hand over (paths.AgentDirs).
+RuntimeDirectoryMode=0700
+# Kept when the daemon stops, which is what makes the promise at the top of this
+# file true. The decrypted credential a running agent reads lives in here, and
+# the default is to delete the directory on stop -- so restarting the daemon
+# would take the runners' credentials out from under them, jobs included.
+RuntimeDirectoryPreserve=yes
+
 # What it needs and nothing else. It cannot write outside its own directories.
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
-ReadWritePaths=/etc/runner-fleet /var/lib/runner-fleet /run/runner-fleet /etc/systemd/system
+ReadWritePaths=/etc/runner-fleet /var/lib/runner-fleet /etc/systemd/system
 
 [Install]
 WantedBy=multi-user.target
