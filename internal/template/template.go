@@ -86,6 +86,11 @@ var local = map[string]string{
 	"credentialId": "a credential belongs to the host it was sealed on — the import asks which one to use",
 	"createdAt":    "timestamps are recorded by the daemon",
 	"updatedAt":    "timestamps are recorded by the daemon",
+	// Deliberately not portable. Letting a repository add to a pool's image is
+	// a decision about *that* repository on *this* host — a template that
+	// carried "trust" would install an approval nobody made, on a scope the
+	// importer may be overriding anyway. It is one control in the pool editor.
+	"layers": "whether a repository may add to a pool's image is decided on the host, per pool",
 }
 
 // Parse reads a document and rejects anything that is not one.

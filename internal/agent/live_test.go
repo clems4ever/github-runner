@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -132,7 +133,13 @@ func TestLiveBuildLayerOnGoldenImage(t *testing.T) {
 }
 
 // A machine's disk is an overlay on the layer, so the chain a runner actually
-// boots is three deep. QEMU is the only thing whose opinion of that counts.
+// boots is three deep: golden image, repository layer, the machine's own disk.
+// QEMU is the only thing whose opinion of that counts, so this boots it.
+//
+// What it looks for inside is one thing from each level — the runner from the
+// image, the packages from the layer, the file the repository's recipe wrote —
+// because a chain that boots but has lost a level is exactly the failure this
+// is for. A job would find that out halfway through.
 func TestLiveMachineBootsThroughTheWholeChain(t *testing.T) {
 	dir := liveImages(t)
 	base := ImageSpec{Variant: "default"}
@@ -145,13 +152,17 @@ func TestLiveMachineBootsThroughTheWholeChain(t *testing.T) {
 		t.Skip("build the layer first")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
 
 	work := t.TempDir()
 	disk := filepath.Join(work, "disk.qcow2")
-	if err := runIn(ctx, dir, "qemu-img", "create", "-q", "-f", "qcow2",
-		"-F", "qcow2", "-b", layer.Name(), disk); err != nil {
+	// The backing file is named absolutely, which is what the agent does: the
+	// name is stored inside the qcow2 and resolved against wherever the
+	// overlay is, and the overlay is in the machine's own directory rather
+	// than next to the images.
+	if err := runIn(ctx, work, "qemu-img", "create", "-q", "-f", "qcow2",
+		"-F", "qcow2", "-b", layer.Path(dir), disk); err != nil {
 		t.Fatal(err)
 	}
 
@@ -160,12 +171,105 @@ func TestLiveMachineBootsThroughTheWholeChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The collector reads exactly this to decide what it may delete, so it is
+	// asked the same question here rather than trusted to agree.
 	for _, want := range []string{layer.Name(), base.Name()} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("%s is not in the chain a machine boots:\n%s", want, out)
 		}
 	}
-	// The collector reads exactly this to decide what it may delete, so it is
-	// asked the same question here rather than trusted to agree.
-	t.Logf("chain:\n%s", out)
+
+	seed := filepath.Join(work, "seed.iso")
+	if err := makeSeed(ctx, chainCheckUserData(liveKey(t, dir)),
+		metaData("runner-fleet-chain", "chain-check-1"), seed); err != nil {
+		t.Fatal(err)
+	}
+
+	port, err := freePort()
+	if err != nil {
+		t.Fatal(err)
+	}
+	console := filepath.Join(work, "console.log")
+	cmd, err := bootVM(ctx, VMOptions{
+		Name: "runner-fleet-chain", Dir: work, Disk: disk, Seed: seed,
+		CPUs: 2, MemoryMB: 2048, SSHPort: port,
+		CPUModel:  CPUModel(CPUVendor(), false),
+		QMPSocket: filepath.Join(work, "qmp.sock"),
+		Console:   console,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := followConsole(console, os.Stdout)
+	waitErr := cmd.Wait()
+	said := string(stop())
+
+	if ctx.Err() != nil {
+		t.Fatalf("the machine never finished: %v", ctx.Err())
+	}
+	if waitErr != nil && ignoreCleanExit(waitErr) != nil {
+		t.Fatalf("the machine failed: %v", waitErr)
+	}
+	if !strings.Contains(said, chainOKMarker) {
+		t.Fatalf("the machine did not report a whole chain; its console said:\n%s",
+			lastOf(said, 4000))
+	}
+	t.Log("booted a three-deep chain with every level intact")
+}
+
+// chainOKMarker is how the machine says every level of its chain is there. The
+// console is the only channel out of a machine nothing has logged into.
+const chainOKMarker = "runner-fleet: chain ok"
+
+// chainCheckUserData boots the machine, looks for one thing from each level of
+// the chain, says what it found, and switches the machine off.
+func chainCheckUserData(publicKey string) string {
+	check := `#!/usr/bin/env bash
+set -uo pipefail
+fail=0
+say() { echo "runner-fleet: $*" > /dev/console; }
+
+# From the golden image: the Actions runner, and the user it runs as.
+[ -x /home/runner/actions-runner/run.sh ] || { say "MISSING the actions runner"; fail=1; }
+id runner >/dev/null 2>&1 || { say "MISSING the runner user"; fail=1; }
+
+# From the layer: the packages the repository asked for.
+for tool in jq sqlite3; do
+  command -v "$tool" >/dev/null 2>&1 || { say "MISSING $tool"; fail=1; }
+done
+
+# From the layer's recipe: the file it wrote.
+[ -f /etc/runner-fleet-layer-test ] || { say "MISSING what the recipe wrote"; fail=1; }
+
+if [ "$fail" -eq 0 ]; then say "chain ok"; else say "chain broken"; fi
+systemctl poweroff
+`
+	return fmt.Sprintf(`#cloud-config
+hostname: runner-fleet-chain
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - %s
+
+write_files:
+  - path: /usr/local/bin/chain-check.sh
+    permissions: '0755'
+    owner: 'root:root'
+    content: |
+%s
+
+runcmd:
+  - [ /usr/local/bin/chain-check.sh ]
+`, publicKey, indent(check, "      "))
+}
+
+// lastOf is the end of a console, for a failure message that has to be read.
+func lastOf(text string, n int) string {
+	if len(text) <= n {
+		return text
+	}
+	return text[len(text)-n:]
 }

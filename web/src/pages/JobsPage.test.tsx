@@ -30,6 +30,7 @@ const pool = (name: string): Pool => ({
   image: 'default',
   packages: [],
   recipe: '',
+  layers: 'off',
   credentialId: 1,
   enabled: true,
   createdAt: '',

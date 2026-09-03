@@ -76,6 +76,7 @@ const pool = (over: Partial<Pool> = {}): Pool => ({
   image: 'default',
   packages: [],
   recipe: '',
+  layers: 'off',
   credentialId: 1,
   enabled: true,
   createdAt: '',

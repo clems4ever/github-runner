@@ -376,6 +376,12 @@ func RenderEnv(spec reconcile.Spec, layout paths.Layout) string {
 	fmt.Fprintf(&b, "FLEET_MEMORY_MB=%d\n", spec.MemoryMB)
 	fmt.Fprintf(&b, "FLEET_DISK_GB=%d\n", spec.DiskGB)
 	fmt.Fprintf(&b, "FLEET_IMAGE=%s\n", spec.Image)
+	// The per-repository layer, when the pool has one and it has been built.
+	// Written only when there is one: an empty value would be a file name the
+	// agent then refused to find, and a pool without layers would never start.
+	if spec.Layer != "" {
+		fmt.Fprintf(&b, "FLEET_LAYER=%s\n", spec.Layer)
+	}
 	if len(spec.Packages) > 0 {
 		fmt.Fprintf(&b, "FLEET_PACKAGES=%s\n", strings.Join(spec.Packages, ","))
 	}

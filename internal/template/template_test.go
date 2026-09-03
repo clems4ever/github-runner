@@ -452,3 +452,36 @@ func TestImportingARecipeOntoAContainerPoolIsRefused(t *testing.T) {
 		t.Fatal("a container pool was imported with a recipe it cannot run")
 	}
 }
+
+// A template is portable and a layer policy is not: it says that a particular
+// repository may run a script as root on this host. Carried in a document,
+// importing somebody else's template would install an approval nobody on this
+// host made — so it is refused, by name, rather than ignored.
+func TestATemplateDoesNotCarryALayerPolicy(t *testing.T) {
+	_, err := Parse([]byte(`{"version":1,"pools":[{"name":"web","layers":"trust"}]}`))
+	if err == nil {
+		t.Fatal("a layer policy was imported from a template")
+	}
+	if !strings.Contains(err.Error(), "decided on the host") {
+		t.Fatalf("got %v, want it to say where that decision belongs", err)
+	}
+}
+
+// The mirror: exporting a pool that has one must not put it in the document,
+// or the fleet's own export would not import back into it.
+func TestExportLeavesTheLayerPolicyBehind(t *testing.T) {
+	doc := Export([]model.Pool{{
+		Name: "web", ScopeKind: model.ScopeRepository, Scope: "o/r",
+		Runtime: model.RuntimeVM, Layers: model.LayersTrust,
+	}})
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "layers") {
+		t.Fatalf("the export carries a layer policy:\n%s", raw)
+	}
+	if _, err := Parse(raw); err != nil {
+		t.Fatalf("this daemon's own export does not import back into it: %v", err)
+	}
+}

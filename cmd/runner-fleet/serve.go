@@ -176,8 +176,11 @@ func serveCommand(args []string) error {
 		Fleet:     reconciler,
 		Resources: sampler,
 		Images:    builder,
-		UI:        uiAssets(log),
-		Version:   version,
+		// So that approving a definition takes effect now rather than at the
+		// resolver's next reading of the repository.
+		Layers:  repoLayers,
+		UI:      uiAssets(log),
+		Version: version,
 		// Asked when a pool is saved, so a credential that cannot serve it is
 		// caught while someone is looking at the form rather than a minute
 		// later in a log.
