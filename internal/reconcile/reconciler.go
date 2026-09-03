@@ -170,8 +170,12 @@ func (r *Reconciler) lastBusy(pool string, runners []Runner, states map[string]g
 			busy = true
 			break
 		}
-		if _, known := states[runner.Name]; !known &&
-			runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
+		// Young enough that a job could still be on its way to it, whether or
+		// not GitHub has said it registered. Registering quickly is not
+		// evidence a job has arrived, and this timestamp belongs to the pool
+		// rather than the runner: it can predate the runner by any amount, so
+		// a runner judged on it alone is drained the moment it registers.
+		if runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
 			busy = true
 			break
 		}
