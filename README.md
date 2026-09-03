@@ -513,6 +513,18 @@ what keeps the guarantee above: a machine that comes back with the daemon down
 registers from the credential it keeps, and a machine restarted by systemd
 after a job gets a fresh configuration instead of replaying a used one.
 
+The registration path is covered by tests that talk to real GitHub, because a
+fake server can only confirm that the client sends what this repository thinks
+GitHub wants. They are skipped unless told where to run:
+
+```
+FLEET_LIVE_TOKEN=… FLEET_LIVE_REPO=owner/name go test ./internal/github -run Live
+```
+
+The token needs `Administration: read and write` on that repository, which is
+what minting a configuration requires. Every runner they register is
+deregistered again, under a name nothing else would choose.
+
 Container images are expected to carry the GitHub Actions runner. The official
 `ghcr.io/actions/actions-runner` works as it is; a custom image is found by
 looking for `config.sh`, or told where to look with `FLEET_RUNNER_HOME` — which
