@@ -15,6 +15,7 @@ import (
 
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/model"
+	"github.com/clems4ever/github-runner/internal/qmp"
 )
 
 // shutdownGrace is how long the agent waits for a machine to stop on its own
@@ -139,7 +140,7 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 	go func() { exited <- cmd.Wait() }()
 
 	press := func() error {
-		if err := powerDown(options.QMPSocket); err != nil {
+		if err := qmp.PowerDown(options.QMPSocket); err != nil {
 			// The monitor is the polite route. Without it the only thing left
 			// is a signal to QEMU, which is a power cut.
 			_ = cmd.Process.Signal(syscall.SIGTERM)

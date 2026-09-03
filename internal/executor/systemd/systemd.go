@@ -24,6 +24,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/agent"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
+	"github.com/clems4ever/github-runner/internal/qmp"
 	"github.com/clems4ever/github-runner/internal/reconcile"
 	"github.com/clems4ever/github-runner/internal/resources"
 )
@@ -505,9 +506,47 @@ func (e *Executor) List(ctx context.Context) ([]reconcile.Runner, error) {
 			}
 			runners[i].Coming = unit.coming
 		}
+		if trouble := e.machineTrouble(runners[i]); trouble != "" {
+			runners[i].Trouble = trouble
+		}
 	}
 	sort.Slice(runners, func(i, j int) bool { return runners[i].Name < runners[j].Name })
 	return runners, nil
+}
+
+// machineTrouble asks QEMU whether the machine behind a running unit is
+// actually executing instructions, and says so when it is not.
+//
+// systemd cannot answer this. A machine QEMU has stopped has a live process and
+// a perfectly active unit, so every layer above reports it as running while it
+// executes nothing: the fleet showed RUNNING, the runner inside stopped
+// heartbeating, and GitHub's view of its job went to unknown. Four machines
+// once sat like that for hours across a whole host, and restarting the daemon
+// could not have helped — the daemon does not own them, and says so on the way
+// out ("shutting down; the runners keep running").
+//
+// The state that matters is io-error. QEMU's default write-error policy stops a
+// machine when the host has no space left rather than passing the error into
+// the guest — which is the right trade, because it keeps the guest's filesystem
+// whole instead of corrupting it. But nothing resumes a machine on its own, so
+// the fleet has to be the thing that notices.
+//
+// Best effort by design: a monitor that cannot be reached says nothing here.
+// The unit state above is what the reconciler acts on, and a machine mid-boot
+// or mid-shutdown has no monitor to answer.
+func (e *Executor) machineTrouble(runner reconcile.Runner) string {
+	if runner.Runtime != model.RuntimeVM || runner.State == reconcile.StateStopped {
+		return ""
+	}
+	status, err := qmp.Status(e.layout.QMPSocket(runner.Name))
+	if err != nil || status == qmp.StatusRunning {
+		return ""
+	}
+	if status == qmp.StatusIOError {
+		return fmt.Sprintf("stopped by QEMU on a write error and will not resume on its own — "+
+			"check the host's free space, then: runner-fleet machine resume %s", runner.Name)
+	}
+	return fmt.Sprintf("QEMU reports the machine is %q, not running", status)
 }
 
 // unit is what systemd says about one runner.
