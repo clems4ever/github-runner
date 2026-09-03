@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -55,8 +56,8 @@ func TestJITConfigAsksForOneRunner(t *testing.T) {
 }
 
 // GitHub rejects an empty label list, and a pool is allowed to name none. The
-// self-hosted label is on every runner anyway, so it is the one that changes
-// nothing about which jobs the runner can take.
+// labels a runner would have configured for itself are the ones that change
+// nothing about which jobs it can take, so they are what it asks for.
 func TestJITConfigNeverAsksWithNoLabels(t *testing.T) {
 	var asked map[string]any
 	client, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -67,10 +68,59 @@ func TestJITConfigNeverAsksWithNoLabels(t *testing.T) {
 	if _, err := client.JITConfig(context.Background(), repoScope(), JIT{Name: "web-1"}); err != nil {
 		t.Fatal(err)
 	}
-	labels, _ := asked["labels"].([]any)
-	if len(labels) != 1 || labels[0] != "self-hosted" {
-		t.Fatalf("labels %v, want just self-hosted", asked["labels"])
+	if got := labelsAsked(t, asked); !reflect.DeepEqual(got, implicitLabels) {
+		t.Fatalf("labels %v, want %v", got, implicitLabels)
 	}
+}
+
+// The labels a runner configures for itself are the ones Serves treats as
+// implicit, and this endpoint adds none of them: a runner registered without
+// them is one the fleet scales up for and GitHub never offers the job to,
+// because runs-on nearly always names self-hosted.
+func TestJITConfigAsksForTheImplicitLabelsToo(t *testing.T) {
+	var asked map[string]any
+	client, _ := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		asked = body(t, r)
+		w.Write([]byte(`{"encoded_jit_config":"BASE64"}`))
+	})
+
+	want := JIT{Name: "web-1", Labels: []string{"vm", "ephemeral", "jit-fleet-smoke"}}
+	if _, err := client.JITConfig(context.Background(), repoScope(), want); err != nil {
+		t.Fatal(err)
+	}
+
+	got := labelsAsked(t, asked)
+	if !Serves(got, []string{"self-hosted", "linux", "vm", "jit-fleet-smoke"}) {
+		t.Fatalf("registered %v, which is not offered the job it was woken for", got)
+	}
+	// The pool's own labels survive, and nothing is asked for twice.
+	seen := map[string]bool{}
+	for _, label := range got {
+		if seen[strings.ToLower(label)] {
+			t.Fatalf("asked for %q twice in %v", label, got)
+		}
+		seen[strings.ToLower(label)] = true
+	}
+	for _, label := range want.Labels {
+		if !seen[label] {
+			t.Errorf("dropped the pool's own label %q from %v", label, got)
+		}
+	}
+}
+
+// labelsAsked is the label list out of a generate-jitconfig body.
+func labelsAsked(t *testing.T, asked map[string]any) []string {
+	t.Helper()
+	raw, _ := asked["labels"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, label := range raw {
+		text, ok := label.(string)
+		if !ok {
+			t.Fatalf("label %v is not a string", label)
+		}
+		out = append(out, text)
+	}
+	return out
 }
 
 // A runner's name is its identity in the fleet and is reused on purpose. This

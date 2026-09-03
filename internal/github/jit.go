@@ -64,12 +64,13 @@ type JIT struct {
 // authenticates with, so it is handed to exactly one machine and never
 // written anywhere it outlives that machine.
 func (c *Client) JITConfig(ctx context.Context, scope Scope, want JIT) (string, error) {
-	labels := want.Labels
-	if len(labels) == 0 {
-		// GitHub refuses an empty list. Every runner carries this label
-		// regardless, so it is the one that changes nothing.
-		labels = []string{"self-hosted"}
-	}
+	// A runner that configures itself adds self-hosted, Linux and X64 on its
+	// own, which is why Serves treats them as implicit. This endpoint does not:
+	// a just-in-time runner carries exactly the labels named here and nothing
+	// else. Leaving them out registers a runner the fleet believes serves a job
+	// that GitHub will never offer it — the pool wakes, boots, registers, and
+	// the job waits for a runner that does not match it.
+	labels := withImplicit(want.Labels)
 
 	group, err := c.runnerGroupID(ctx, scope, want.Group)
 	if err != nil {

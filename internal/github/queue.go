@@ -131,6 +131,37 @@ var implicit = map[string]bool{
 	"x64":         true,
 }
 
+// implicitLabels is implicit in the spelling GitHub's own runners use, and in
+// the order they report them.
+var implicitLabels = []string{"self-hosted", "Linux", "X64"}
+
+// withImplicit is what a runner has to register with to be given the jobs
+// Serves says its pool can take.
+//
+// A runner that configures itself adds these; one configured just-in-time is
+// given exactly what the request named. Serves treats them as implicit either
+// way, so a just-in-time runner that does not carry them is one the fleet
+// scales up for and GitHub never offers the job to.
+func withImplicit(labels []string) []string {
+	has := make(map[string]bool, len(labels)+len(implicitLabels))
+	out := make([]string, 0, len(labels)+len(implicitLabels))
+	add := func(label string) {
+		key := strings.ToLower(strings.TrimSpace(label))
+		if key == "" || has[key] {
+			return
+		}
+		has[key] = true
+		out = append(out, label)
+	}
+	for _, label := range implicitLabels {
+		add(label)
+	}
+	for _, label := range labels {
+		add(label)
+	}
+	return out
+}
+
 // Serves reports whether a runner with these labels would be given a job that
 // asked for those.
 //
