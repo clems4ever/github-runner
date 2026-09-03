@@ -122,7 +122,7 @@ behave the way anyone editing them would hope:
 
 - change either, and the daemon builds a new image; the pool's runners drain as
   they finish their jobs and come back on the new one
-- change them back, and the old image is almost certainly still on the host, so
+- change them back within a day, and the old image is still on the host, so
   nothing is rebuilt
 - leave them alone, and no machine ever rebuilds anything
 
@@ -408,6 +408,7 @@ pool says which of the two problems this is.
 | --- | --- |
 | **CPU** | processors across every machine together, as `CPUQuota` on the slice. Throughput, not a set of cores |
 | **Memory** | MiB across every machine together, as `MemoryHigh` |
+| **Disk** | GiB across the machines' disks and the golden images underneath them. Not enforced by the slice — see below |
 | **Share when contended** | `CPUWeight`: what the fleet gets when something else on this host wants the machine too. Not a cap — a fleet with only this set may still use the whole host |
 | **Kill at the ceiling** | off by default. See below |
 
@@ -418,6 +419,33 @@ which picks the largest machine in the group rather than the one that overspent
 — so it costs somebody their job, and not necessarily the person whose job
 caused it. That is the switch, it is off, and turning it on puts `MemoryMax`
 five per cent above the ceiling so the reclaim has somewhere to happen first.
+
+**Disk is the one the slice cannot hold.** There is no disk equivalent of
+`CPUQuota`, and it is also the dimension that behaves least like the other two:
+processors and memory come back the moment a machine stops, and disk does not. A
+machine's disk grows as its job writes and is only freed when the machine is
+destroyed; a golden image is not freed at all. So the ceiling is held from two
+sides in the daemon instead — it does not start the machine that would cross it,
+and it collects golden images to get back underneath.
+
+**Golden images are collected.** An image no pool asks for and no machine is
+booting is deleted after a day. The day is deliberate: the usual reason an image
+goes unwanted is somebody editing a recipe and putting it back, and that round
+trip is minutes where a rebuild is tens of them. Past the disk ceiling the grace
+does not apply and the oldest unwanted images go first, only as many as it takes
+to fit. Two things are never collected whatever the ceiling says: an image a
+pool asks for, and an image something is booting — including the ones further
+down a backing chain, read from the machines' own disks rather than from
+anything the daemon remembers, so a restart does not lose track of them. If that
+cannot be read at all, nothing is collected; a full disk is a bad afternoon, and
+deleting an image out from under a running job is somebody's job.
+
+Machines that were killed rather than stopped — a host crash, the out-of-memory
+killer, `kill -9` — used to leave their disks behind for ever, because the only
+thing that ever deleted one was the machine itself on the way out. The daemon now
+sweeps them at startup, which is the one moment nothing it started is running:
+a directory belonging to no runner it knows about, that no process has open, is
+gone.
 
 Changing the budget applies to the machines that are already running: the limits
 are properties of a group that already holds them. Lowering it drains the excess

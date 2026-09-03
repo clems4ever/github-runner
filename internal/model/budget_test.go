@@ -128,6 +128,8 @@ func TestABudgetThatCouldOnlyBeAMistakeIsRefused(t *testing.T) {
 		"a gigabyte as MiB":    {MemoryMB: 8},
 		"more memory than any": {MemoryMB: MaxBudgetMemoryMB + 1},
 		"a weight of zero-ish": {CPUWeight: -5},
+		"a disk under one VM":  {DiskGB: 20},
+		"more disk than any":   {DiskGB: MaxBudgetDiskGB + 1},
 		"a weight off the end": {CPUWeight: MaxCPUWeight + 1},
 	} {
 		if err := budget.Validate(); err == nil {
@@ -156,6 +158,8 @@ func TestZeroIsHowACapIsRemoved(t *testing.T) {
 	for _, budget := range []Budget{
 		{CPUs: 0, MemoryMB: 4096},
 		{CPUs: 4, MemoryMB: 0},
+		{DiskGB: 0, CPUs: 4},
+		{DiskGB: 200},
 		{},
 	} {
 		if err := budget.Validate(); err != nil {

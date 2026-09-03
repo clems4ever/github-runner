@@ -278,6 +278,15 @@ export interface Budget {
   /** MiB across every machine together. 0 is no cap. */
   memoryMb: number
   /**
+   * GiB across the machines' disks and the golden images underneath them
+   * together, because they share one filesystem. 0 is no cap.
+   *
+   * Unlike the other two this is not held by a control group: the daemon does
+   * not start a machine that would cross it, and collects golden images
+   * nothing is booting until the fleet fits back underneath.
+   */
+  diskGb: number
+  /**
    * Whether to add a hard limit above the ceiling, past which the kernel kills
    * a machine mid-job. Off by default: the ceiling on its own makes the fleet
    * slower, and the alternative costs somebody their job.

@@ -3,6 +3,7 @@ package reconcile
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/clems4ever/github-runner/internal/model"
 )
@@ -82,7 +83,7 @@ func Ration(pools []model.Pool, scaling map[string]Scale, budget model.Budget) m
 	// Whether the minimums alone have already overrun, which changes what a
 	// pool held at its minimum should be told: there is a difference between a
 	// budget that is fully spent and one that was never large enough.
-	overcommitted := !spent.fits(budget, 0, 0)
+	overcommitted := !spent.fits(budget, 0, 0, 0)
 
 	// Then the growth, a runner at a time, round by round.
 	for {
@@ -91,7 +92,7 @@ func Ration(pools []model.Pool, scaling map[string]Scale, budget model.Budget) m
 			if granted[pool.Name] >= wanted[pool.Name] {
 				continue
 			}
-			if !spent.fits(budget, pool.CPUs, pool.MemoryMB) {
+			if !spent.fits(budget, pool.CPUs, pool.MemoryMB, pool.DiskGB) {
 				continue
 			}
 			granted[pool.Name]++
@@ -135,13 +136,23 @@ func budgetReason(overcommitted bool, budget model.Budget) string {
 // describe says what the budget is, in the terms it was set in, so the reason
 // on the pools page can be read without opening the settings page.
 func describe(budget model.Budget) string {
-	switch {
-	case budget.CPUs > 0 && budget.MemoryMB > 0:
-		return fmt.Sprintf("%d cpus and %d MiB", budget.CPUs, budget.MemoryMB)
-	case budget.CPUs > 0:
-		return fmt.Sprintf("%d cpus", budget.CPUs)
+	var parts []string
+	if budget.CPUs > 0 {
+		parts = append(parts, fmt.Sprintf("%d cpus", budget.CPUs))
+	}
+	if budget.MemoryMB > 0 {
+		parts = append(parts, fmt.Sprintf("%d MiB", budget.MemoryMB))
+	}
+	if budget.DiskGB > 0 {
+		parts = append(parts, fmt.Sprintf("%d GB of disk", budget.DiskGB))
+	}
+	switch len(parts) {
+	case 0:
+		return "nothing"
+	case 1:
+		return parts[0]
 	default:
-		return fmt.Sprintf("%d MiB", budget.MemoryMB)
+		return strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
 	}
 }
 
@@ -150,21 +161,26 @@ func describe(budget model.Budget) string {
 type purse struct {
 	cpus     int
 	memoryMB int
+	diskGB   int
 }
 
 func (p *purse) add(pool model.Pool, runners int) {
 	p.cpus += runners * pool.CPUs
 	p.memoryMB += runners * pool.MemoryMB
+	p.diskGB += runners * pool.DiskGB
 }
 
 // fits reports whether one more runner of the given size stays inside the
 // budget. A dimension the budget does not name is not a constraint — a budget
 // that caps memory and not processors is a memory budget, not a refusal.
-func (p *purse) fits(budget model.Budget, cpus, memoryMB int) bool {
+func (p *purse) fits(budget model.Budget, cpus, memoryMB, diskGB int) bool {
 	if budget.CPUs > 0 && p.cpus+cpus > budget.CPUs {
 		return false
 	}
 	if budget.MemoryMB > 0 && p.memoryMB+memoryMB > budget.MemoryMB {
+		return false
+	}
+	if budget.DiskGB > 0 && p.diskGB+diskGB > budget.DiskGB {
 		return false
 	}
 	return true

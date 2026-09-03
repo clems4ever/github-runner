@@ -134,13 +134,13 @@ describe('ResourcesPage', () => {
   // of zeroes reading "uncapped, uncapped, uncapped" is a row somebody has to
   // learn to ignore.
   it('says nothing about a budget nobody set', async () => {
-    await renderPage(report({ budget: { cpus: 0, cpuWeight: 0, memoryMb: 0, hardMemory: false } }))
+    await renderPage(report({ budget: { cpus: 0, cpuWeight: 0, memoryMb: 0, diskGb: 0, hardMemory: false } }))
     expect(screen.queryByText('Fleet budget')).not.toBeInTheDocument()
   })
 
   it('shows the budget against the host once there is one', async () => {
     await renderPage(
-      report({ budget: { cpus: 4, cpuWeight: 0, memoryMb: 8192, hardMemory: false } }),
+      report({ budget: { cpus: 4, cpuWeight: 0, memoryMb: 8192, diskGb: 0, hardMemory: false } }),
     )
 
     expect(screen.getByText('Fleet budget')).toBeInTheDocument()
@@ -156,7 +156,7 @@ describe('ResourcesPage', () => {
     await renderPage(
       report({
         committed: { runners: 8, cpus: 32, memoryBytes: 64 * 1024 ** 3, diskBytes: 0 },
-        budget: { cpus: 4, cpuWeight: 0, memoryMb: 8192, hardMemory: false },
+        budget: { cpus: 4, cpuWeight: 0, memoryMb: 8192, diskGb: 0, hardMemory: false },
       }),
     )
 
@@ -167,7 +167,7 @@ describe('ResourcesPage', () => {
   // read afterwards looking for a reason that is not in the job's own log.
   it('says out loud when the fleet is set to kill a machine at the ceiling', async () => {
     await renderPage(
-      report({ budget: { cpus: 0, cpuWeight: 0, memoryMb: 8192, hardMemory: true } }),
+      report({ budget: { cpus: 0, cpuWeight: 0, memoryMb: 8192, diskGb: 0, hardMemory: true } }),
     )
 
     expect(screen.getByText('a machine is killed')).toBeInTheDocument()
@@ -178,19 +178,30 @@ describe('ResourcesPage', () => {
   // still allowed the whole host.
   it('shows a share without claiming anything is capped', async () => {
     await renderPage(
-      report({ budget: { cpus: 0, cpuWeight: 20, memoryMb: 0, hardMemory: false } }),
+      report({ budget: { cpus: 0, cpuWeight: 20, memoryMb: 0, diskGb: 0, hardMemory: false } }),
     )
 
     expect(screen.getByText('Share when contended')).toBeInTheDocument()
     expect(screen.getByText('20')).toBeInTheDocument()
-    expect(screen.getAllByText('uncapped')).toHaveLength(2)
+    expect(screen.getAllByText('uncapped')).toHaveLength(3)
+  })
+
+  // Disk is the dimension a host actually runs out of, and the page somebody
+  // opens when it has has to show what the ceiling was.
+  it('shows the disk ceiling against what the filesystem has', async () => {
+    await renderPage(
+      report({ budget: { cpus: 0, cpuWeight: 0, memoryMb: 0, diskGb: 200, hardMemory: false } }),
+    )
+
+    expect(screen.getAllByText('Disk').length).toBeGreaterThan(0)
+    expect(screen.getByText(/200 GB of/)).toBeInTheDocument()
   })
 
   // Containers are not in the group the budget is enforced in, and a host
   // running both would otherwise read this as a fleet-wide ceiling.
   it('says which runtime the budget covers', async () => {
     await renderPage(
-      report({ budget: { cpus: 4, cpuWeight: 0, memoryMb: 0, hardMemory: false } }),
+      report({ budget: { cpus: 4, cpuWeight: 0, memoryMb: 0, diskGb: 0, hardMemory: false } }),
     )
     expect(screen.getByText(/Machine pools only/)).toBeInTheDocument()
   })

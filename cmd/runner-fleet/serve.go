@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/agent"
 	"github.com/clems4ever/github-runner/internal/api"
 	"github.com/clems4ever/github-runner/internal/executor/docker"
 	"github.com/clems4ever/github-runner/internal/executor/systemd"
@@ -38,6 +40,8 @@ func serveCommand(args []string) error {
 	interval := flags.Duration("interval", 30*time.Second, "how often to reconcile")
 	sampleInterval := flags.Duration("resource-interval", 15*time.Second,
 		"how often to measure what the host and its runners are using")
+	collectInterval := flags.Duration("collect-interval", 10*time.Minute,
+		"how often to delete golden images no pool wants and nothing is booting")
 	user := flags.String("user", "runner-fleet", "the service user the runners' units run as")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -106,6 +110,15 @@ func serveCommand(args []string) error {
 	if err := builder.Adopt(context.Background()); err != nil {
 		log.Warn("could not read what this host has built", "error", err)
 	}
+
+	// Working directories left behind by machines that were killed rather than
+	// stopped. A machine deletes its own on the way out, which does not happen
+	// when the process is killed, when the host crashes, or when the OOM killer
+	// picks it — so they accumulated, several gigabytes at a time, and nothing
+	// ever looked at them. Startup is the right moment: it is the one point at
+	// which no machine this daemon started is running yet, so anything with a
+	// file open in there is a survivor of the last run and is left alone.
+	sweep(layout, log)
 
 	// The reconciler is told how to reach GitHub and how to hand a credential
 	// to a runner. Both are injected rather than reached for directly, which
@@ -215,6 +228,12 @@ func serveCommand(args []string) error {
 	// dense wherever the fleet was busy and sparse everywhere else — an evenly
 	// spaced record is the one a chart can be read off.
 	go sampler.Run(ctx, *sampleInterval)
+	// On a clock of its own too, and a slow one. Collecting is minutes of
+	// nothing followed by deleting a few gigabytes, and there is no reason for
+	// it to share the reconciler's cadence or to hold up a pass while it walks
+	// the disk.
+	go collectLoop(ctx, db, imagebuild.NewGC(layout.ImagesDir(),
+		filepath.Join(layout.State, "vms"), 0), *collectInterval, log)
 
 	select {
 	case err := <-serving:
@@ -233,6 +252,107 @@ func serveCommand(args []string) error {
 	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	return httpServer.Shutdown(shutdownCtx)
+}
+
+// sweep deletes the working directories of machines that no longer exist.
+//
+// What counts as existing is answered from the environment files rather than
+// from systemd: a unit that failed is still a runner this host is responsible
+// for, and its disk is not garbage. A directory something still has open is
+// left alone whatever the environment files say — that is the one case they
+// cannot cover, a daemon that went down between asking a machine to stop and
+// seeing it stop.
+func sweep(layout paths.Layout, log *slog.Logger) {
+	known := func(runner string) bool {
+		_, err := os.Stat(layout.RunnerEnv(runner))
+		return err == nil
+	}
+	swept, freed, err := agent.SweepVMDirs(layout.State, known, agent.InUseByProcess)
+	if err != nil {
+		// Reported and carried on with. A directory that could not be deleted
+		// is disk this host does not get back, which is worth saying and is not
+		// worth refusing to start over.
+		log.Warn("could not sweep every abandoned machine directory", "error", err)
+	}
+	if len(swept) > 0 {
+		log.Info("swept abandoned machine directories",
+			"runners", strings.Join(swept, ","), "freed", human(freed))
+	}
+}
+
+// collectLoop deletes golden images nothing wants, for ever.
+//
+// The set of images the fleet wants is rebuilt from the pools on every pass
+// rather than remembered, because it changes whenever somebody edits a recipe —
+// and the whole reason images accumulate is that editing one mints another.
+func collectLoop(ctx context.Context, db *store.Store, gc *imagebuild.GC,
+	interval time.Duration, log *slog.Logger) {
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	pass := func() {
+		pools, err := db.ListPools(ctx)
+		if err != nil {
+			log.Warn("could not read the pools to collect images", "error", err)
+			return
+		}
+		// Every pool's image, including the pools that are switched off: a pool
+		// somebody disabled for the afternoon should not have to rebuild.
+		wanted := map[string]bool{}
+		for _, pool := range pools {
+			if pool.Runtime == model.RuntimeVM {
+				wanted[imagebuild.Image(pool)] = true
+			}
+		}
+
+		// The fleet's disk ceiling, read each pass so that lowering it in the
+		// UI takes effect at the next collection rather than at the next
+		// restart.
+		var ceiling int64
+		if stored, err := db.Setting(ctx, model.SettingFleetBudget); err == nil {
+			if budget, err := model.ParseBudget(stored); err == nil {
+				ceiling = int64(budget.DiskGB) * 1024 * 1024 * 1024
+			}
+		}
+		gc.WithCeiling(ceiling)
+
+		collected, err := gc.Collect(ctx, wanted)
+		if err != nil {
+			log.Warn("could not collect golden images", "error", err)
+			return
+		}
+		if len(collected.Deleted) > 0 {
+			log.Info("collected golden images",
+				"images", strings.Join(collected.Deleted, ","),
+				"freed", human(collected.Freed), "kept", collected.Kept,
+				"onDisk", human(collected.Total))
+		}
+	}
+
+	pass()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pass()
+		}
+	}
+}
+
+// human is a byte count as somebody would say it, for a log line.
+func human(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	value, exponent := float64(bytes)/unit, 0
+	for value >= unit && exponent < 3 {
+		value /= unit
+		exponent++
+	}
+	return fmt.Sprintf("%.1f %ciB", value, "KMGT"[exponent])
 }
 
 // portOf is the last colon-separated part of a listen address, for a message

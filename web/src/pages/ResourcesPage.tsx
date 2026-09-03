@@ -266,13 +266,15 @@ function Budgeted({
   committed?: Commitment
   host: HostResources
 }) {
-  if (!budget.cpus && !budget.memoryMb && !budget.cpuWeight) return null
+  if (!budget.cpus && !budget.memoryMb && !budget.diskGb && !budget.cpuWeight) return null
 
   const budgetMemoryBytes = budget.memoryMb * 1024 * 1024
+  const budgetDiskBytes = budget.diskGb * 1024 * 1024 * 1024
   const cpuHeld = Boolean(budget.cpus && committed && committed.cpus > budget.cpus)
   const memoryHeld = Boolean(
     budget.memoryMb && committed && committed.memoryBytes > budgetMemoryBytes,
   )
+  const diskHeld = Boolean(budget.diskGb && committed && committed.diskBytes > budgetDiskBytes)
 
   return (
     <Card withBorder padding="md">
@@ -293,6 +295,13 @@ function Budgeted({
               : 'uncapped'
           }
           note={memoryHeld ? 'pools held below their maximums' : undefined}
+        />
+        <Fact
+          label="Disk"
+          value={
+            budget.diskGb ? `${bytes(budgetDiskBytes)} of ${bytes(host.diskTotalBytes)}` : 'uncapped'
+          }
+          note={diskHeld ? 'pools held below their maximums' : undefined}
         />
         {Boolean(budget.cpuWeight) && (
           <Fact
@@ -315,7 +324,9 @@ function Budgeted({
       {/* Machines only, and said here rather than in a tooltip: a host running
           container pools would otherwise read this as a fleet-wide ceiling. */}
       <Text size="xs" c="dimmed" mt="xs">
-        Machine pools only. Containers are not inside the group this is enforced in.
+        Machine pools only. Containers are not inside the group this is enforced in. Disk is not
+        enforced there either — there is no disk equivalent of a CPU quota — so it is held by not
+        starting the machine that would cross it, and by collecting golden images nothing wants.
       </Text>
     </Card>
   )
