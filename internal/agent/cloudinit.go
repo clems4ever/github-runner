@@ -125,6 +125,14 @@ users:
     ssh_authorized_keys:
       - %s
 
+# A build fetches several hundred packages and takes minutes to do it. Without
+# this, one connection dropped anywhere in that is the whole build: apt gives
+# up on the file, the install exits non-zero, and everything downloaded so far
+# is thrown away with the disk. Retrying costs nothing when the link is good.
+apt:
+  conf: |
+    Acquire::Retries "5";
+
 package_update: true
 package_upgrade: true
 packages:

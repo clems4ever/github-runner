@@ -22,6 +22,7 @@ import (
 	"github.com/clems4ever/github-runner/internal/executor/systemd"
 	"github.com/clems4ever/github-runner/internal/github"
 	"github.com/clems4ever/github-runner/internal/imagebuild"
+	"github.com/clems4ever/github-runner/internal/layers"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -141,6 +142,22 @@ func serveCommand(args []string) error {
 			status := builder.Ensure(ctx, pool)
 			return status.Ready, status.Summary
 		})
+
+	// And a repository-scoped machine pool may be told to read the repository
+	// it serves and boot what that repository asked for, on top of the pool's
+	// own image. A pool with no such policy — every pool, until somebody sets
+	// one — never reaches GitHub for this at all.
+	repoLayers := layers.New(db,
+		func(secret model.Secret) (layers.Reader, error) {
+			return github.NewFromSecret(github.Secret{
+				IsAppCredential: secret.IsApp(),
+				Token:           secret.Token,
+				AppID:           secret.AppID,
+				InstallationID:  secret.InstallationID,
+			})
+		},
+		builder, log)
+	reconciler = reconciler.WithLayers(repoLayers.For)
 
 	// A buffered channel of one: several changes arriving together collapse
 	// into a single extra pass rather than queueing up.
@@ -304,6 +321,24 @@ func collectLoop(ctx context.Context, db *store.Store, gc *imagebuild.GC,
 			if pool.Runtime == model.RuntimeVM {
 				wanted[imagebuild.Image(pool)] = true
 			}
+		}
+
+		// And the layers a repository asked for and an operator approved. They
+		// are wanted by a row rather than by a pool's specification, so without
+		// this the collector deletes each one as soon as its grace runs out and
+		// the next pass builds it again — for ever.
+		//
+		// A layer that cannot be read is a reason not to collect at all: the
+		// alternative is deleting a live layer because a query failed, and the
+		// cost of skipping one pass is a few gigabytes for an hour.
+		layerImages, err := db.WantedLayerImages(ctx)
+		if err != nil {
+			log.Warn("could not read which repository layers are wanted; not collecting this pass",
+				"error", err)
+			return
+		}
+		for image := range layerImages {
+			wanted[image] = true
 		}
 
 		// The fleet's disk ceiling, read each pass so that lowering it in the

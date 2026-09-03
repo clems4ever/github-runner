@@ -290,7 +290,7 @@ const SpecRevision = 5
 // release changed that and left every existing runner looking current. The
 // spec revision below is the manual version of this, for changes a recipe
 // cannot express.
-func (p *Pool) Generation(credentialFingerprint, recipe string) string {
+func (p *Pool) Generation(credentialFingerprint, recipe, layer string) string {
 	h := sha256.New()
 	write := func(parts ...string) {
 		for _, part := range parts {
@@ -313,6 +313,12 @@ func (p *Pool) Generation(credentialFingerprint, recipe string) string {
 		p.Image,
 		recipe,
 		credentialFingerprint,
+		// The per-repository layer, when there is one. A repository that edits
+		// its file and has the result approved gets a different image, and a
+		// runner already up was built from the old one: without this it would
+		// be left alone, and the change would take effect whenever that runner
+		// happened to be replaced for some other reason.
+		layer,
 	)
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }

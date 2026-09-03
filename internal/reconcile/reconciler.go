@@ -88,6 +88,22 @@ type CredentialWriter func(id int64, secret string) error
 // about the pool and not about the builder.
 type ImageReady func(ctx context.Context, pool model.Pool) (ready bool, why string)
 
+// LayerFor answers which per-repository image a pool's runners should boot.
+//
+// Empty is the ordinary answer and means the pool's own image: the pool has no
+// layer policy, or the repository declares nothing, or what it declared is
+// waiting for somebody to approve it. note says which of those, for the pass
+// result, and is empty when there was nothing to say.
+//
+// A pool whose layer is not ready is *not* held at zero. The repository asked
+// for additions and has not been given them yet; its jobs run on the pool's
+// own image in the meantime, which is what they did before it asked. Holding
+// the pool would mean a repository could take its own runners away by
+// committing a file, and a queue of jobs with nothing to run them.
+//
+// Injected like ImageReady, so the fleet's rules can be tested without GitHub.
+type LayerFor func(ctx context.Context, pool model.Pool) (image string, note string)
+
 // Reconciler drives the fleet towards what the store asks for.
 type Reconciler struct {
 	store       Fleet
@@ -95,6 +111,7 @@ type Reconciler struct {
 	newClient   ClientFactory
 	writeSecret CredentialWriter
 	images      ImageReady
+	layer       LayerFor
 	log         *slog.Logger
 
 	// pass serialises whole reconcile passes. The daemon's loop is not the
@@ -272,6 +289,15 @@ func (r *Reconciler) WithImages(ready ImageReady) *Reconciler {
 	return r
 }
 
+// WithLayers makes the fleet boot per-repository images where a pool asks for
+// them. Left unset, every pool boots its own image and nothing reads a
+// repository's file at all — which is what a fleet with no layer policy
+// anywhere should cost.
+func (r *Reconciler) WithLayers(layer LayerFor) *Reconciler {
+	r.layer = layer
+	return r
+}
+
 // New builds a reconciler.
 func New(store Fleet, executors []Executor, newClient ClientFactory, writeSecret CredentialWriter, log *slog.Logger) *Reconciler {
 	byRuntime := make(map[model.Runtime]Executor, len(executors))
@@ -297,8 +323,13 @@ func New(store Fleet, executors []Executor, newClient ClientFactory, writeSecret
 
 // Result is what one pass did.
 type Result struct {
-	Actions []Action         `json:"actions"`
-	Errors  []string         `json:"errors"`
+	Actions []Action `json:"actions"`
+	Errors  []string `json:"errors"`
+	// Notes are things the operator should know that are not failures: a
+	// repository waiting for its layer to be approved is the fleet working
+	// exactly as configured, and it still has to be visible somewhere or
+	// nobody ever approves it.
+	Notes   []string         `json:"notes"`
 	Scaling map[string]Scale `json:"scaling"`
 	// ScaledUp says a pool grew because everything in it was busy. The daemon
 	// uses it to come back sooner than the next tick: a burst of jobs should
@@ -428,6 +459,21 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	// and turning the sizes into runners, rather than inside either.
 	scaling = Ration(pools, scaling, budget)
 
+	// Which image each pool's runners boot. Resolved once per pass rather than
+	// per runner: it is a request to GitHub and a row read, and a pool of ten
+	// would otherwise make ten of each for one answer.
+	layers := map[string]string{}
+	for _, pool := range pools {
+		if r.layer == nil || !pool.LayersAllowed() || pool.Layers == model.LayersOff {
+			continue
+		}
+		image, note := r.layer(ctx, pool)
+		layers[pool.Name] = image
+		if note != "" {
+			result.Notes = append(result.Notes, fmt.Sprintf("%s: %s", pool.Name, note))
+		}
+	}
+
 	for _, pool := range pools {
 		fingerprint, ok := fingerprints[pool.Name]
 		if !ok {
@@ -438,7 +484,7 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			result.ScaledUp = true
 		}
 		desired = append(desired,
-			SpecsForCredential(pool, fingerprint, r.recipeFor(pool),
+			SpecsForCredential(pool, fingerprint, r.recipeFor(pool), layers[pool.Name],
 				DesiredNames(pool, byPool[pool.Name], states, scale.Target), secrets[pool.Name])...)
 	}
 	result.Scaling = scaling
@@ -748,6 +794,17 @@ func (r *Reconciler) listAll(ctx context.Context) ([]Runner, []string) {
 // recipeFor asks the executor that would build this pool's runners how it would
 // build them. A pool whose runtime has no executor on this host gets nothing,
 // which is right: there is no recipe, and there are no runners either.
+// layerFor is the per-repository image this pool's runners should boot, or
+// empty for the pool's own. The note is dropped here; the pass that builds the
+// specs keeps it.
+func (r *Reconciler) layerFor(pool model.Pool) string {
+	if r.layer == nil || !pool.LayersAllowed() || pool.Layers == model.LayersOff {
+		return ""
+	}
+	image, _ := r.layer(context.Background(), pool)
+	return image
+}
+
 func (r *Reconciler) recipeFor(pool model.Pool) string {
 	executor, ok := r.executors[pool.Runtime]
 	if !ok {
@@ -823,7 +880,7 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 		if err != nil {
 			continue
 		}
-		generations[pool.Name] = pool.Generation(fingerprint, r.recipeFor(pool))
+		generations[pool.Name] = pool.Generation(fingerprint, r.recipeFor(pool), r.layerFor(pool))
 
 		scope := github.ScopeOf(pool)
 		key := string(scope.Kind) + ":" + scope.Path

@@ -30,7 +30,7 @@ func resize(p model.Pool, runners []Runner, states map[string]github.State) (Sca
 // so a plan is not full of replacements for a configuration nobody changed.
 func fleetForPool(p model.Pool, description string) ([]Runner, map[string]github.State) {
 	runners, states := fleetOf(p.Name, description)
-	generation := p.Generation("fp", "image")
+	generation := p.Generation("fp", "image", "")
 	for i := range runners {
 		runners[i].Generation = generation
 	}

@@ -100,11 +100,28 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 	// restart it. A runner that quietly built its own image was how a broken
 	// recipe used to turn into a unit rebuilding a fleet's worth of it, every
 	// two seconds, with the account of each attempt thrown away.
+	images := filepath.Join(c.StateDir, "images")
 	spec := ImageSpec{Variant: c.Image, Packages: c.Packages, Recipe: c.Recipe}
-	golden, built := GoldenImage(spec, filepath.Join(c.StateDir, "images"))
+	golden, built := GoldenImage(spec, images)
 	if !built {
 		return fmt.Errorf("%w: %s. The daemon builds it; this runner should not have been started yet",
 			ErrImageNotBuilt, filepath.Base(golden))
+	}
+
+	// A layer is checked the same way and for the same reason. Falling back to
+	// the pool's own image when the layer is missing would be worse than
+	// stopping: the job would run, and it would fail somewhere in the middle on
+	// a tool the repository had asked for and been told it had.
+	backing := golden
+	if c.Layer != "" {
+		if err := layerName(c.Layer); err != nil {
+			return err
+		}
+		backing = filepath.Join(images, c.Layer)
+		if _, err := os.Stat(backing); err != nil {
+			return fmt.Errorf("%w: %s, the layer built for this repository. The daemon builds it; "+
+				"this runner should not have been started yet", ErrImageNotBuilt, c.Layer)
+		}
 	}
 
 	dir := filepath.Join(c.StateDir, "vms", c.Runner)
@@ -123,7 +140,7 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 	// A copy-on-write overlay, so booting is seconds rather than minutes and
 	// the golden image is never written to.
 	disk := filepath.Join(dir, "disk.qcow2")
-	if err := run(ctx, "qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", golden, disk,
+	if err := run(ctx, "qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", backing, disk,
 		fmt.Sprintf("%dG", c.DiskGB)); err != nil {
 		return fmt.Errorf("create the machine's disk: %w", err)
 	}

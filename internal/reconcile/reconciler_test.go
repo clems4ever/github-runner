@@ -379,7 +379,7 @@ func TestReconfiguringAPoolReplacesRunnersGracefully(t *testing.T) {
 
 	// And the rebuilt runners carry the new configuration.
 	for _, r := range h.vm.runners {
-		if r.Generation != pool.Generation("fp", "image") {
+		if r.Generation != pool.Generation("fp", "image", "") {
 			t.Fatalf("%s came back on the old generation", r.Name)
 		}
 	}

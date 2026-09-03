@@ -52,8 +52,12 @@ type Spec struct {
 	// top of the base one. They travel with the spec because the agent builds
 	// the image, not the daemon — which is also what lets a machine come back
 	// after a reboot with the daemon still down.
-	Packages     []string
-	Recipe       string
+	Packages []string
+	Recipe   string
+	// Layer is the image built for the repository this pool serves, when that
+	// repository asked for one and an operator allowed it. Empty is the
+	// ordinary case and means the pool's own image.
+	Layer        string
 	CredentialID int64
 	// How the runner authenticates. An app's agent signs its own assertion and
 	// buys an installation token, so it needs the app id as well as the key —
@@ -271,13 +275,13 @@ func sortedRunners(in []Runner) []Runner {
 // should have. The names are decided elsewhere, because how many a pool needs
 // depends on what its runners are doing and this does not.
 func SpecsFor(p model.Pool, credentialFingerprint, recipe string, names []string) []Spec {
-	return SpecsForCredential(p, credentialFingerprint, recipe, names, model.Secret{Kind: model.CredentialPAT})
+	return SpecsForCredential(p, credentialFingerprint, recipe, "", names, model.Secret{Kind: model.CredentialPAT})
 }
 
 // SpecsForCredential is SpecsFor with the credential's shape, which the agent
 // needs in order to authenticate without the daemon.
-func SpecsForCredential(p model.Pool, credentialFingerprint, recipe string, names []string, secret model.Secret) []Spec {
-	generation := p.Generation(credentialFingerprint, recipe)
+func SpecsForCredential(p model.Pool, credentialFingerprint, recipe, layer string, names []string, secret model.Secret) []Spec {
+	generation := p.Generation(credentialFingerprint, recipe, layer)
 	labels := p.EffectiveLabels()
 
 	var specs []Spec
@@ -300,6 +304,7 @@ func SpecsForCredential(p model.Pool, credentialFingerprint, recipe string, name
 			Image:          p.Image,
 			Packages:       p.Packages,
 			Recipe:         p.Recipe,
+			Layer:          layer,
 			CredentialID:   p.CredentialID,
 			CredentialKind: secret.Kind,
 			AppID:          secret.AppID,

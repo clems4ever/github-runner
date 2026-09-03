@@ -40,8 +40,15 @@ type Config struct {
 	// Packages and Recipe are what this runner's pool bakes into its image on
 	// top of the base one. The agent builds the image, so it is the agent that
 	// has to know them.
-	Packages       []string
-	Recipe         string
+	Packages []string
+	Recipe   string
+	// Layer is the file name of a per-repository image this runner boots
+	// instead of its pool's own, chosen by the daemon. The layer is an overlay
+	// on that same image, so booting it is booting the pool's image plus what
+	// the repository asked for; it is a name and not a specification because
+	// deciding whether a repository may have one is the daemon's job and not a
+	// judgement to re-make out here, holding a credential, next to the job.
+	Layer          string
 	CredentialFile string
 	StateDir       string
 	// How to authenticate. A GitHub App's agent signs its own assertion with
@@ -75,6 +82,7 @@ func ConfigFromEnv(name string) (Config, error) {
 		MemoryMB:       intEnv("FLEET_MEMORY_MB", 4096),
 		DiskGB:         intEnv("FLEET_DISK_GB", 40),
 		Image:          first(os.Getenv("FLEET_IMAGE"), "default"),
+		Layer:          os.Getenv("FLEET_LAYER"),
 		CredentialFile: os.Getenv("FLEET_CREDENTIAL_FILE"),
 		StateDir:       first(os.Getenv("FLEET_STATE_DIR"), "/var/lib/runner-fleet"),
 		CredentialKind: model.CredentialKind(first(os.Getenv("FLEET_CREDENTIAL_KIND"), string(model.CredentialPAT))),

@@ -70,6 +70,13 @@ func (s LayerSpec) Name() string {
 // resolved relative to the overlay.
 func (s LayerSpec) Path(imagesDir string) string { return filepath.Join(imagesDir, s.Name()) }
 
+// BuiltLayer is where a layer lives on this host, and whether it is there.
+func BuiltLayer(spec LayerSpec, imagesDir string) (string, bool) {
+	path := spec.Path(imagesDir)
+	_, err := os.Stat(path)
+	return path, err == nil
+}
+
 // LayerOptions is one layer build.
 type LayerOptions struct {
 	Spec      LayerSpec
@@ -226,6 +233,14 @@ users:
     ssh_authorized_keys:
       - %s
 
+# A build fetches several hundred packages and takes minutes to do it. Without
+# this, one connection dropped anywhere in that is the whole build: apt gives
+# up on the file, the install exits non-zero, and everything downloaded so far
+# is thrown away with the disk. Retrying costs nothing when the link is good.
+apt:
+  conf: |
+    Acquire::Retries "5";
+
 package_update: true
 packages:
 %s
@@ -306,6 +321,22 @@ func runIn(ctx context.Context, dir, name string, args ...string) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// layerName refuses anything that is not a plain image file name.
+//
+// The name arrives in an environment variable and is joined to the images
+// directory, and a runner is the one place in this daemon that is close to a
+// job. It is checked rather than trusted because the cost of being wrong is
+// booting a machine off a file somebody else chose.
+func layerName(name string) error {
+	// Spelled out rather than borrowed from the collector's IsImageName: the
+	// collector is in a package that imports this one.
+	if name != filepath.Base(name) ||
+		!strings.HasPrefix(name, "runner-") || !strings.HasSuffix(name, ".qcow2") {
+		return fmt.Errorf("%q is not an image this daemon builds", name)
 	}
 	return nil
 }
