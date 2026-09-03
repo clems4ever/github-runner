@@ -3,6 +3,12 @@ name: fleet-smoke
 # A trivial job for a sleeping pool to wake on. It exists to give the fleet a
 # real queued job to find, not to check anything about the code — see the
 # live end-to-end test this branch adds.
+#
+# It also reports what the disk it booted from carries. Nothing here fails on
+# an absence: a pool whose layer is off, or whose definition an operator has
+# not approved yet, boots the pool's own image and is expected to find none of
+# this. The stamp is written when the layer is built, so a second job reading
+# the same stamp booted the same prebuilt layer rather than provisioning again.
 
 on:
   push:
@@ -14,3 +20,8 @@ jobs:
     runs-on: [self-hosted, linux, vm, jit-fleet-smoke]
     steps:
       - run: echo hello
+      - name: What this machine booted from
+        run: |
+          echo "layer stamp: $(cat /opt/fleet-layer-built-at 2>/dev/null || echo '<none: booted the pool image>')"
+          echo "jq:          $(command -v jq   || echo absent)"
+          echo "tree:        $(command -v tree || echo absent)"
