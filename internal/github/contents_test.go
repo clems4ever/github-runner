@@ -117,3 +117,21 @@ func TestDefaultBranchFileRefusesAnOrganisation(t *testing.T) {
 		t.Fatal("accepted an organisation")
 	}
 }
+
+// A directory is not what the documentation's schema suggests — GitHub answers
+// it with an array of entries, not an object with type "dir". Decoded straight
+// into the file struct that is a parse error naming nothing; the path is
+// somebody's mistake to correct, so it is named.
+func TestDefaultBranchFileRefusesADirectory(t *testing.T) {
+	client, _ := newClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte(`[{"name":"workflows","path":".github/workflows","type":"dir"}]`))
+	})
+
+	_, err := client.DefaultBranchFile(context.Background(), repoScope(), ".github")
+	if err == nil {
+		t.Fatal("read a directory as if it were a definition")
+	}
+	if !strings.Contains(err.Error(), ".github is a directory") {
+		t.Fatalf("refused with %q, which does not say what is wrong", err)
+	}
+}

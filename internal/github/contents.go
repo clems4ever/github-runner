@@ -1,8 +1,10 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -42,6 +44,12 @@ func (c *Client) DefaultBranchFile(ctx context.Context, scope Scope, path string
 		Content  string `json:"content"`
 		Size     int64  `json:"size"`
 	}
+	// Read as raw JSON first, because this endpoint does not answer with one
+	// shape. A file is an object; a *directory* is an array of them, which
+	// unmarshalled straight into the struct above would fail with a parse
+	// error naming neither the path nor the reason. The path is somebody's
+	// mistake to correct, so it has to be said as one.
+	var body json.RawMessage
 	// Each path segment is escaped on its own: the separators are part of the
 	// URL and the names are not.
 	var segments []string
@@ -51,12 +59,19 @@ func (c *Client) DefaultBranchFile(ctx context.Context, scope Scope, path string
 	api := "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(repo) +
 		"/contents/" + strings.Join(segments, "/")
 
-	if err := c.do(ctx, http.MethodGet, api, &out, scope); err != nil {
+	if err := c.do(ctx, http.MethodGet, api, &body, scope); err != nil {
 		var refused *Error
 		if errors.As(err, &refused) && refused.Status == http.StatusNotFound {
 			return nil, nil
 		}
 		return nil, err
+	}
+
+	if bytes.HasPrefix(bytes.TrimLeft(body, " \t\r\n"), []byte("[")) {
+		return nil, fmt.Errorf("%s is a directory, not a file", path)
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("%s: GitHub returned something that is not a file: %w", path, err)
 	}
 
 	if out.Type != "file" {

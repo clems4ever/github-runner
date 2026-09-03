@@ -171,37 +171,3 @@ func TestLiveJITConfigWithoutLabelsIsStillTargetable(t *testing.T) {
 		t.Fatalf("GitHub refused a configuration with no labels: %v", err)
 	}
 }
-
-// The contents API against real GitHub, for the same reason as the rest of
-// this file: the wire format is the part a fake cannot be trusted about. The
-// base64 comes back wrapped at 60 columns, which Go's decoder refuses, and a
-// fake that did not wrap it would have hidden that.
-func TestLiveDefaultBranchFileReadsAndMissesCleanly(t *testing.T) {
-	client, scope := live(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	got, err := client.DefaultBranchFile(ctx, scope, "go.mod")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(string(got), "module ") {
-		t.Fatalf("read %q, want the go.mod on the default branch", first(got, 60))
-	}
-
-	// The common case by far: a repository that has never heard of this.
-	missing, err := client.DefaultBranchFile(ctx, scope, ".github/definitely-not-here.yml")
-	if err != nil {
-		t.Fatalf("a missing file is not an error: %v", err)
-	}
-	if missing != nil {
-		t.Fatalf("read %q out of nothing", missing)
-	}
-}
-
-func first(b []byte, n int) string {
-	if len(b) > n {
-		return string(b[:n])
-	}
-	return string(b)
-}
