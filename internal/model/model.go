@@ -146,11 +146,15 @@ type Pool struct {
 	// It is part of the image's identity — see the executor's Recipe — so
 	// editing it builds a new image and drains the runners built from the old
 	// one, and leaving it alone reuses what is already on the host.
-	Recipe       string    `json:"recipe"`
-	CredentialID int64     `json:"credentialId"`
-	Enabled      bool      `json:"enabled"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	Recipe string `json:"recipe"`
+	// Layers is how much this pool trusts the repository it serves to declare
+	// its own additions to the image. Off unless an operator turns it on; see
+	// layer.go for what turning it on means.
+	Layers       LayerPolicy `json:"layers"`
+	CredentialID int64       `json:"credentialId"`
+	Enabled      bool        `json:"enabled"`
+	CreatedAt    time.Time   `json:"createdAt"`
+	UpdatedAt    time.Time   `json:"updatedAt"`
 }
 
 // URL is where the runners register.
@@ -391,6 +395,9 @@ func (p *Pool) Validate() error {
 	if len(p.Recipe) > MaxRecipeBytes {
 		return fmt.Errorf("recipe is %d bytes: the limit is %d, and a recipe that long wants to fetch what it needs rather than carry it", len(p.Recipe), MaxRecipeBytes)
 	}
+	if err := ValidateLayerPolicy(*p); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -434,6 +441,9 @@ func (p *Pool) Defaults() {
 	// Normalised on the way in, so what is stored is what runs and what the
 	// image's name was computed from.
 	p.Recipe = strings.ReplaceAll(p.Recipe, "\r\n", "\n")
+	if p.Layers == "" {
+		p.Layers = LayersOff
+	}
 }
 
 // Sample is one observation of a pool: how many runners it had and how many
