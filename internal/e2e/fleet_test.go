@@ -155,6 +155,12 @@ func (f *fakeGitHub) States(context.Context, github.Scope) (map[string]github.St
 	return out, nil
 }
 
+// Nothing in the end-to-end fleet sleeps, so this is never reached — it is
+// here because the reconciler's client has to be able to answer it.
+func (f *fakeGitHub) QueuedJobs(context.Context, github.Scope, []string, int) (int, error) {
+	return 0, nil
+}
+
 func (f *fakeGitHub) Deregister(context.Context, github.Scope, string) error { return nil }
 
 func (f *fakeGitHub) RegistrationToken(context.Context, github.Scope) (string, error) {

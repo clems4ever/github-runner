@@ -46,6 +46,18 @@ function layersPossible(pool: Partial<Pool>): boolean {
   return pool.runtime === "vm" && pool.scopeKind === "repository";
 }
 
+/**
+ * Whether this pool could sleep.
+ *
+ * The daemon's rule: a sleeping pool is woken by reading the queue of the
+ * repository it serves, and GitHub lists queued jobs per repository. An
+ * organisation has no queue to read, so nothing would ever wake it — and a
+ * pool at zero that nothing wakes is a pool that has quietly stopped.
+ */
+function sleepPossible(pool: Partial<Pool>): boolean {
+  return pool.scopeKind === "repository";
+}
+
 /** A refusal from GitHub that a person can act on. */
 interface Refusal {
   message: string;
@@ -87,13 +99,20 @@ export function PoolEditor({
         return null;
       },
       // One, not zero. A pool with no runners has nothing able to accept a
-      // job, so it could never discover that it needs to grow.
-      minReplicas: (value) =>
-        (value ?? 0) >= 1 && (value ?? 0) <= 64
-          ? null
-          : "At least 1 — use the enabled switch to stop a pool entirely",
+      // job, so it could never discover that it needs to grow — unless it
+      // sleeps, and something is reading the queue on its behalf.
+      minReplicas: (value, values) => {
+        const floor = values.sleeps ? 0 : 1;
+        if ((value ?? 0) >= floor && (value ?? 0) <= 64) return null;
+        return values.sleeps
+          ? "0 or more"
+          : "At least 1 — use the enabled switch to stop a pool entirely";
+      },
+      // At least one either way: a sleeping pool with a ceiling of zero has
+      // nowhere to wake up to.
       maxReplicas: (value, values) =>
-        (value ?? 0) >= (values.minReplicas ?? 1) && (value ?? 0) <= 64
+        (value ?? 0) >= Math.max(values.minReplicas ?? 1, 1) &&
+        (value ?? 0) <= 64
           ? null
           : "At least the minimum, and no more than 64",
     },
@@ -113,6 +132,15 @@ export function PoolEditor({
         // reading a refusal about a field they cannot see.
         if (!layersPossible(submitted))
           submitted = { ...submitted, layers: "off" };
+        // The same for sleeping, and for the same reason: switched to an
+        // organisation, the control is gone and the daemon would refuse to
+        // save a field the operator can no longer see.
+        if (!sleepPossible(submitted))
+          submitted = {
+            ...submitted,
+            sleeps: false,
+            minReplicas: Math.max(submitted.minReplicas ?? 1, 1),
+          };
         try {
           if (pool.id) {
             await api.updatePool(pool.id, submitted);
@@ -260,7 +288,7 @@ export function PoolEditor({
           <NumberInput
             label="Minimum runners"
             description="Kept up even when nothing is running"
-            min={1}
+            min={values.sleeps ? 0 : 1}
             max={64}
             {...form.getInputProps("minReplicas")}
           />
@@ -273,10 +301,45 @@ export function PoolEditor({
           />
         </SimpleGrid>
         <Text size="xs" c="dimmed" mt={-8}>
-          {(values.maxReplicas ?? 1) > (values.minReplicas ?? 1)
-            ? `The pool sits at ${values.minReplicas} and adds a runner whenever every one of them is busy, up to ${values.maxReplicas}. It returns to ${values.minReplicas} after a few minutes with no work.`
-            : `A fixed ${values.minReplicas} runner${(values.minReplicas ?? 1) === 1 ? "" : "s"}: it never grows, however much work arrives.`}
+          {values.sleeps && (values.minReplicas ?? 0) === 0
+            ? `Nothing runs while ${values.scope || "the repository"} is quiet. A job waiting for these labels starts as many runners as it needs, up to ${values.maxReplicas}, and they go again after a few minutes with no work.`
+            : (values.maxReplicas ?? 1) > (values.minReplicas ?? 1)
+              ? `The pool sits at ${values.minReplicas} and adds a runner whenever every one of them is busy, up to ${values.maxReplicas}. It returns to ${values.minReplicas} after a few minutes with no work.`
+              : `A fixed ${values.minReplicas} runner${(values.minReplicas ?? 1) === 1 ? "" : "s"}: it never grows, however much work arrives.`}
         </Text>
+
+        {/*
+          The setting the operator came here for after a host filled up: a pool
+          that keeps a machine up around the clock to notice work that arrives
+          twice a week. It is under Scaling rather than in a section of its own
+          because it is the floor, said a different way.
+        */}
+        {sleepPossible(values) && (
+          <Switch
+            label="Let this pool sleep"
+            description="Keep nothing running while the repository is quiet, and start machines when a job is waiting for them."
+            checked={values.sleeps ?? false}
+            onChange={(event) => {
+              const on = event.currentTarget.checked;
+              form.setFieldValue("sleeps", on);
+              // The switch is about the floor, so it moves the floor. Leaving
+              // a minimum of one behind would be a pool that says it sleeps
+              // and never does.
+              if (on) form.setFieldValue("minReplicas", 0);
+              else if ((values.minReplicas ?? 0) < 1)
+                form.setFieldValue("minReplicas", 1);
+              if ((values.maxReplicas ?? 0) < 1)
+                form.setFieldValue("maxReplicas", 1);
+            }}
+          />
+        )}
+        {values.sleeps && (
+          <Text size="xs" c="dimmed" mt={-8}>
+            The daemon asks GitHub what is queued for this repository once a
+            pass while the pool is asleep or fully busy, so waking costs a boot
+            — around a minute — on the first job after a quiet spell.
+          </Text>
+        )}
 
         <Divider label="Size" labelPosition="left" />
 
@@ -340,7 +403,7 @@ export function PoolEditor({
           label="Image"
           description={
             isVM
-              ? "Names this pool\u2019s image. Two pools that bake the same thing share one; a name of its own gives this pool one of its own."
+              ? "Names this pool’s image. Two pools that bake the same thing share one; a name of its own gives this pool one of its own."
               : "The container image these runners run. It has to carry the Actions runner."
           }
           {...form.getInputProps("image")}
@@ -362,7 +425,7 @@ export function PoolEditor({
             />
             <Textarea
               label="Recipe"
-              description="Shell, run as root while the image is built \u2014 for what apt cannot give: a pinned toolchain, a linter, a warm build cache. Editing it builds a new image and replaces this pool's runners as they finish."
+              description="Shell, run as root while the image is built — for what apt cannot give: a pinned toolchain, a linter, a warm build cache. Editing it builds a new image and replaces this pool's runners as they finish."
               placeholder={
                 "curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz"
               }
@@ -386,12 +449,12 @@ export function PoolEditor({
             <Divider label="Repository definitions" labelPosition="left" />
             <Select
               label="Let the repository add to this image"
-              description={`Read from .github/runner-fleet.yml on ${values.scope || "the repository"}\u2019s default branch.`}
+              description={`Read from .github/runner-fleet.yml on ${values.scope || "the repository"}’s default branch.`}
               allowDeselect={false}
               data={[
                 {
                   value: "off",
-                  label: "No \u2014 this pool\u2019s image is the whole of it",
+                  label: "No — this pool’s image is the whole of it",
                 },
                 {
                   value: "approve",
@@ -411,11 +474,11 @@ export function PoolEditor({
                 icon={<IconAlertTriangle size={16} />}
               >
                 <Text size="sm">
-                  Anyone who can merge to that repository\u2019s default branch
-                  can run a script as root on a machine on this host, without
-                  anyone reading it first. That is a reasonable thing to allow
-                  \u2014 it is close to what merging a workflow already buys
-                  \u2014 but it is worth meaning.
+                  Anyone who can merge to that repository’s default branch can
+                  run a script as root on a machine on this host, without anyone
+                  reading it first. That is a reasonable thing to allow — it is
+                  close to what merging a workflow already buys — but it is
+                  worth meaning.
                 </Text>
               </Alert>
             )}
@@ -423,7 +486,7 @@ export function PoolEditor({
               <Text size="xs" c="dimmed" mt={-8}>
                 Each new definition waits on the Layers page. Until one is
                 approved the pool keeps running on the image it has, so a change
-                here never takes a repository\u2019s runners away.
+                here never takes a repository’s runners away.
               </Text>
             )}
           </>

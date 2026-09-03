@@ -25,7 +25,10 @@ export interface Pool {
   runtime: Runtime;
   nested: boolean;
   ephemeral: boolean;
-  /** What the pool falls back to when nothing is running. Never below one. */
+  /**
+   * What the pool falls back to when nothing is running. Never below one,
+   * unless the pool sleeps.
+   */
   minReplicas: number;
   /** The ceiling. Equal to the minimum, the pool is a fixed size. */
   maxReplicas: number;
@@ -44,6 +47,13 @@ export interface Pool {
    * repository-scoped machine pool.
    */
   layers: LayerPolicy;
+  /**
+   * Whether the pool may go to zero while its repository is quiet, and be
+   * woken by a job waiting for it. Only ever true on a repository-scoped pool:
+   * GitHub lists queued jobs per repository, so nothing could read an
+   * organisation's queue to wake it.
+   */
+  sleeps: boolean;
   credentialId: number;
   enabled: boolean;
   createdAt: string;
@@ -573,6 +583,7 @@ export function emptyPool(credentialId: number): Partial<Pool> {
     packages: [],
     recipe: "",
     layers: "off",
+    sleeps: false,
     credentialId,
     enabled: true,
   };
@@ -600,7 +611,10 @@ export function scaled(pool: Pool, delta: number): Pool | null {
   const fixed = isFixed(pool);
   const max = pool.maxReplicas + delta;
   const min = fixed ? max : pool.minReplicas;
-  if (min < 1 || max > maxReplicas) return null;
+  // A sleeping pool's floor is zero, and a floor of one is every other pool's.
+  // Without this the steppers are dead on exactly the pools whose size is most
+  // worth nudging.
+  if (min < (pool.sleeps ? 0 : 1) || max > maxReplicas) return null;
   if (fixed ? max < min : max <= min) return null;
   return { ...pool, minReplicas: min, maxReplicas: max };
 }

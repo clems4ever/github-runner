@@ -123,10 +123,16 @@ type Pool struct {
 	Runtime   Runtime   `json:"runtime"`
 	Nested    bool      `json:"nested"`
 	Ephemeral bool      `json:"ephemeral"`
-	// MinReplicas is what the pool falls back to when nothing is running, and
-	// is never below one: a pool with no runner at all cannot accept a job, and
-	// so can never discover that it needs more.
+	// MinReplicas is what the pool falls back to when nothing is running. Never
+	// below one unless the pool sleeps: a pool with no runner at all cannot
+	// accept a job, and so can never discover that it needs more — which is
+	// exactly the gap Sleeps fills another way.
 	MinReplicas int `json:"minReplicas"`
+	// Sleeps lets the pool go to zero when nothing is queued, and wakes it by
+	// reading the repository's queue instead of by keeping a runner up to
+	// watch. See sleep.go for what that costs and why only a repository pool
+	// may do it.
+	Sleeps bool `json:"sleeps"`
 	// MaxReplicas is the ceiling. Equal to the minimum, the pool is a fixed
 	// size and never scales.
 	MaxReplicas int      `json:"maxReplicas"`
@@ -176,9 +182,17 @@ func (p *Pool) Elastic() bool { return p.MaxReplicas > p.MinReplicas }
 // Floor is the smallest the pool is allowed to be, and is at least one even if
 // the stored value is not: an empty pool cannot accept a job, so it can never
 // find out that it needs to grow.
+//
+// Unless it sleeps, which is the arrangement where it finds out by asking.
 func (p *Pool) Floor() int {
 	if !p.Enabled {
 		return 0
+	}
+	if p.Sleeping() {
+		if p.MinReplicas < 0 {
+			return 0
+		}
+		return p.MinReplicas
 	}
 	if p.MinReplicas < 1 {
 		return 1
@@ -355,9 +369,10 @@ func (p *Pool) Validate() error {
 
 	// One, not zero. A pool has to keep a runner able to accept work, or
 	// nothing would ever reveal that the pool needs to grow. Switching a pool
-	// off entirely is what "enabled" is for.
-	if p.MinReplicas < 1 || p.MinReplicas > MaxReplicas {
-		return fmt.Errorf("minimum replicas %d: want 1 to %d — use the enabled switch to stop a pool entirely", p.MinReplicas, MaxReplicas)
+	// off entirely is what "enabled" is for — and sleeping is what a pool that
+	// finds out by asking instead does.
+	if p.MinReplicas < 1 && !p.Sleeps || p.MinReplicas < 0 || p.MinReplicas > MaxReplicas {
+		return fmt.Errorf("minimum replicas %d: want 1 to %d — use the enabled switch to stop a pool entirely, or let the pool sleep", p.MinReplicas, MaxReplicas)
 	}
 	if p.MaxReplicas < p.MinReplicas || p.MaxReplicas > MaxReplicas {
 		return fmt.Errorf("maximum replicas %d: want %d to %d, and never below the minimum", p.MaxReplicas, p.MinReplicas, MaxReplicas)
@@ -404,6 +419,9 @@ func (p *Pool) Validate() error {
 	if err := ValidateLayerPolicy(*p); err != nil {
 		return err
 	}
+	if err := ValidateSleep(*p); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -413,8 +431,16 @@ func (p *Pool) Defaults() {
 	if p.Runtime == "" {
 		p.Runtime = RuntimeVM
 	}
-	if p.MinReplicas < 1 {
+	if p.MinReplicas < 1 && !p.Sleeps {
 		p.MinReplicas = 1
+	}
+	if p.MinReplicas < 0 {
+		p.MinReplicas = 0
+	}
+	if p.Sleeps && p.MaxReplicas < 1 {
+		// A pool that sleeps and may never start anything is not a pool. One
+		// is the smallest thing it could wake up to.
+		p.MaxReplicas = 1
 	}
 	if p.MaxReplicas < p.MinReplicas {
 		p.MaxReplicas = p.MinReplicas

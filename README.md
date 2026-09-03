@@ -66,7 +66,7 @@ A pool named `web` with a maximum of three gives you `web-1`, `web-2` and
 | **Runtime** | a virtual machine per job, or a container |
 | **Nested virtualisation** | whether jobs get `/dev/kvm` and can boot machines of their own |
 | **Ephemeral** | take one job, then be replaced by a clean runner |
-| **Minimum runners** | what the pool keeps up when nothing is running, at least one |
+| **Minimum runners** | what the pool keeps up when nothing is running: at least one, or zero on a pool that sleeps |
 | **Maximum runners** | how far it may grow under load; equal to the minimum for a fixed size |
 | **Labels** | what a workflow targets with `runs-on` |
 | **Size** | vCPUs, memory, and disk for VM pools |
@@ -306,9 +306,10 @@ until work arrives.
 **Growing.** GitHub does not publish how many jobs are queued for a set of
 labels — only what each runner is doing. So demand is inferred: when *every*
 runner in a pool is busy, the next job would have nowhere to go, and one more
-runner is added. That is also why the minimum is never zero. A pool with no
-runners has nothing to observe, so it could never learn that it should grow;
-the idle runner is what makes the pool able to answer the question at all.
+runner is added. That is also why the minimum is one rather than zero, unless
+the pool is told to sleep. A pool with no runners has nothing to observe, so it
+could never learn that it should grow; the idle runner is what makes the pool
+able to answer the question at all.
 
 It grows one runner at a time, and the daemon comes back within seconds after a
 scale-up rather than waiting for its next tick, so a burst ramps quickly without
@@ -322,6 +323,33 @@ on.
 
 Minimum equal to maximum is a fixed-size pool that never moves — which is what
 every pool was before this existed, and what an upgraded database keeps.
+
+**Sleeping.** A pool that serves a repository busy twice a week does not need a
+machine up around the clock to find that out. Turn on **Let this pool sleep**
+in the editor and its minimum goes to zero: nothing runs while the repository
+is quiet.
+
+What wakes it is the repository's own queue. Once a pass, and *only* while a
+sleeping pool is empty or has every runner busy, the daemon asks GitHub what is
+waiting — the repository's unfinished workflow runs, then the jobs inside them —
+and counts the ones whose `runs-on` labels this pool could serve. It starts that
+many runners at once rather than one per pass, so a five-way matrix does not
+wake up over five minutes. On a quiet repository the whole question is two API
+requests, and it is not asked at all of a pool that already has a spare runner.
+
+A job's labels are matched the way GitHub matches them: every label the job asks
+for must be on the runner, and the runner may have more. `self-hosted`, `linux`
+and `x64` are on every runner here, so `runs-on: [self-hosted, vm]` is served by
+a machine pool without those having to be typed into the pool's labels.
+
+The cost is a boot — around a minute — on the first job after a quiet spell, and
+that is the whole trade. A repository that is busy all day should not sleep; one
+that is busy on Tuesdays should.
+
+Only a repository pool can sleep. GitHub lists queued jobs per repository, so
+there is no organisation-wide queue to read, and a pool at zero that nothing
+could wake is a pool that has quietly stopped. The daemon refuses to save one
+rather than accepting it and going silent.
 
 The fleet view says which pool is at what size and why: *every runner is busy*,
 *quiet for 7m*, *spare capacity available*.

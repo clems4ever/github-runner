@@ -156,7 +156,7 @@ func TestAutoscale(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			runners, states := fleetOf("web", tt.fleet)
-			got := Autoscale(tt.pool, runners, states, tt.lastBusy, now)
+			got := Autoscale(tt.pool, runners, states, QueueUnknown, tt.lastBusy, now)
 
 			if got.Target != tt.want {
 				t.Errorf("target is %d, want %d (%s)", got.Target, tt.want, got.Reason)
@@ -192,7 +192,7 @@ func TestAutoscaleOverABurst(t *testing.T) {
 	}
 	for _, step := range steps {
 		runners, states := fleetOf("web", step.fleet)
-		got := Autoscale(pool, runners, states, now, now)
+		got := Autoscale(pool, runners, states, QueueUnknown, now, now)
 		if got.Target != step.want {
 			t.Fatalf("with %q the target is %d, want %d (%s)", step.fleet, got.Target, step.want, got.Reason)
 		}
@@ -200,10 +200,10 @@ func TestAutoscaleOverABurst(t *testing.T) {
 
 	// The burst ends. Nothing shrinks until the quiet has lasted.
 	runners, states := fleetOf("web", "iiii")
-	if got := Autoscale(pool, runners, states, now, now.Add(ScaleDownAfter-time.Second)); got.Target != 4 {
+	if got := Autoscale(pool, runners, states, QueueUnknown, now, now.Add(ScaleDownAfter-time.Second)); got.Target != 4 {
 		t.Fatalf("it shrank after %s, before the stabilisation window was over", ScaleDownAfter-time.Second)
 	}
-	if got := Autoscale(pool, runners, states, now, now.Add(ScaleDownAfter)); got.Target != 1 {
+	if got := Autoscale(pool, runners, states, QueueUnknown, now, now.Add(ScaleDownAfter)); got.Target != 1 {
 		t.Fatalf("target is %d after the window, want back to the minimum", got.Target)
 	}
 }
@@ -217,7 +217,7 @@ func TestAutoscaleSettles(t *testing.T) {
 	// however many times it is asked.
 	runners, states := fleetOf("web", "bi")
 	for i := 0; i < 10; i++ {
-		if got := Autoscale(pool, runners, states, now, now.Add(time.Duration(i)*time.Minute)); got.Target != 2 {
+		if got := Autoscale(pool, runners, states, QueueUnknown, now, now.Add(time.Duration(i)*time.Minute)); got.Target != 2 {
 			t.Fatalf("pass %d moved a settled pool to %d (%s)", i, got.Target, got.Reason)
 		}
 	}
@@ -346,7 +346,7 @@ func TestAPoolWhoseMachinesAreRecyclingIsNotQuiet(t *testing.T) {
 
 	// Nothing has been seen busy for half an hour, which used to be enough to
 	// shrink the pool to its floor.
-	scale := Autoscale(pool, runners, states, now.Add(-30*time.Minute), now)
+	scale := Autoscale(pool, runners, states, QueueUnknown, now.Add(-30*time.Minute), now)
 
 	if scale.Target != 3 {
 		t.Fatalf("the pool shrank to %d while a machine was coming back from a job", scale.Target)
@@ -368,7 +368,7 @@ func TestAPoolWhoseMachinesAreAllRegisteredAndIdleStillShrinks(t *testing.T) {
 	}
 	states := map[string]github.State{"web-1": github.StateIdle, "web-2": github.StateIdle}
 
-	scale := Autoscale(pool, runners, states, now.Add(-30*time.Minute), now)
+	scale := Autoscale(pool, runners, states, QueueUnknown, now.Add(-30*time.Minute), now)
 	if scale.Target != 1 {
 		t.Fatalf("a genuinely quiet pool stayed at %d", scale.Target)
 	}
@@ -385,7 +385,7 @@ func TestARunnerThatWillNeverRegisterDoesNotHoldThePoolOpen(t *testing.T) {
 		{Name: "web-2", Pool: "web", State: StateRunning, Up: time.Hour},
 	}
 	// GitHub has never heard of either.
-	scale := Autoscale(pool, runners, map[string]github.State{}, now.Add(-30*time.Minute), now)
+	scale := Autoscale(pool, runners, map[string]github.State{}, QueueUnknown, now.Add(-30*time.Minute), now)
 	if scale.Target != 1 {
 		t.Fatalf("a pool of runners that never registered stayed at %d", scale.Target)
 	}

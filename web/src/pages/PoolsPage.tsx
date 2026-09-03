@@ -457,6 +457,16 @@ function RuntimeBadges({ pool }: { pool: Pool }) {
           </Badge>
         </Tooltip>
       )}
+      {/* Worth a badge rather than being left to be inferred from a minimum of
+          zero: this is the pool that will be empty most of the time, and an
+          empty pool otherwise reads as a broken one. */}
+      {pool.sleeps && (
+        <Tooltip label="Runs nothing until a job is waiting for it">
+          <Badge size="sm" color="indigo" variant="light">
+            sleeps
+          </Badge>
+        </Tooltip>
+      )}
     </Group>
   )
 }
@@ -570,6 +580,7 @@ function describeSize(pool: Pool): string {
 
 /** Why a pool will not go any smaller from here. */
 function floorReason(pool: Pool): string {
+  if (pool.sleeps) return 'A pool that sleeps still needs somewhere to wake up to'
   return isFixed(pool)
     ? 'A pool keeps at least one runner — switch it off instead'
     : `Its minimum is ${pool.minReplicas}. Lower that in the editor, where a pool can also stop autoscaling`

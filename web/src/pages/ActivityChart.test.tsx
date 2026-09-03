@@ -44,6 +44,7 @@ const pool = (name: string): Pool => ({
   packages: [],
   recipe: '',
   layers: 'off',
+  sleeps: false,
   credentialId: 1,
   enabled: true,
   createdAt: '',

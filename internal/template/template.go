@@ -55,11 +55,17 @@ type Pool struct {
 	Ephemeral   *bool           `json:"ephemeral,omitempty"`
 	MinReplicas int             `json:"minReplicas,omitempty"`
 	MaxReplicas int             `json:"maxReplicas,omitempty"`
-	Labels      []string        `json:"labels,omitempty"`
-	CPUs        int             `json:"cpus,omitempty"`
-	MemoryMB    int             `json:"memoryMb,omitempty"`
-	DiskGB      int             `json:"diskGb,omitempty"`
-	Image       string          `json:"image,omitempty"`
+	// Sleeps travels, unlike layers below: a pool that goes to zero when its
+	// repository is quiet is a shape somebody chose for the pool, not a trust
+	// decision about a host. A plain bool because false is both the zero value
+	// and the default, so a template that says nothing means a pool that stays
+	// up — which is what every template written before this existed meant.
+	Sleeps   bool     `json:"sleeps,omitempty"`
+	Labels   []string `json:"labels,omitempty"`
+	CPUs     int      `json:"cpus,omitempty"`
+	MemoryMB int      `json:"memoryMb,omitempty"`
+	DiskGB   int      `json:"diskGb,omitempty"`
+	Image    string   `json:"image,omitempty"`
 	// What a machine pool bakes into its image. A template is the portable
 	// form of a pool, and a pool whose runners have the toolchain baked in is
 	// not portable without them.
@@ -179,6 +185,7 @@ func Apply(doc Document, opts Options) ([]model.Pool, error) {
 			Ephemeral:    value(entry.Ephemeral, true),
 			MinReplicas:  entry.MinReplicas,
 			MaxReplicas:  entry.MaxReplicas,
+			Sleeps:       entry.Sleeps,
 			Labels:       entry.Labels,
 			CPUs:         entry.CPUs,
 			MemoryMB:     entry.MemoryMB,
@@ -225,6 +232,7 @@ func Export(pools []model.Pool) Document {
 			Ephemeral:   &ephemeral,
 			MinReplicas: pool.MinReplicas,
 			MaxReplicas: pool.MaxReplicas,
+			Sleeps:      pool.Sleeps,
 			Labels:      pool.Labels,
 			CPUs:        pool.CPUs,
 			MemoryMB:    pool.MemoryMB,

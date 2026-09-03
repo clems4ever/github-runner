@@ -194,6 +194,12 @@ type fakeGitHub struct {
 	mintedJIT    int
 	jitWanted    []github.JIT
 	err          error
+	// queued is what the repository has waiting, and queueCalls how often the
+	// fleet went and asked — a request per pass on every pool would be the
+	// cost this feature is not allowed to have.
+	queued     int
+	queueCalls int
+	queueErr   error
 }
 
 func (f *fakeGitHub) States(ctx context.Context, scope github.Scope) (map[string]github.State, error) {
@@ -202,6 +208,14 @@ func (f *fakeGitHub) States(ctx context.Context, scope github.Scope) (map[string
 		return nil, f.err
 	}
 	return f.states, nil
+}
+
+func (f *fakeGitHub) QueuedJobs(context.Context, github.Scope, []string, int) (int, error) {
+	f.queueCalls++
+	if f.queueErr != nil {
+		return 0, f.queueErr
+	}
+	return f.queued, nil
 }
 
 func (f *fakeGitHub) Deregister(ctx context.Context, scope github.Scope, name string) error {

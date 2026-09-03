@@ -60,6 +60,11 @@ type Fleet interface {
 // GitHubClient is the part of GitHub the reconciler needs.
 type GitHubClient interface {
 	States(ctx context.Context, scope github.Scope) (map[string]github.State, error)
+	// QueuedJobs is how a pool that has scaled to zero finds out that
+	// something wants it. Only asked of pools allowed to sleep — see
+	// NeedsQueue — because it costs requests and every other pool can infer
+	// what it needs from its own runners.
+	QueuedJobs(ctx context.Context, scope github.Scope, labels []string, limit int) (int, error)
 	Deregister(ctx context.Context, scope github.Scope, name string) error
 	RegistrationToken(ctx context.Context, scope github.Scope) (string, error)
 	// JITConfig mints a whole runner configuration, for an ephemeral runner
@@ -449,7 +454,8 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			continue // its credential could not be read; already reported
 		}
 		mine := byPool[pool.Name]
-		scale := Autoscale(pool, mine, states, r.lastBusy(pool.Name, mine, states), r.now())
+		queued := r.queueDepth(ctx, pool, mine, states, secrets[pool.Name], &result)
+		scale := Autoscale(pool, mine, states, queued, r.lastBusy(pool.Name, mine, states), r.now())
 		scaling[pool.Name] = r.holdForImage(ctx, pool, scale)
 	}
 
@@ -928,4 +934,33 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 		})
 	}
 	return out, errs
+}
+
+// queueDepth is how many jobs are waiting that this pool could take, or
+// QueueUnknown when nobody needed to ask.
+//
+// An error is reported and answered as unknown, which leaves the pool at its
+// floor. For a sleeping pool that means staying asleep while jobs wait, so it
+// is not something to swallow: it goes in the pass's errors, where the UI
+// shows it against the pool.
+func (r *Reconciler) queueDepth(ctx context.Context, pool model.Pool, mine []Runner,
+	states map[string]github.State, secret model.Secret, result *Result) int {
+
+	if r.newClient == nil || !NeedsQueue(pool, mine, states) {
+		return QueueUnknown
+	}
+	client, err := r.newClient(secret)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("pool %s: %v", pool.Name, err))
+		return QueueUnknown
+	}
+	// The ceiling is the most it could start, so counting past it is requests
+	// spent on a number nothing reads.
+	depth, err := client.QueuedJobs(ctx, github.ScopeOf(pool), pool.EffectiveLabels(), pool.Ceiling())
+	if err != nil {
+		result.Errors = append(result.Errors,
+			fmt.Sprintf("pool %s: ask GitHub what is waiting for it: %v", pool.Name, err))
+		return QueueUnknown
+	}
+	return depth
 }

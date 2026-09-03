@@ -94,7 +94,8 @@ func TestBounds(t *testing.T) {
 
 // A pool must never be allowed to reach zero while it is enabled: with no
 // runner there is nothing to accept a job, and so nothing to reveal that the
-// pool needs to grow.
+// pool needs to grow. Unless it sleeps, which is the arrangement where it
+// finds out by asking instead — see sleep_test.go.
 func TestFloorIsNeverZeroWhileEnabled(t *testing.T) {
 	p := validPool()
 	p.MinReplicas = 0

@@ -129,6 +129,61 @@ describe("PoolEditor", () => {
     );
   });
 
+  // The setting somebody comes here for after a host filled up. Turning it on
+  // has to move the floor as well, or it is a pool that says it sleeps and
+  // keeps a machine up anyway.
+  it("takes the floor to zero when a pool is told to sleep", async () => {
+    renderEditor({ ...emptyPool(1), scope: "o/r" });
+    const minimum = screen.getByRole("textbox", { name: "Minimum runners" });
+    expect(minimum).toHaveValue("1");
+
+    await userEvent.click(
+      screen.getByRole("switch", { name: /Let this pool sleep/ }),
+    );
+
+    expect(minimum).toHaveValue("0");
+    expect(
+      screen.getByText(/Nothing runs while o\/r is quiet/),
+    ).toBeInTheDocument();
+  });
+
+  // GitHub lists queued jobs per repository, so nothing could ever read an
+  // organisation's queue to wake the pool. Offering the switch there would be
+  // offering a pool that quietly stops.
+  it("does not offer sleeping to an organisation pool", async () => {
+    renderEditor();
+    expect(
+      screen.getByRole("switch", { name: /Let this pool sleep/ }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByText("Organisation"));
+    expect(
+      screen.queryByRole("switch", { name: /Let this pool sleep/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  // The mirror of the layer case: switched to an organisation, the pool keeps
+  // sleeps and a floor of zero, and the daemon refuses it — about a control
+  // that has left the screen.
+  it("wakes a pool up when it is moved to an organisation", async () => {
+    const createPool = vi
+      .spyOn(api, "createPool")
+      .mockResolvedValue({} as never);
+
+    renderEditor({ ...emptyPool(1), name: "web", scope: "o/r" });
+    await userEvent.click(
+      screen.getByRole("switch", { name: /Let this pool sleep/ }),
+    );
+    await userEvent.click(screen.getByText("Organisation"));
+    await userEvent.clear(screen.getByPlaceholderText("my-org"));
+    await userEvent.type(screen.getByPlaceholderText("my-org"), "acme");
+    await userEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    expect(createPool).toHaveBeenCalledWith(
+      expect.objectContaining({ sleeps: false, minReplicas: 1 }),
+    );
+  });
+
   it("says what the pool will cost in memory at its maximum", async () => {
     renderEditor({
       ...emptyPool(1),

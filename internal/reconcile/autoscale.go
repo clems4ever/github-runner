@@ -31,19 +31,55 @@ type Scale struct {
 	ScaledUp bool   `json:"scaledUp"`
 }
 
+// QueueUnknown is the queue depth of a pool nobody asked about.
+//
+// Which is most of them. Reading a queue costs requests, so it is only done
+// for the pools that need it — the ones allowed to reach zero, where there are
+// no runners left to infer anything from.
+const QueueUnknown = -1
+
+// NeedsQueue reports whether this pool's queue is worth a request right now.
+//
+// Only pools that may sleep, and only when the pool could not take another job
+// as it stands: with nothing running there is nothing to infer from, and with
+// everything busy the depth is the difference between climbing one runner a
+// pass and meeting the queue at once. A pool with spare capacity already has
+// somewhere for the next job to go, so what is behind it can wait thirty
+// seconds to be discovered.
+func NeedsQueue(p model.Pool, runners []Runner, states map[string]github.State) bool {
+	if !p.Enabled || !p.Sleeping() {
+		return false
+	}
+	live := livingRunners(runners)
+	if len(live) == 0 {
+		return true
+	}
+	for _, runner := range live {
+		if states[runner.Name] != github.StateBusy {
+			return false
+		}
+	}
+	return true
+}
+
 // Autoscale decides how many runners a pool should have right now.
 //
 // The shape of the problem is that GitHub does not tell anyone how many jobs
 // are queued for a set of labels — only what each runner is doing. So demand
 // is inferred: if every runner in the pool is busy, the next job to arrive has
 // nowhere to go, and one more runner is added. That is also why the minimum is
-// never zero. A pool with no runners has nothing to observe, so it could never
-// learn that it should grow; keeping one idle runner is what makes the pool
-// able to answer the question at all.
+// normally never zero. A pool with no runners has nothing to observe, so it
+// could never learn that it should grow; keeping one idle runner is what makes
+// the pool able to answer the question at all.
+//
+// queued is the way out of that for a pool that may sleep: the number of jobs
+// waiting that this pool could take, read from the repository rather than
+// inferred. QueueUnknown means nobody asked, and then everything below is
+// exactly what it was before.
 //
 // It is a pure function of what was observed, so every rule below is a test
 // rather than a description.
-func Autoscale(p model.Pool, runners []Runner, states map[string]github.State, lastBusy, now time.Time) Scale {
+func Autoscale(p model.Pool, runners []Runner, states map[string]github.State, queued int, lastBusy, now time.Time) Scale {
 	floor, ceiling := p.Floor(), p.Ceiling()
 	scale := Scale{Floor: floor, Ceiling: ceiling}
 
@@ -92,6 +128,35 @@ func Autoscale(p model.Pool, runners []Runner, states map[string]github.State, l
 	case current < floor:
 		scale.Target = floor
 		scale.Reason = "below the minimum"
+
+	case current == 0 && queued > 0:
+		// Asleep, and something is waiting. This is the whole reason a pool is
+		// allowed to reach zero: the job that arrives at three in the morning
+		// starts a machine instead of finding none.
+		scale.Target = atMost(queued, ceiling)
+		scale.ScaledUp = true
+		scale.Reason = jobsWaiting(queued) + " waiting"
+
+	case current == 0:
+		// Asleep and nothing is waiting, which on a repository that pushes
+		// twice a week is nearly always. Said plainly, because a fleet page
+		// showing a pool at zero should say that it is asleep rather than
+		// leave the reader wondering what broke.
+		scale.Target = 0
+		if queued == QueueUnknown {
+			scale.Reason = "nothing is running"
+		} else {
+			scale.Reason = "asleep, and nothing is queued"
+		}
+
+	case free == 0 && queued > 0 && current < ceiling:
+		// Every runner is busy and the queue depth is actually known, so the
+		// pool can go straight to what is waiting rather than climbing one a
+		// pass. A pass is thirty seconds; a queue of ten would otherwise take
+		// five minutes to be met.
+		scale.Target = atMost(current+queued, ceiling)
+		scale.ScaledUp = true
+		scale.Reason = "every runner is busy, and " + jobsWaiting(queued) + " waiting"
 
 	case free == 0 && current < ceiling:
 		// Every runner is working, so the next job would queue. One at a time
@@ -143,6 +208,22 @@ func Autoscale(p model.Pool, runners []Runner, states map[string]github.State, l
 		scale.Target = ceiling
 	}
 	return scale
+}
+
+// atMost is the smaller of two, for the ceiling.
+func atMost(want, ceiling int) int {
+	if want > ceiling {
+		return ceiling
+	}
+	return want
+}
+
+// jobsWaiting is a count said the way a person would read it.
+func jobsWaiting(n int) string {
+	if n == 1 {
+		return "a job is"
+	}
+	return strconv.Itoa(n) + " jobs are"
 }
 
 // DesiredNames picks which runners a pool should have, given how many it

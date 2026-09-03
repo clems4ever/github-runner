@@ -39,6 +39,7 @@ function pool(over: Partial<Pool>): Pool {
     packages: [],
     recipe: '',
     layers: 'off',
+    sleeps: false,
     credentialId: 3,
     enabled: true,
     createdAt: '',
