@@ -35,6 +35,9 @@ type Client struct {
 	app     *appAuth
 	baseURL string
 	http    *http.Client
+	// The runner groups this client has resolved, so scaling a pool up does
+	// not ask for the same one once per runner.
+	groupCache
 }
 
 // Option configures a client.

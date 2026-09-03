@@ -62,6 +62,9 @@ type GitHubClient interface {
 	States(ctx context.Context, scope github.Scope) (map[string]github.State, error)
 	Deregister(ctx context.Context, scope github.Scope, name string) error
 	RegistrationToken(ctx context.Context, scope github.Scope) (string, error)
+	// JITConfig mints a whole runner configuration, for an ephemeral runner
+	// that must not hold the credential itself.
+	JITConfig(ctx context.Context, scope github.Scope, want github.JIT) (string, error)
 }
 
 // ClientFactory builds a GitHub client for one credential, whichever kind it
@@ -632,14 +635,14 @@ func (r *Reconciler) apply(ctx context.Context, action Action, pools map[string]
 		}
 		spec := *action.Spec
 		// A runtime that shares everything with the job it runs must not be
-		// handed the credential, so the daemon does the minting and passes on
-		// a token that can do one thing and expires in an hour.
+		// handed the credential, so the daemon does the minting. An ephemeral
+		// pool gets a whole runner configuration, which is one runner taking
+		// one job; the rest get a registration token, which is the most GitHub
+		// will mint for a runner meant to outlive its job.
 		if spec.Runtime == model.RuntimeContainer {
-			minted, err := r.mintFor(ctx, spec, pools)
-			if err != nil {
+			if err := r.mintFor(ctx, &spec, pools); err != nil {
 				return err
 			}
-			spec.RegistrationToken = minted
 		}
 		if action.Op == OpCreate {
 			return executor.Create(ctx, spec)
@@ -662,24 +665,44 @@ func (r *Reconciler) apply(ctx context.Context, action Action, pools map[string]
 	}
 }
 
-// mintFor buys a registration token for one runner.
-func (r *Reconciler) mintFor(ctx context.Context, spec Spec, pools map[string]model.Pool) (string, error) {
+// mintFor buys one runner whatever it registers with.
+func (r *Reconciler) mintFor(ctx context.Context, spec *Spec, pools map[string]model.Pool) error {
 	if r.newClient == nil {
-		return "", nil
+		return nil
 	}
 	pool, ok := pools[spec.Pool]
 	if !ok {
-		return "", fmt.Errorf("pool %s is gone", spec.Pool)
+		return fmt.Errorf("pool %s is gone", spec.Pool)
 	}
 	secret, err := r.store.Secret(ctx, pool.CredentialID)
 	if err != nil {
-		return "", err
+		return err
 	}
 	client, err := r.newClient(secret)
 	if err != nil {
-		return "", err
+		return err
 	}
-	return client.RegistrationToken(ctx, github.ScopeOf(pool))
+	scope := github.ScopeOf(pool)
+
+	if spec.Ephemeral {
+		// No group: a pool does not have one to name, so every runner lands in
+		// the scope's default group, which is where they land today.
+		jit, err := client.JITConfig(ctx, scope, github.JIT{
+			Name: spec.Name, Labels: spec.Labels,
+		})
+		if err != nil {
+			return err
+		}
+		spec.JITConfig = jit
+		return nil
+	}
+
+	token, err := client.RegistrationToken(ctx, scope)
+	if err != nil {
+		return err
+	}
+	spec.RegistrationToken = token
+	return nil
 }
 
 func (r *Reconciler) deregister(ctx context.Context, action Action, pools map[string]model.Pool) {

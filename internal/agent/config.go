@@ -53,6 +53,9 @@ type Config struct {
 	// minted is a registration token the daemon produced for this runner,
 	// which a container gets instead of a credential of its own.
 	minted string
+	// mintedJIT is a whole runner configuration the daemon produced for this
+	// runner, which is what an ephemeral container gets instead.
+	mintedJIT string
 }
 
 // ConfigFromEnv reads the runner's configuration out of its environment.
@@ -103,6 +106,10 @@ func ConfigFromEnv(name string) (Config, error) {
 	if c.minted != "" {
 		_ = os.Unsetenv("FLEET_REGISTRATION_TOKEN")
 	}
+	c.mintedJIT = os.Getenv("FLEET_JIT_CONFIG")
+	if c.mintedJIT != "" {
+		_ = os.Unsetenv("FLEET_JIT_CONFIG")
+	}
 
 	if c.Runner == "" {
 		return c, fmt.Errorf("no runner name: pass --name, or set FLEET_RUNNER")
@@ -115,9 +122,9 @@ func ConfigFromEnv(name string) (Config, error) {
 	// with the daemon still down. A container is handed a token the daemon
 	// minted, because a container shares everything with the job it runs and
 	// must not be given a credential that administers repositories.
-	if c.CredentialFile == "" && c.minted == "" {
+	if c.CredentialFile == "" && c.minted == "" && c.mintedJIT == "" {
 		return c, fmt.Errorf("%s: nothing to register with. A runner needs either a credential that can "+
-			"mint registration tokens, or a token minted for it", c.Runner)
+			"mint registration tokens, or a configuration minted for it", c.Runner)
 	}
 	if c.CredentialKind == model.CredentialApp && c.AppID == 0 {
 		return c, fmt.Errorf("%s: an app credential without an app id", c.Runner)
@@ -136,6 +143,18 @@ func ConfigFromEnv(name string) (Config, error) {
 // credential and mints for itself, which is what lets it come back after a
 // reboot with the daemon still down.
 func (c Config) RegistrationToken() string { return c.minted }
+
+// MintedJIT is a whole runner configuration the daemon produced for this
+// runner.
+//
+// This is how an ephemeral container registers, and it is strictly better than
+// the token above: a registration token can register any runner on the
+// repository, where this is one runner, taking one job, and worthless
+// afterwards. It is minted by the daemon rather than here for the same reason
+// the token is — a container shares everything with the job it runs — and it
+// is not reusable, which is why the container executor rebuilds a container
+// rather than restarting one.
+func (c Config) MintedJIT() string { return c.mintedJIT }
 
 // Token reads the credential the daemon left for this runner.
 //

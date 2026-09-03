@@ -67,6 +67,16 @@ type Spec struct {
 	// when the plan is made: these expire in an hour, and a plan is not a
 	// promise that anything will happen.
 	RegistrationToken string
+	// JITConfig is a whole runner configuration minted by the daemon, and is
+	// what a runtime that must not hold the credential gets instead of the
+	// token above when its pool is ephemeral.
+	//
+	// It is better than a token in every way that matters here — one runner,
+	// one job, nothing that can administer a repository — and worse in exactly
+	// one: it is spent by the job it takes, so it cannot be reused and a runner
+	// holding one cannot be restarted, only rebuilt. Filled in as the action is
+	// applied, for the same reason as the token and more strongly.
+	JITConfig string
 }
 
 // Runner is what an executor found on the host.

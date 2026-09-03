@@ -54,39 +54,49 @@ func runContainer(ctx context.Context, c Config, log *slog.Logger) error {
 		return err
 	}
 
-	token, err := registrationToken(ctx, c)
+	reg, err := register(ctx, c)
 	if err != nil {
 		return err
 	}
 
-	args := []string{
-		"--url", c.URL,
-		"--name", c.Runner,
-		"--runnergroup", c.Group,
-		"--work", "/home/runner/_work",
-		"--unattended",
-		"--disableupdate",
-		// This runner's name is its identity in the fleet and is reused on
-		// purpose, so it takes over the entry a previous container left.
-		"--replace",
-		"--token", token,
-	}
-	if len(c.Labels) > 0 {
-		args = append(args, "--labels", strings.Join(c.Labels, ","))
-	}
-	if c.Ephemeral {
-		args = append(args, "--ephemeral")
+	// A just-in-time configuration is everything config.sh would have written,
+	// minted by the daemon before this container was created. There is nothing
+	// to register: unpack it and run.
+	runArgs := []string{}
+	if reg.JIT != "" {
+		log.Info("starting from a just-in-time configuration",
+			"runner", c.Runner, "url", c.URL, "labels", strings.Join(c.Labels, ","))
+		runArgs = append(runArgs, "--jitconfig", reg.JIT)
+	} else {
+		args := []string{
+			"--url", c.URL,
+			"--name", c.Runner,
+			"--runnergroup", c.Group,
+			"--work", "/home/runner/_work",
+			"--unattended",
+			"--disableupdate",
+			// This runner's name is its identity in the fleet and is reused on
+			// purpose, so it takes over the entry a previous container left.
+			"--replace",
+			"--token", reg.Token,
+		}
+		if len(c.Labels) > 0 {
+			args = append(args, "--labels", strings.Join(c.Labels, ","))
+		}
+		if c.Ephemeral {
+			args = append(args, "--ephemeral")
+		}
+
+		log.Info("registering", "runner", c.Runner, "url", c.URL, "labels", strings.Join(c.Labels, ","))
+		config := exec.CommandContext(ctx, "./config.sh", args...)
+		config.Dir = runnerHome
+		config.Stdout, config.Stderr = os.Stdout, os.Stderr
+		if err := config.Run(); err != nil {
+			return fmt.Errorf("registration failed: %w", err)
+		}
 	}
 
-	log.Info("registering", "runner", c.Runner, "url", c.URL, "labels", strings.Join(c.Labels, ","))
-	config := exec.CommandContext(ctx, "./config.sh", args...)
-	config.Dir = runnerHome
-	config.Stdout, config.Stderr = os.Stdout, os.Stderr
-	if err := config.Run(); err != nil {
-		return fmt.Errorf("registration failed: %w", err)
-	}
-
-	runner := exec.Command("./run.sh")
+	runner := exec.Command("./run.sh", runArgs...)
 	runner.Dir = runnerHome
 	runner.Stdout, runner.Stderr = os.Stdout, os.Stderr
 	if err := runner.Start(); err != nil {

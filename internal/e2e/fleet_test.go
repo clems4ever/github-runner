@@ -139,9 +139,10 @@ func (h *host) names() []string {
 }
 
 type fakeGitHub struct {
-	mu     sync.Mutex
-	states map[string]github.State
-	minted int
+	mu        sync.Mutex
+	states    map[string]github.State
+	minted    int
+	mintedJIT int
 }
 
 func (f *fakeGitHub) States(context.Context, github.Scope) (map[string]github.State, error) {
@@ -161,6 +162,13 @@ func (f *fakeGitHub) RegistrationToken(context.Context, github.Scope) (string, e
 	defer f.mu.Unlock()
 	f.minted++
 	return fmt.Sprintf("AAAA-registration-%d", f.minted), nil
+}
+
+func (f *fakeGitHub) JITConfig(_ context.Context, _ github.Scope, want github.JIT) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mintedJIT++
+	return fmt.Sprintf("AAAA-jitconfig-%s-%d", want.Name, f.mintedJIT), nil
 }
 
 func (f *fakeGitHub) setBusy(name string) {
@@ -947,6 +955,37 @@ func TestContainerRunnersAreGivenATokenNotTheCredential(t *testing.T) {
 	}
 	if f.gh.minted != 1 {
 		t.Fatalf("minted %d tokens for one container", f.gh.minted)
+	}
+}
+
+// An ephemeral container gets a whole runner configuration instead of a token.
+// It is strictly better: a registration token can register any runner on the
+// repository, where this is one runner, taking one job, and worthless
+// afterwards.
+func TestEphemeralContainersAreGivenAConfigurationNotAToken(t *testing.T) {
+	f := newFleet(t)
+	defer f.close()
+
+	credential := f.addCredential()
+	f.addPool(map[string]any{
+		"name": "api", "scopeKind": "repository", "scope": "o/r",
+		"runtime": "container", "minReplicas": 1, "maxReplicas": 1,
+		"credentialId": credential, "enabled": true, "ephemeral": true,
+	})
+	f.reconcileNow()
+
+	if len(f.containers.specs) != 1 {
+		t.Fatalf("got %d containers", len(f.containers.specs))
+	}
+	spec := f.containers.specs[0]
+	if spec.JITConfig == "" {
+		t.Fatal("the container was created without a configuration, so it cannot run")
+	}
+	if spec.RegistrationToken != "" {
+		t.Error("a registration token was minted as well, which is one more thing that can register a runner")
+	}
+	if f.gh.minted != 0 {
+		t.Errorf("the daemon minted %d registration tokens for a just-in-time runner", f.gh.minted)
 	}
 }
 

@@ -315,7 +315,7 @@ per job. It is about half a minute, and it is worth knowing what it is made of:
 | | |
 | --- | --- |
 | systemd's restart delay | 2s |
-| overlay disk, registration token, seed image | 1–2s |
+| overlay disk, runner configuration, seed image | 1–2s |
 | the guest booting to *Listening for Jobs* | ~16s |
 
 The image is built for that: a machine boots for one job and is destroyed, so
@@ -477,17 +477,46 @@ job the host's `/dev/kvm`, which is a real hole in an already weaker boundary.
 Both are offered; the UI says which is which.
 
 The two also differ in what the runner is trusted with. A machine keeps the
-credential and mints its own registration tokens, which is what lets it come
-back after a reboot with the daemon still down — the job is inside the guest
-and never sees it. A container shares everything with its job, so it is given
-nothing but a registration token the daemon minted: short-lived, and able only
-to register a runner. The cost is that containers are replaced by the daemon
-rather than restarted by Docker, so a container that finishes a job while the
-daemon is down waits for it to come back.
+credential and registers itself at every boot, which is what lets it come back
+after a reboot with the daemon still down — the job is inside the guest and
+never sees it. A container shares everything with its job, so it is given only
+what the daemon minted for that one runner. The cost is that containers are
+replaced by the daemon rather than restarted by Docker, so a container that
+finishes a job while the daemon is down waits for it to come back.
+
+### How a runner registers
+
+An **ephemeral** runner is registered just in time: the whole configuration —
+name, labels, group, and the credential the runner listens with — is minted on
+the host by a single call to GitHub, handed to the runner, and spent on the
+first job. Three things follow from that, and they are the reason it is the
+default:
+
+- Nothing inside the runner can administer a repository. A registration token
+  is short-lived, but for its lifetime anyone holding it can register runners;
+  a just-in-time configuration is one runner that takes one job.
+- There is no `config.sh` step, so there is no half-registered runner to clean
+  up when it fails.
+- A runner that is minted and never boots leaves nothing behind on GitHub.
+  Under a registration token the entry appears when the guest configures
+  itself, which is what left offline runners on a repository after a host went
+  down mid-boot.
+
+A **non-ephemeral** runner cannot use one. GitHub only mints a configuration
+for a runner that takes a single job and is spent, which is the opposite of a
+pool kept up across jobs, so those still register with a token — minted by the
+daemon for a container, and by the machine itself for a VM.
+
+A configuration is spent by the job it took, so a machine mints its own at
+every boot rather than being handed one that has to survive a restart. That is
+what keeps the guarantee above: a machine that comes back with the daemon down
+registers from the credential it keeps, and a machine restarted by systemd
+after a job gets a fresh configuration instead of replaying a used one.
 
 Container images are expected to carry the GitHub Actions runner. The official
 `ghcr.io/actions/actions-runner` works as it is; a custom image is found by
-looking for `config.sh`, or told where to look with `FLEET_RUNNER_HOME`.
+looking for `config.sh`, or told where to look with `FLEET_RUNNER_HOME` — which
+is where the runner is started from either way.
 
 ## How the daemon works
 

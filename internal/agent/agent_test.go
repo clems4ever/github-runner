@@ -278,7 +278,8 @@ func TestRunUserDataCarriesTheRegistration(t *testing.T) {
 		Runner: "web-1", URL: "https://github.com/o/r", Labels: []string{"vm", "gpu"},
 		Group: "Default", Ephemeral: true,
 	}
-	data := runUserData(c, "AAAA-registration-token", "ssh-ed25519 KEY runner-fleet")
+	data := runUserData(c, Registration{Token: "AAAA-registration-token"},
+		"ssh-ed25519 KEY runner-fleet")
 
 	for _, want := range []string{
 		"hostname: web-1",
@@ -302,7 +303,7 @@ func TestRunUserDataCarriesTheRegistration(t *testing.T) {
 // The token is 0600 and root-owned inside the machine: it is short-lived, but
 // a job has no reason to be able to read it.
 func TestTheRegistrationTokenIsNotReadableByTheJob(t *testing.T) {
-	data := runUserData(Config{Runner: "web-1", URL: "u"}, "token", "key")
+	data := runUserData(Config{Runner: "web-1", URL: "u"}, Registration{Token: "token"}, "key")
 	i := strings.Index(data, "/etc/runner-fleet/runner.env")
 	if i < 0 {
 		t.Fatal("no runner environment file")
@@ -310,6 +311,45 @@ func TestTheRegistrationTokenIsNotReadableByTheJob(t *testing.T) {
 	window := data[i : i+200]
 	if !strings.Contains(window, "permissions: '0600'") || !strings.Contains(window, "owner: 'root:root'") {
 		t.Fatalf("the registration token is not protected:\n%s", window)
+	}
+}
+
+// The registration a machine gets is minted on the host, so the guest never
+// holds anything that could administer a repository — and with a just-in-time
+// configuration there is no registration step in there at all.
+func TestRunUserDataCarriesAJustInTimeConfiguration(t *testing.T) {
+	c := Config{
+		Runner: "web-1", URL: "https://github.com/o/r", Labels: []string{"vm"},
+		Ephemeral: true,
+	}
+	data := runUserData(c, Registration{JIT: "BASE64-JIT-CONFIG"}, "ssh-ed25519 KEY")
+
+	if !strings.Contains(data, `RUNNER_JITCONFIG="BASE64-JIT-CONFIG"`) {
+		t.Error("the machine was not given its configuration")
+	}
+	// Empty rather than absent: the guest picks whichever it was given, and an
+	// empty one is how it knows which that is.
+	if !strings.Contains(data, `RUNNER_TOKEN=""`) {
+		t.Error("a registration token was minted for a just-in-time runner as well")
+	}
+}
+
+// A just-in-time configuration is spent by the job it takes, so the guest must
+// use it directly rather than running config.sh with it — and it must prefer it
+// over the older path when it has both.
+func TestGuestScriptPrefersAJustInTimeConfiguration(t *testing.T) {
+	for _, want := range []string{
+		`if [[ -n "${RUNNER_JITCONFIG:-}" ]]; then`,
+		`exec ./run.sh --jitconfig "$RUNNER_JITCONFIG"`,
+	} {
+		if !strings.Contains(GuestRunnerScript, want) {
+			t.Errorf("the guest script is missing %q", want)
+		}
+	}
+	jit := strings.Index(GuestRunnerScript, "--jitconfig")
+	config := strings.Index(GuestRunnerScript, "./config.sh")
+	if jit < 0 || config < 0 || jit > config {
+		t.Error("the guest registers the old way before looking at the configuration it was given")
 	}
 }
 

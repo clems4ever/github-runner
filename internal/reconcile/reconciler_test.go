@@ -191,6 +191,8 @@ type fakeGitHub struct {
 	deregistered []string
 	scopeCalls   int
 	minted       int
+	mintedJIT    int
+	jitWanted    []github.JIT
 	err          error
 }
 
@@ -210,6 +212,12 @@ func (f *fakeGitHub) Deregister(ctx context.Context, scope github.Scope, name st
 func (f *fakeGitHub) RegistrationToken(ctx context.Context, scope github.Scope) (string, error) {
 	f.minted++
 	return fmt.Sprintf("AAAA-registration-%d", f.minted), nil
+}
+
+func (f *fakeGitHub) JITConfig(_ context.Context, _ github.Scope, want github.JIT) (string, error) {
+	f.mintedJIT++
+	f.jitWanted = append(f.jitWanted, want)
+	return fmt.Sprintf("AAAA-jitconfig-%s-%d", want.Name, f.mintedJIT), nil
 }
 
 // testPool is a fixed-size pool: minimum equal to maximum, so these tests are

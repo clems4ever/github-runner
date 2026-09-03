@@ -39,19 +39,31 @@ func Run(ctx context.Context, c Config, log *slog.Logger) error {
 	return runVM(ctx, c, log)
 }
 
-// registrationToken mints the short-lived token the runner registers with.
-// One per boot: it expires an hour after it is issued, so it cannot be stored
-// in the machine's configuration and reused.
-func registrationToken(ctx context.Context, c Config) (string, error) {
-	// A token the daemon minted for this runner, which is how a container
-	// registers without ever being given the credential itself.
+// register mints what this machine becomes a runner with, once per boot.
+//
+// An ephemeral pool gets a just-in-time configuration: the whole of what
+// config.sh would have written, minted out here on the host, so the guest has
+// no registration step to fail and never holds anything that could administer
+// a repository. A pool of long-lived runners gets a registration token
+// instead, because GitHub only mints a just-in-time configuration for a runner
+// that takes one job and is then spent.
+//
+// Either way it is minted per boot and never stored. Both expire, and the
+// just-in-time one is spent by the job it takes — so a machine that reboots
+// mints again rather than replaying something that no longer works.
+func register(ctx context.Context, c Config) (Registration, error) {
+	// A configuration the daemon minted for this runner, which is how a
+	// container registers without ever being given the credential itself.
+	if minted := c.MintedJIT(); minted != "" {
+		return Registration{JIT: minted}, nil
+	}
 	if minted := c.RegistrationToken(); minted != "" {
-		return minted, nil
+		return Registration{Token: minted}, nil
 	}
 
 	secret, err := c.Token()
 	if err != nil {
-		return "", err
+		return Registration{}, err
 	}
 	client, err := github.NewFromSecret(github.Secret{
 		IsAppCredential: c.CredentialKind == model.CredentialApp,
@@ -60,9 +72,25 @@ func registrationToken(ctx context.Context, c Config) (string, error) {
 		InstallationID:  c.InstallationID,
 	})
 	if err != nil {
-		return "", err
+		return Registration{}, err
 	}
-	return client.RegistrationToken(ctx, github.Scope{Kind: c.ScopeKind, Path: c.Scope})
+	scope := github.Scope{Kind: c.ScopeKind, Path: c.Scope}
+
+	if c.Ephemeral {
+		jit, err := client.JITConfig(ctx, scope, github.JIT{
+			Name: c.Runner, Labels: c.Labels, Group: c.Group,
+		})
+		if err != nil {
+			return Registration{}, err
+		}
+		return Registration{JIT: jit}, nil
+	}
+
+	token, err := client.RegistrationToken(ctx, scope)
+	if err != nil {
+		return Registration{}, err
+	}
+	return Registration{Token: token}, nil
 }
 
 func runVM(ctx context.Context, c Config, log *slog.Logger) error {
@@ -100,13 +128,13 @@ func runVM(ctx context.Context, c Config, log *slog.Logger) error {
 		return fmt.Errorf("create the machine's disk: %w", err)
 	}
 
-	token, err := registrationToken(ctx, c)
+	reg, err := register(ctx, c)
 	if err != nil {
 		return err
 	}
 
 	seed := filepath.Join(dir, "seed.iso")
-	if err := makeSeed(ctx, runUserData(c, token, publicKey),
+	if err := makeSeed(ctx, runUserData(c, reg, publicKey),
 		metaData(c.Runner, fmt.Sprintf("%s-%d", c.Runner, time.Now().Unix())), seed); err != nil {
 		return err
 	}

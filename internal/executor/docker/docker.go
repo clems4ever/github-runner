@@ -213,10 +213,17 @@ func env(spec reconcile.Spec, layout paths.Layout) []string {
 		fmt.Sprintf("FLEET_EPHEMERAL=%t", spec.Ephemeral),
 		fmt.Sprintf("FLEET_NESTED=%t", spec.Nested),
 		"FLEET_RUNTIME=container",
-		// What the runner registers with. Short-lived and single-purpose: the
-		// worst a job can do with it is register another runner, where the
-		// credential it replaces could administer the repository.
+		// What the runner registers with. Never the credential itself: a
+		// container shares everything with the job it runs, so handing it the
+		// key that administers repositories would hand it to the job.
+		//
+		// One of these is filled in, not both. The configuration is what an
+		// ephemeral pool gets and is the better of the two — one runner, one
+		// job, worthless afterwards — where the token can still register
+		// another runner on the repository. The token is only used where
+		// GitHub will not mint the other: a runner meant to outlive its job.
 		"FLEET_REGISTRATION_TOKEN=" + spec.RegistrationToken,
+		"FLEET_JIT_CONFIG=" + spec.JITConfig,
 	}
 }
 
