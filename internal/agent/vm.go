@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -11,7 +10,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // CPUModel is the -cpu argument for a machine.
@@ -149,41 +147,6 @@ func bootVM(ctx context.Context, o VMOptions) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("start %s: %w", qemuBinary(), err)
 	}
 	return cmd, nil
-}
-
-// powerDown asks the guest to shut down through the QEMU monitor.
-//
-// This is an ACPI power button press, not a power cut: inside the machine
-// systemd stops the runner unit, and that unit waits for the job in flight.
-// It is the mechanism behind every "drain" in the fleet.
-func powerDown(socket string) error {
-	conn, err := net.DialTimeout("unix", socket, 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("reach the machine's monitor: %w", err)
-	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	// QMP opens with a greeting and refuses commands until capabilities are
-	// negotiated.
-	decoder := json.NewDecoder(conn)
-	var greeting map[string]any
-	if err := decoder.Decode(&greeting); err != nil {
-		return fmt.Errorf("read the monitor greeting: %w", err)
-	}
-	for _, command := range []string{`{"execute":"qmp_capabilities"}`, `{"execute":"system_powerdown"}`} {
-		if _, err := conn.Write([]byte(command)); err != nil {
-			return err
-		}
-		var reply map[string]any
-		if err := decoder.Decode(&reply); err != nil {
-			return err
-		}
-		if errValue, failed := reply["error"]; failed {
-			return fmt.Errorf("monitor refused %s: %v", command, errValue)
-		}
-	}
-	return nil
 }
 
 // freePort finds a loopback port for the machine's ssh forward.
