@@ -1,0 +1,14 @@
+# Read by runner-fleet from this repository's default branch. It describes what
+# this repository's jobs need on top of the pool's golden image; the daemon
+# builds that once as a qcow2 layer and every runner boots from it thereafter.
+packages:
+  - jq
+  - tree
+
+recipe: |
+  #!/usr/bin/env bash
+  set -euo pipefail
+  # Stamped into the image at build time. A job that reads the same stamp twice
+  # booted the same prebuilt layer both times rather than provisioning again.
+  date -u +%Y-%m-%dT%H:%M:%SZ > /opt/fleet-layer-built-at
+  chmod 0644 /opt/fleet-layer-built-at
