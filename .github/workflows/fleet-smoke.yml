@@ -1,0 +1,16 @@
+name: fleet-smoke
+
+# A trivial job for a sleeping pool to wake on. It exists to give the fleet a
+# real queued job to find, not to check anything about the code — see the
+# live end-to-end test this branch adds.
+
+on:
+  push:
+    branches: [jit-fleet]
+  workflow_dispatch:
+
+jobs:
+  hello:
+    runs-on: [self-hosted, linux, vm, jit-fleet-smoke]
+    steps:
+      - run: echo hello
