@@ -136,6 +136,85 @@ the recipe changes. Both fields are for machine pools; a container pool names a
 prebuilt image in its image field instead, and is refused these rather than
 quietly ignoring them.
 
+### What a repository can add for itself
+
+The operator owns the fleet — how big a machine is, which credential it uses,
+how many there may be. What the operator cannot know is what any particular
+repository's jobs need installed. That changes with the repository, and asking
+somebody with access to the host to edit a pool every time a project picks up a
+dependency is how a fleet ends up with one enormous image that has everything in
+it, rebuilt whenever anyone needs anything.
+
+So a repository can declare its own layer, in a file next to the workflows that
+need it:
+
+```yaml
+# .github/runner-fleet.yml
+packages:
+  - ffmpeg
+  - libvips-dev
+
+recipe: |
+  #!/usr/bin/env bash
+  set -euo pipefail
+  npm install -g pnpm@10
+```
+
+The daemon reads it from the repository's **default branch**, builds a thin
+image on top of the pool's, and boots that pool's runners from it. The chain is
+three deep and each level is shared as far as it can be:
+
+```
+runner-noble-default-5cddd228c4a9.qcow2   the pool's golden image   5230 MB
+  └── runner-noble-<repo>-….qcow2         what the repository added  260 MB
+        └── disk.qcow2                    one machine, one job       grows
+```
+
+Those are real figures from a build on a test host: a repository's whole layer
+cost 260 MB on a 5.2 GB image and took under two minutes, because everything
+underneath it was already built. A machine boots through all three levels in
+about 35 seconds.
+
+**A pull request cannot change any of this.** Only the default branch is read,
+so a change to the file has to be merged first — opening a PR against a
+repository is not a way to run code on the host.
+
+Layers are off until an operator turns them on, per pool, in the pool editor:
+
+| Setting | What it does |
+|---|---|
+| **No** | The pool's own image is the whole of it. The default, and what every pool did before this existed. |
+| **Once I have approved each definition** | Each new definition waits on the **Layers** page until somebody reads it. |
+| **Whatever it asks for, unread** | Builds whatever the default branch says. |
+
+The middle one is the setting to want. What is being decided is not small: a
+recipe is a root shell on a build machine on the host, and anybody who can merge
+to the default branch can change it. Approving costs one click per change to a
+file that changes rarely, and what it buys is that no merge runs anything on the
+host that a human has not read.
+
+The **Layers** page is where that happens. It shows the packages and the recipe
+in full, because an approval button next to a package count is a click rather
+than a decision. A definition is identified by a digest of exactly what would
+execute — the effective package list and the script, not the file — so
+reformatting the file is not a new question, and changing a command always is.
+The digest travels with the decision, so a repository that edits its file while
+the page is open gets a refusal rather than an approval of something nobody saw.
+Approvals can be withdrawn.
+
+Only a **repository-scoped machine pool** can have layers, and the editor offers
+the setting nowhere else. An organisation pool's runner is built before it knows
+whose job it will take, so there is no one repository whose layer it could have;
+a container has no disk of that shape. Nothing is portable either — a template
+that carried "trust" would install an approval nobody on this host made, so the
+import refuses that field by name.
+
+**A pool whose layer is pending, building or broken keeps serving on its own
+image.** It is not held at zero. Holding it would mean a repository could take
+its own runners away by committing a file, and a job that would have run fine on
+the pool's image would sit in a queue instead. The reason is reported on the
+reconcile pass rather than swallowed.
+
 ### Waiting for an image
 
 **A machine pool takes no jobs until the image its runners boot has been
