@@ -35,6 +35,8 @@ const pool = (over: Partial<Pool> = {}): Pool => ({
   image: 'default',
   packages: [],
   recipe: '',
+  layers: 'off',
+  sleeps: false,
   credentialId: 1,
   enabled: true,
   createdAt: '',
@@ -100,6 +102,14 @@ describe('PoolsPage', () => {
     renderPage([pool()])
     expect(screen.getByRole('table')).toBeInTheDocument()
     expect(screen.getByText('web')).toBeInTheDocument()
+  })
+
+  // A pool that sleeps is empty most of the time, and an empty pool otherwise
+  // reads as a broken one. The row has to say which it is.
+  it('marks a pool that sleeps, so its emptiness is not read as a fault', () => {
+    renderPage([pool({ sleeps: true, minReplicas: 0 })])
+    expect(screen.getByText('sleeps')).toBeInTheDocument()
+    expect(screen.getByText('of 0–4')).toBeInTheDocument()
   })
 
   it('says what to do when there are no pools yet', () => {
@@ -215,6 +225,22 @@ describe('scaling a pool from the list', () => {
     // decision for the editor, not a side effect of a minus button.
     renderPage([pool({ minReplicas: 1, maxReplicas: 2 })])
     expect(screen.getByRole('button', { name: 'Scale web down' })).toBeDisabled()
+  })
+
+  // The floor of a sleeping pool is zero, so the minus button steps it right
+  // down to a ceiling of one — and stops there, because a pool with nowhere to
+  // wake up to is one the daemon refuses.
+  it('steps a sleeping pool down to one, and no further', async () => {
+    const { onChange } = renderPage([pool({ sleeps: true, minReplicas: 0, maxReplicas: 2 })])
+    vi.spyOn(api, 'updatePool').mockResolvedValue(pool() as never)
+
+    await userEvent.click(screen.getByRole('button', { name: 'Scale web down' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Scale down' }))
+    expect(api.updatePool).toHaveBeenCalledWith(1, expect.objectContaining({ maxReplicas: 1 }))
+    expect(onChange).toHaveBeenCalled()
+
+    renderPage([pool({ sleeps: true, minReplicas: 0, maxReplicas: 1 })])
+    expect(screen.getAllByRole('button', { name: 'Scale web down' })[1]).toBeDisabled()
   })
 
   it('stops where the daemon would refuse the pool anyway', () => {

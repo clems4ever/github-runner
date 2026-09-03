@@ -60,6 +60,21 @@ describe('scaled', () => {
     expect(scaled(pool(64, 64), 1)).toBeNull()
   })
 
+  // A sleeping pool's floor is zero, and the guard against an empty pool is
+  // exactly what it does not need: something else is reading its queue. Left
+  // alone, the steppers were dead on the pools whose ceiling matters most.
+  it('steps a sleeping pool from its floor of zero', () => {
+    const asleep = { ...pool(0, 2), sleeps: true }
+    expect(scaled(asleep, 1)).toMatchObject({ minReplicas: 0, maxReplicas: 3 })
+    expect(scaled(asleep, -1)).toMatchObject({ minReplicas: 0, maxReplicas: 1 })
+  })
+
+  // Zero to zero is a pool with nowhere to wake up to, which the daemon
+  // refuses. The switch in the editor is what stops a pool entirely.
+  it('will not leave a sleeping pool with nowhere to wake up to', () => {
+    expect(scaled({ ...pool(0, 1), sleeps: true }, -1)).toBeNull()
+  })
+
   it('leaves the rest of the pool alone', () => {
     const before = pool(1, 4)
     expect(scaled(before, 1)).toEqual({ ...before, maxReplicas: 5 })

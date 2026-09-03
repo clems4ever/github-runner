@@ -14,7 +14,7 @@ vi.mock('../api', async () => {
   }
 })
 
-const uncapped: Budget = { cpus: 0, cpuWeight: 0, memoryMb: 0, hardMemory: false }
+const uncapped: Budget = { cpus: 0, cpuWeight: 0, memoryMb: 0, diskGb: 0, hardMemory: false }
 
 function stored(budget: Partial<Budget> = {}) {
   vi.mocked(api.settings).mockResolvedValue({
@@ -54,7 +54,8 @@ describe('the fleet budget', () => {
 
     expect(screen.getByLabelText('CPU')).toHaveValue('0')
     expect(screen.getByLabelText('Memory (MiB)')).toHaveValue('0')
-    expect(screen.getAllByText(/0 for no cap/)).toHaveLength(2)
+    expect(screen.getByLabelText('Disk (GiB)')).toHaveValue('0')
+    expect(screen.getAllByText(/0 for no cap/)).toHaveLength(3)
   })
 
   it('shows a budget that has been set', async () => {

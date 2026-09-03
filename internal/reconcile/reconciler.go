@@ -60,8 +60,16 @@ type Fleet interface {
 // GitHubClient is the part of GitHub the reconciler needs.
 type GitHubClient interface {
 	States(ctx context.Context, scope github.Scope) (map[string]github.State, error)
+	// QueuedJobs is how a pool that has scaled to zero finds out that
+	// something wants it. Only asked of pools allowed to sleep — see
+	// NeedsQueue — because it costs requests and every other pool can infer
+	// what it needs from its own runners.
+	QueuedJobs(ctx context.Context, scope github.Scope, labels []string, limit int) (int, error)
 	Deregister(ctx context.Context, scope github.Scope, name string) error
 	RegistrationToken(ctx context.Context, scope github.Scope) (string, error)
+	// JITConfig mints a whole runner configuration, for an ephemeral runner
+	// that must not hold the credential itself.
+	JITConfig(ctx context.Context, scope github.Scope, want github.JIT) (string, error)
 }
 
 // ClientFactory builds a GitHub client for one credential, whichever kind it
@@ -85,6 +93,22 @@ type CredentialWriter func(id int64, secret string) error
 // about the pool and not about the builder.
 type ImageReady func(ctx context.Context, pool model.Pool) (ready bool, why string)
 
+// LayerFor answers which per-repository image a pool's runners should boot.
+//
+// Empty is the ordinary answer and means the pool's own image: the pool has no
+// layer policy, or the repository declares nothing, or what it declared is
+// waiting for somebody to approve it. note says which of those, for the pass
+// result, and is empty when there was nothing to say.
+//
+// A pool whose layer is not ready is *not* held at zero. The repository asked
+// for additions and has not been given them yet; its jobs run on the pool's
+// own image in the meantime, which is what they did before it asked. Holding
+// the pool would mean a repository could take its own runners away by
+// committing a file, and a queue of jobs with nothing to run them.
+//
+// Injected like ImageReady, so the fleet's rules can be tested without GitHub.
+type LayerFor func(ctx context.Context, pool model.Pool) (image string, note string)
+
 // Reconciler drives the fleet towards what the store asks for.
 type Reconciler struct {
 	store       Fleet
@@ -92,6 +116,7 @@ type Reconciler struct {
 	newClient   ClientFactory
 	writeSecret CredentialWriter
 	images      ImageReady
+	layer       LayerFor
 	log         *slog.Logger
 
 	// pass serialises whole reconcile passes. The daemon's loop is not the
@@ -145,8 +170,12 @@ func (r *Reconciler) lastBusy(pool string, runners []Runner, states map[string]g
 			busy = true
 			break
 		}
-		if _, known := states[runner.Name]; !known &&
-			runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
+		// Young enough that a job could still be on its way to it, whether or
+		// not GitHub has said it registered. Registering quickly is not
+		// evidence a job has arrived, and this timestamp belongs to the pool
+		// rather than the runner: it can predate the runner by any amount, so
+		// a runner judged on it alone is drained the moment it registers.
+		if runner.State == StateRunning && runner.Up > 0 && runner.Up < Registering {
 			busy = true
 			break
 		}
@@ -269,6 +298,15 @@ func (r *Reconciler) WithImages(ready ImageReady) *Reconciler {
 	return r
 }
 
+// WithLayers makes the fleet boot per-repository images where a pool asks for
+// them. Left unset, every pool boots its own image and nothing reads a
+// repository's file at all — which is what a fleet with no layer policy
+// anywhere should cost.
+func (r *Reconciler) WithLayers(layer LayerFor) *Reconciler {
+	r.layer = layer
+	return r
+}
+
 // New builds a reconciler.
 func New(store Fleet, executors []Executor, newClient ClientFactory, writeSecret CredentialWriter, log *slog.Logger) *Reconciler {
 	byRuntime := make(map[model.Runtime]Executor, len(executors))
@@ -294,8 +332,13 @@ func New(store Fleet, executors []Executor, newClient ClientFactory, writeSecret
 
 // Result is what one pass did.
 type Result struct {
-	Actions []Action         `json:"actions"`
-	Errors  []string         `json:"errors"`
+	Actions []Action `json:"actions"`
+	Errors  []string `json:"errors"`
+	// Notes are things the operator should know that are not failures: a
+	// repository waiting for its layer to be approved is the fleet working
+	// exactly as configured, and it still has to be visible somewhere or
+	// nobody ever approves it.
+	Notes   []string         `json:"notes"`
 	Scaling map[string]Scale `json:"scaling"`
 	// ScaledUp says a pool grew because everything in it was busy. The daemon
 	// uses it to come back sooner than the next tick: a burst of jobs should
@@ -415,7 +458,8 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			continue // its credential could not be read; already reported
 		}
 		mine := byPool[pool.Name]
-		scale := Autoscale(pool, mine, states, r.lastBusy(pool.Name, mine, states), r.now())
+		queued := r.queueDepth(ctx, pool, mine, states, secrets[pool.Name], &result)
+		scale := Autoscale(pool, mine, states, queued, r.lastBusy(pool.Name, mine, states), r.now())
 		scaling[pool.Name] = r.holdForImage(ctx, pool, scale)
 	}
 
@@ -424,6 +468,21 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 	// pool's answer at once — which is why it happens between sizing the pools
 	// and turning the sizes into runners, rather than inside either.
 	scaling = Ration(pools, scaling, budget)
+
+	// Which image each pool's runners boot. Resolved once per pass rather than
+	// per runner: it is a request to GitHub and a row read, and a pool of ten
+	// would otherwise make ten of each for one answer.
+	layers := map[string]string{}
+	for _, pool := range pools {
+		if r.layer == nil || !pool.LayersAllowed() || pool.Layers == model.LayersOff {
+			continue
+		}
+		image, note := r.layer(ctx, pool)
+		layers[pool.Name] = image
+		if note != "" {
+			result.Notes = append(result.Notes, fmt.Sprintf("%s: %s", pool.Name, note))
+		}
+	}
 
 	for _, pool := range pools {
 		fingerprint, ok := fingerprints[pool.Name]
@@ -435,7 +494,7 @@ func (r *Reconciler) Once(ctx context.Context) Result {
 			result.ScaledUp = true
 		}
 		desired = append(desired,
-			SpecsForCredential(pool, fingerprint, r.recipeFor(pool),
+			SpecsForCredential(pool, fingerprint, r.recipeFor(pool), layers[pool.Name],
 				DesiredNames(pool, byPool[pool.Name], states, scale.Target), secrets[pool.Name])...)
 	}
 	result.Scaling = scaling
@@ -632,14 +691,14 @@ func (r *Reconciler) apply(ctx context.Context, action Action, pools map[string]
 		}
 		spec := *action.Spec
 		// A runtime that shares everything with the job it runs must not be
-		// handed the credential, so the daemon does the minting and passes on
-		// a token that can do one thing and expires in an hour.
+		// handed the credential, so the daemon does the minting. An ephemeral
+		// pool gets a whole runner configuration, which is one runner taking
+		// one job; the rest get a registration token, which is the most GitHub
+		// will mint for a runner meant to outlive its job.
 		if spec.Runtime == model.RuntimeContainer {
-			minted, err := r.mintFor(ctx, spec, pools)
-			if err != nil {
+			if err := r.mintFor(ctx, &spec, pools); err != nil {
 				return err
 			}
-			spec.RegistrationToken = minted
 		}
 		if action.Op == OpCreate {
 			return executor.Create(ctx, spec)
@@ -662,24 +721,44 @@ func (r *Reconciler) apply(ctx context.Context, action Action, pools map[string]
 	}
 }
 
-// mintFor buys a registration token for one runner.
-func (r *Reconciler) mintFor(ctx context.Context, spec Spec, pools map[string]model.Pool) (string, error) {
+// mintFor buys one runner whatever it registers with.
+func (r *Reconciler) mintFor(ctx context.Context, spec *Spec, pools map[string]model.Pool) error {
 	if r.newClient == nil {
-		return "", nil
+		return nil
 	}
 	pool, ok := pools[spec.Pool]
 	if !ok {
-		return "", fmt.Errorf("pool %s is gone", spec.Pool)
+		return fmt.Errorf("pool %s is gone", spec.Pool)
 	}
 	secret, err := r.store.Secret(ctx, pool.CredentialID)
 	if err != nil {
-		return "", err
+		return err
 	}
 	client, err := r.newClient(secret)
 	if err != nil {
-		return "", err
+		return err
 	}
-	return client.RegistrationToken(ctx, github.ScopeOf(pool))
+	scope := github.ScopeOf(pool)
+
+	if spec.Ephemeral {
+		// No group: a pool does not have one to name, so every runner lands in
+		// the scope's default group, which is where they land today.
+		jit, err := client.JITConfig(ctx, scope, github.JIT{
+			Name: spec.Name, Labels: spec.Labels,
+		})
+		if err != nil {
+			return err
+		}
+		spec.JITConfig = jit
+		return nil
+	}
+
+	token, err := client.RegistrationToken(ctx, scope)
+	if err != nil {
+		return err
+	}
+	spec.RegistrationToken = token
+	return nil
 }
 
 func (r *Reconciler) deregister(ctx context.Context, action Action, pools map[string]model.Pool) {
@@ -725,6 +804,17 @@ func (r *Reconciler) listAll(ctx context.Context) ([]Runner, []string) {
 // recipeFor asks the executor that would build this pool's runners how it would
 // build them. A pool whose runtime has no executor on this host gets nothing,
 // which is right: there is no recipe, and there are no runners either.
+// layerFor is the per-repository image this pool's runners should boot, or
+// empty for the pool's own. The note is dropped here; the pass that builds the
+// specs keeps it.
+func (r *Reconciler) layerFor(pool model.Pool) string {
+	if r.layer == nil || !pool.LayersAllowed() || pool.Layers == model.LayersOff {
+		return ""
+	}
+	image, _ := r.layer(context.Background(), pool)
+	return image
+}
+
 func (r *Reconciler) recipeFor(pool model.Pool) string {
 	executor, ok := r.executors[pool.Runtime]
 	if !ok {
@@ -800,7 +890,7 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 		if err != nil {
 			continue
 		}
-		generations[pool.Name] = pool.Generation(fingerprint, r.recipeFor(pool))
+		generations[pool.Name] = pool.Generation(fingerprint, r.recipeFor(pool), r.layerFor(pool))
 
 		scope := github.ScopeOf(pool)
 		key := string(scope.Kind) + ":" + scope.Path
@@ -848,4 +938,33 @@ func (r *Reconciler) Status(ctx context.Context) ([]RunnerStatus, []string) {
 		})
 	}
 	return out, errs
+}
+
+// queueDepth is how many jobs are waiting that this pool could take, or
+// QueueUnknown when nobody needed to ask.
+//
+// An error is reported and answered as unknown, which leaves the pool at its
+// floor. For a sleeping pool that means staying asleep while jobs wait, so it
+// is not something to swallow: it goes in the pass's errors, where the UI
+// shows it against the pool.
+func (r *Reconciler) queueDepth(ctx context.Context, pool model.Pool, mine []Runner,
+	states map[string]github.State, secret model.Secret, result *Result) int {
+
+	if r.newClient == nil || !NeedsQueue(pool, mine, states) {
+		return QueueUnknown
+	}
+	client, err := r.newClient(secret)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("pool %s: %v", pool.Name, err))
+		return QueueUnknown
+	}
+	// The ceiling is the most it could start, so counting past it is requests
+	// spent on a number nothing reads.
+	depth, err := client.QueuedJobs(ctx, github.ScopeOf(pool), pool.EffectiveLabels(), pool.Ceiling())
+	if err != nil {
+		result.Errors = append(result.Errors,
+			fmt.Sprintf("pool %s: ask GitHub what is waiting for it: %v", pool.Name, err))
+		return QueueUnknown
+	}
+	return depth
 }

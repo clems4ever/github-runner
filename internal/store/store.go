@@ -177,6 +177,32 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX image_builds_pool ON image_builds(pool, id)`,
 	`CREATE INDEX image_builds_image ON image_builds(image, id)`,
+	`ALTER TABLE pools ADD COLUMN layers TEXT NOT NULL DEFAULT 'off'`,
+	// A pool that may go to zero. Off by default, which is the behaviour every
+	// existing pool already has: an upgrade changes nothing until somebody asks
+	// for it.
+	`ALTER TABLE pools ADD COLUMN sleeps INTEGER NOT NULL DEFAULT 0`,
+	// What a repository asked for, and what an operator said about it.
+	//
+	// Keyed by the digest as well as by the repository, so that the answer
+	// belongs to a definition rather than to a repository: editing the file
+	// asks again, and putting it back finds the old answer still there rather
+	// than asking a second time about something already decided.
+	`CREATE TABLE repo_layers (
+		id         INTEGER PRIMARY KEY AUTOINCREMENT,
+		pool       TEXT NOT NULL,
+		repo       TEXT NOT NULL,
+		digest     TEXT NOT NULL,
+		packages   TEXT NOT NULL DEFAULT '',
+		recipe     TEXT NOT NULL DEFAULT '',
+		image      TEXT NOT NULL DEFAULT '',
+		approval   TEXT NOT NULL,
+		decided_by TEXT NOT NULL DEFAULT '',
+		first_seen TEXT NOT NULL,
+		last_seen  TEXT NOT NULL,
+		decided_at TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE UNIQUE INDEX repo_layers_key ON repo_layers(pool, repo, digest)`,
 }
 
 // SampleRetention is how much history the daemon keeps. Two days covers "what
@@ -431,7 +457,7 @@ func (s *Store) DeleteCredential(ctx context.Context, id int64) error {
 // ---------------------------------------------------------------------------
 
 const poolColumns = `id, name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
-	labels, cpus, memory_mb, disk_gb, image, packages, recipe, credential_id, enabled, created_at, updated_at`
+	labels, cpus, memory_mb, disk_gb, image, packages, recipe, layers, sleeps, credential_id, enabled, created_at, updated_at`
 
 // execer is the part of the database both a connection and a transaction offer,
 // so the statements below can be run either way. Importing several pools has to
@@ -458,12 +484,12 @@ func insertPool(ctx context.Context, db execer, p model.Pool) (model.Pool, error
 	p.CreatedAt, p.UpdatedAt = now, now
 	res, err := db.ExecContext(ctx,
 		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
-			labels, cpus, memory_mb, disk_gb, image, packages, recipe, credential_id, enabled, created_at, updated_at, replicas)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			labels, cpus, memory_mb, disk_gb, image, packages, recipe, layers, sleeps, credential_id, enabled, created_at, updated_at, replicas)
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral,
 		p.MinReplicas, p.MaxReplicas,
 		strings.Join(p.Labels, ","), p.CPUs, p.MemoryMB, p.DiskGB, p.Image,
-		strings.Join(p.Packages, ","), p.Recipe, p.CredentialID, p.Enabled,
+		strings.Join(p.Packages, ","), p.Recipe, string(p.Layers), p.Sleeps, p.CredentialID, p.Enabled,
 		p.CreatedAt.Format(time.RFC3339Nano), p.UpdatedAt.Format(time.RFC3339Nano),
 		// The old column is not dropped: SQLite makes that awkward, and a
 		// database that can still be read by the previous release is worth more
@@ -499,13 +525,13 @@ func updatePool(ctx context.Context, db execer, p model.Pool) error {
 	res, err := db.ExecContext(ctx,
 		`UPDATE pools SET name=?, scope_kind=?, scope=?, runtime=?, nested=?, ephemeral=?,
 			min_replicas=?, max_replicas=?, replicas=?,
-			labels=?, cpus=?, memory_mb=?, disk_gb=?, image=?, packages=?, recipe=?,
+			labels=?, cpus=?, memory_mb=?, disk_gb=?, image=?, packages=?, recipe=?, layers=?, sleeps=?,
 			credential_id=?, enabled=?, updated_at=?
 		 WHERE id = ?`,
 		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral,
 		p.MinReplicas, p.MaxReplicas, p.MaxReplicas,
 		strings.Join(p.Labels, ","), p.CPUs, p.MemoryMB, p.DiskGB, p.Image,
-		strings.Join(p.Packages, ","), p.Recipe, p.CredentialID, p.Enabled,
+		strings.Join(p.Packages, ","), p.Recipe, string(p.Layers), p.Sleeps, p.CredentialID, p.Enabled,
 		p.UpdatedAt.Format(time.RFC3339Nano), p.ID)
 	if err != nil {
 		if isUnique(err) {
@@ -523,6 +549,13 @@ func updatePool(ctx context.Context, db execer, p model.Pool) error {
 // notices they are no longer wanted and drains them, which is what keeps a
 // delete from failing a job that is in flight.
 func (s *Store) DeletePool(ctx context.Context, id int64) error {
+	// Read the name before deleting the row: the layers a repository asked
+	// this pool for are keyed by that name, and a pool later given the same
+	// name would inherit approvals nobody made for it.
+	pool, err := poolByID(ctx, s.db, id)
+	if err != nil {
+		return err
+	}
 	res, err := s.db.ExecContext(ctx, `DELETE FROM pools WHERE id = ?`, id)
 	if err != nil {
 		return err
@@ -530,7 +563,7 @@ func (s *Store) DeletePool(ctx context.Context, id int64) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("pool %d: %w", id, ErrNotFound)
 	}
-	return nil
+	return s.ForgetRepoLayers(ctx, pool.Name)
 }
 
 // Pool returns one pool.
@@ -673,16 +706,18 @@ func scanPool(row scanner) (model.Pool, error) {
 		p                  model.Pool
 		scopeKind, runtime string
 		labels, packages   string
+		layers             string
 		created, updated   string
 	)
 	err := row.Scan(&p.ID, &p.Name, &scopeKind, &p.Scope, &runtime, &p.Nested, &p.Ephemeral,
 		&p.MinReplicas, &p.MaxReplicas, &labels, &p.CPUs, &p.MemoryMB, &p.DiskGB, &p.Image,
-		&packages, &p.Recipe, &p.CredentialID, &p.Enabled, &created, &updated)
+		&packages, &p.Recipe, &layers, &p.Sleeps, &p.CredentialID, &p.Enabled, &created, &updated)
 	if err != nil {
 		return model.Pool{}, err
 	}
 	p.ScopeKind = model.ScopeKind(scopeKind)
 	p.Runtime = model.Runtime(runtime)
+	p.Layers = model.LayerPolicy(layers)
 	if labels != "" {
 		p.Labels = strings.Split(labels, ",")
 	} else {

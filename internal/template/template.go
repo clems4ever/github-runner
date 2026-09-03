@@ -55,11 +55,17 @@ type Pool struct {
 	Ephemeral   *bool           `json:"ephemeral,omitempty"`
 	MinReplicas int             `json:"minReplicas,omitempty"`
 	MaxReplicas int             `json:"maxReplicas,omitempty"`
-	Labels      []string        `json:"labels,omitempty"`
-	CPUs        int             `json:"cpus,omitempty"`
-	MemoryMB    int             `json:"memoryMb,omitempty"`
-	DiskGB      int             `json:"diskGb,omitempty"`
-	Image       string          `json:"image,omitempty"`
+	// Sleeps travels, unlike layers below: a pool that goes to zero when its
+	// repository is quiet is a shape somebody chose for the pool, not a trust
+	// decision about a host. A plain bool because false is both the zero value
+	// and the default, so a template that says nothing means a pool that stays
+	// up — which is what every template written before this existed meant.
+	Sleeps   bool     `json:"sleeps,omitempty"`
+	Labels   []string `json:"labels,omitempty"`
+	CPUs     int      `json:"cpus,omitempty"`
+	MemoryMB int      `json:"memoryMb,omitempty"`
+	DiskGB   int      `json:"diskGb,omitempty"`
+	Image    string   `json:"image,omitempty"`
 	// What a machine pool bakes into its image. A template is the portable
 	// form of a pool, and a pool whose runners have the toolchain baked in is
 	// not portable without them.
@@ -86,6 +92,11 @@ var local = map[string]string{
 	"credentialId": "a credential belongs to the host it was sealed on — the import asks which one to use",
 	"createdAt":    "timestamps are recorded by the daemon",
 	"updatedAt":    "timestamps are recorded by the daemon",
+	// Deliberately not portable. Letting a repository add to a pool's image is
+	// a decision about *that* repository on *this* host — a template that
+	// carried "trust" would install an approval nobody made, on a scope the
+	// importer may be overriding anyway. It is one control in the pool editor.
+	"layers": "whether a repository may add to a pool's image is decided on the host, per pool",
 }
 
 // Parse reads a document and rejects anything that is not one.
@@ -174,6 +185,7 @@ func Apply(doc Document, opts Options) ([]model.Pool, error) {
 			Ephemeral:    value(entry.Ephemeral, true),
 			MinReplicas:  entry.MinReplicas,
 			MaxReplicas:  entry.MaxReplicas,
+			Sleeps:       entry.Sleeps,
 			Labels:       entry.Labels,
 			CPUs:         entry.CPUs,
 			MemoryMB:     entry.MemoryMB,
@@ -220,6 +232,7 @@ func Export(pools []model.Pool) Document {
 			Ephemeral:   &ephemeral,
 			MinReplicas: pool.MinReplicas,
 			MaxReplicas: pool.MaxReplicas,
+			Sleeps:      pool.Sleeps,
 			Labels:      pool.Labels,
 			CPUs:        pool.CPUs,
 			MemoryMB:    pool.MemoryMB,

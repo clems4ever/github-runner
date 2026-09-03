@@ -126,8 +126,10 @@ type Builder struct {
 	log       *slog.Logger
 	now       func() time.Time
 	// build is the build itself, replaced in tests by something that does not
-	// need QEMU, a network, or forty minutes.
-	build func(ctx context.Context, o agent.BuildOptions) (string, error)
+	// need QEMU, a network, or forty minutes. buildLayer is the same for a
+	// repository's layer.
+	build      func(ctx context.Context, o agent.BuildOptions) (string, error)
+	buildLayer func(ctx context.Context, o agent.LayerOptions) (string, error)
 
 	mu sync.Mutex
 	// latest is the most recent attempt at each image, which is what says
@@ -148,6 +150,12 @@ type Builder struct {
 type queued struct {
 	id   int64
 	spec agent.ImageSpec
+	// layer is set when this is a repository's layer rather than a pool's own
+	// image. It goes through the same queue for the same reasons the queue
+	// exists: one QEMU building at a time on a host that is also running jobs,
+	// one console log per attempt, and one history somebody can read.
+	layer *agent.LayerSpec
+	repo  string
 }
 
 // Options are what a builder needs.
@@ -172,15 +180,16 @@ func New(o Options) *Builder {
 		log = slog.Default()
 	}
 	return &Builder{
-		imagesDir: o.ImagesDir,
-		sshKey:    o.SSHKey,
-		store:     o.Store,
-		owner:     o.Owner,
-		log:       log,
-		now:       time.Now,
-		build:     agent.BuildImage,
-		latest:    map[string]model.ImageBuild{},
-		wake:      make(chan struct{}, 1),
+		imagesDir:  o.ImagesDir,
+		sshKey:     o.SSHKey,
+		store:      o.Store,
+		owner:      o.Owner,
+		log:        log,
+		now:        time.Now,
+		build:      agent.BuildImage,
+		buildLayer: agent.BuildLayer,
+		latest:     map[string]model.ImageBuild{},
+		wake:       make(chan struct{}, 1),
 	}
 }
 
@@ -478,20 +487,31 @@ func (b *Builder) attempt(ctx context.Context, next queued) {
 	}
 	b.give(b.sshKey, b.sshKey+".pub", filepath.Dir(b.sshKey))
 
-	b.log.Info("building a golden image; this takes a few minutes and happens once per host",
-		"pool", build.Pool, "image", build.Image)
+	if next.layer != nil {
+		b.log.Info("building a repository's layer on its pool's image",
+			"pool", build.Pool, "repo", next.repo, "image", build.Image)
+	} else {
+		b.log.Info("building a golden image; this takes a few minutes and happens once per host",
+			"pool", build.Pool, "image", build.Image)
+	}
 
-	image, err := b.build(ctx, agent.BuildOptions{
-		Spec:      next.spec,
-		ImagesDir: b.imagesDir,
-		PublicKey: publicKey,
-		Journal:   journal,
-		Phase: func(phase agent.BuildPhase) {
-			build.Phase = model.ImagePhase(phase)
-			b.record(ctx, build)
-		},
-		Log: b.log,
-	})
+	watch := func(phase agent.BuildPhase) {
+		build.Phase = model.ImagePhase(phase)
+		b.record(ctx, build)
+	}
+
+	var image string
+	if next.layer != nil {
+		image, err = b.buildLayer(ctx, agent.LayerOptions{
+			Spec: *next.layer, ImagesDir: b.imagesDir, PublicKey: publicKey,
+			Repo: next.repo, Journal: journal, Phase: watch, Log: b.log,
+		})
+	} else {
+		image, err = b.build(ctx, agent.BuildOptions{
+			Spec: next.spec, ImagesDir: b.imagesDir, PublicKey: publicKey,
+			Journal: journal, Phase: watch, Log: b.log,
+		})
+	}
 	if err == nil {
 		// The daemon is root and the runners are not. An image nobody can read
 		// is an image nobody can boot, and the machine would fail on a

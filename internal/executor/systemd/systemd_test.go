@@ -474,6 +474,33 @@ func TestTheEnvironmentFileCarriesTheAppDetails(t *testing.T) {
 	}
 }
 
+// The layer is the last link in the chain: the daemon decides a repository may
+// have one and builds it, and this is the only thing that tells the machine to
+// boot it. Without it the runner comes up on the pool's own image and the job
+// fails on a tool the repository was told it had.
+func TestTheEnvironmentFileCarriesTheLayer(t *testing.T) {
+	_, _, layout := newExecutor(t)
+
+	spec := testSpec("web-1")
+	spec.Layer = "runner-noble-web-aaaaaaaaaaaa.qcow2"
+
+	env := RenderEnv(spec, layout)
+	if !strings.Contains(env, "FLEET_LAYER=runner-noble-web-aaaaaaaaaaaa.qcow2") {
+		t.Fatalf("the layer never reached the machine:\n%s", env)
+	}
+}
+
+// An empty layer is a pool that has none, and writing it would name a file the
+// agent then refused to find — so a pool with layers switched off would never
+// start a machine at all.
+func TestAPoolWithNoLayerSaysNothingAboutOne(t *testing.T) {
+	_, _, layout := newExecutor(t)
+
+	if env := RenderEnv(testSpec("web-1"), layout); strings.Contains(env, "FLEET_LAYER") {
+		t.Fatalf("wrote a layer for a pool that has none:\n%s", env)
+	}
+}
+
 // An installation of zero means "work it out", and writing it would tell the
 // agent to use installation zero.
 func TestAnUnknownInstallationIsLeftOut(t *testing.T) {

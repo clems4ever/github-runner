@@ -191,7 +191,15 @@ type fakeGitHub struct {
 	deregistered []string
 	scopeCalls   int
 	minted       int
+	mintedJIT    int
+	jitWanted    []github.JIT
 	err          error
+	// queued is what the repository has waiting, and queueCalls how often the
+	// fleet went and asked — a request per pass on every pool would be the
+	// cost this feature is not allowed to have.
+	queued     int
+	queueCalls int
+	queueErr   error
 }
 
 func (f *fakeGitHub) States(ctx context.Context, scope github.Scope) (map[string]github.State, error) {
@@ -202,6 +210,14 @@ func (f *fakeGitHub) States(ctx context.Context, scope github.Scope) (map[string
 	return f.states, nil
 }
 
+func (f *fakeGitHub) QueuedJobs(context.Context, github.Scope, []string, int) (int, error) {
+	f.queueCalls++
+	if f.queueErr != nil {
+		return 0, f.queueErr
+	}
+	return f.queued, nil
+}
+
 func (f *fakeGitHub) Deregister(ctx context.Context, scope github.Scope, name string) error {
 	f.deregistered = append(f.deregistered, name)
 	return nil
@@ -210,6 +226,12 @@ func (f *fakeGitHub) Deregister(ctx context.Context, scope github.Scope, name st
 func (f *fakeGitHub) RegistrationToken(ctx context.Context, scope github.Scope) (string, error) {
 	f.minted++
 	return fmt.Sprintf("AAAA-registration-%d", f.minted), nil
+}
+
+func (f *fakeGitHub) JITConfig(_ context.Context, _ github.Scope, want github.JIT) (string, error) {
+	f.mintedJIT++
+	f.jitWanted = append(f.jitWanted, want)
+	return fmt.Sprintf("AAAA-jitconfig-%s-%d", want.Name, f.mintedJIT), nil
 }
 
 // testPool is a fixed-size pool: minimum equal to maximum, so these tests are
@@ -371,7 +393,7 @@ func TestReconfiguringAPoolReplacesRunnersGracefully(t *testing.T) {
 
 	// And the rebuilt runners carry the new configuration.
 	for _, r := range h.vm.runners {
-		if r.Generation != pool.Generation("fp", "image") {
+		if r.Generation != pool.Generation("fp", "image", "") {
 			t.Fatalf("%s came back on the old generation", r.Name)
 		}
 	}

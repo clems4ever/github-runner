@@ -40,8 +40,15 @@ type Config struct {
 	// Packages and Recipe are what this runner's pool bakes into its image on
 	// top of the base one. The agent builds the image, so it is the agent that
 	// has to know them.
-	Packages       []string
-	Recipe         string
+	Packages []string
+	Recipe   string
+	// Layer is the file name of a per-repository image this runner boots
+	// instead of its pool's own, chosen by the daemon. The layer is an overlay
+	// on that same image, so booting it is booting the pool's image plus what
+	// the repository asked for; it is a name and not a specification because
+	// deciding whether a repository may have one is the daemon's job and not a
+	// judgement to re-make out here, holding a credential, next to the job.
+	Layer          string
 	CredentialFile string
 	StateDir       string
 	// How to authenticate. A GitHub App's agent signs its own assertion with
@@ -53,6 +60,9 @@ type Config struct {
 	// minted is a registration token the daemon produced for this runner,
 	// which a container gets instead of a credential of its own.
 	minted string
+	// mintedJIT is a whole runner configuration the daemon produced for this
+	// runner, which is what an ephemeral container gets instead.
+	mintedJIT string
 }
 
 // ConfigFromEnv reads the runner's configuration out of its environment.
@@ -72,6 +82,7 @@ func ConfigFromEnv(name string) (Config, error) {
 		MemoryMB:       intEnv("FLEET_MEMORY_MB", 4096),
 		DiskGB:         intEnv("FLEET_DISK_GB", 40),
 		Image:          first(os.Getenv("FLEET_IMAGE"), "default"),
+		Layer:          os.Getenv("FLEET_LAYER"),
 		CredentialFile: os.Getenv("FLEET_CREDENTIAL_FILE"),
 		StateDir:       first(os.Getenv("FLEET_STATE_DIR"), "/var/lib/runner-fleet"),
 		CredentialKind: model.CredentialKind(first(os.Getenv("FLEET_CREDENTIAL_KIND"), string(model.CredentialPAT))),
@@ -103,6 +114,10 @@ func ConfigFromEnv(name string) (Config, error) {
 	if c.minted != "" {
 		_ = os.Unsetenv("FLEET_REGISTRATION_TOKEN")
 	}
+	c.mintedJIT = os.Getenv("FLEET_JIT_CONFIG")
+	if c.mintedJIT != "" {
+		_ = os.Unsetenv("FLEET_JIT_CONFIG")
+	}
 
 	if c.Runner == "" {
 		return c, fmt.Errorf("no runner name: pass --name, or set FLEET_RUNNER")
@@ -115,9 +130,9 @@ func ConfigFromEnv(name string) (Config, error) {
 	// with the daemon still down. A container is handed a token the daemon
 	// minted, because a container shares everything with the job it runs and
 	// must not be given a credential that administers repositories.
-	if c.CredentialFile == "" && c.minted == "" {
+	if c.CredentialFile == "" && c.minted == "" && c.mintedJIT == "" {
 		return c, fmt.Errorf("%s: nothing to register with. A runner needs either a credential that can "+
-			"mint registration tokens, or a token minted for it", c.Runner)
+			"mint registration tokens, or a configuration minted for it", c.Runner)
 	}
 	if c.CredentialKind == model.CredentialApp && c.AppID == 0 {
 		return c, fmt.Errorf("%s: an app credential without an app id", c.Runner)
@@ -136,6 +151,18 @@ func ConfigFromEnv(name string) (Config, error) {
 // credential and mints for itself, which is what lets it come back after a
 // reboot with the daemon still down.
 func (c Config) RegistrationToken() string { return c.minted }
+
+// MintedJIT is a whole runner configuration the daemon produced for this
+// runner.
+//
+// This is how an ephemeral container registers, and it is strictly better than
+// the token above: a registration token can register any runner on the
+// repository, where this is one runner, taking one job, and worthless
+// afterwards. It is minted by the daemon rather than here for the same reason
+// the token is — a container shares everything with the job it runs — and it
+// is not reusable, which is why the container executor rebuilds a container
+// rather than restarting one.
+func (c Config) MintedJIT() string { return c.mintedJIT }
 
 // Token reads the credential the daemon left for this runner.
 //

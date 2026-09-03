@@ -452,3 +452,95 @@ func TestImportingARecipeOntoAContainerPoolIsRefused(t *testing.T) {
 		t.Fatal("a container pool was imported with a recipe it cannot run")
 	}
 }
+
+// A template is portable and a layer policy is not: it says that a particular
+// repository may run a script as root on this host. Carried in a document,
+// importing somebody else's template would install an approval nobody on this
+// host made — so it is refused, by name, rather than ignored.
+func TestATemplateDoesNotCarryALayerPolicy(t *testing.T) {
+	_, err := Parse([]byte(`{"version":1,"pools":[{"name":"web","layers":"trust"}]}`))
+	if err == nil {
+		t.Fatal("a layer policy was imported from a template")
+	}
+	if !strings.Contains(err.Error(), "decided on the host") {
+		t.Fatalf("got %v, want it to say where that decision belongs", err)
+	}
+}
+
+// The mirror: exporting a pool that has one must not put it in the document,
+// or the fleet's own export would not import back into it.
+func TestExportLeavesTheLayerPolicyBehind(t *testing.T) {
+	doc := Export([]model.Pool{{
+		Name: "web", ScopeKind: model.ScopeRepository, Scope: "o/r",
+		Runtime: model.RuntimeVM, Layers: model.LayersTrust,
+	}})
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "layers") {
+		t.Fatalf("the export carries a layer policy:\n%s", raw)
+	}
+	if _, err := Parse(raw); err != nil {
+		t.Fatalf("this daemon's own export does not import back into it: %v", err)
+	}
+}
+
+// A pool that goes to zero is a shape, not a host-local trust decision, so it
+// travels — and it has to arrive still at zero. Importing it as a pool held at
+// one machine would be the fleet quietly undoing the thing the template was
+// written for.
+func TestATemplateCarriesAPoolThatSleeps(t *testing.T) {
+	doc, err := Parse([]byte(
+		`{"version":1,"pools":[{"name":"web","scope":"o/r","runtime":"vm","sleeps":true,"maxReplicas":3}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pools, err := Apply(doc, Options{CredentialID: 1})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !pools[0].Sleeps {
+		t.Fatal("imported awake")
+	}
+	if pools[0].MinReplicas != 0 {
+		t.Fatalf("imported with a floor of %d, want nothing held up", pools[0].MinReplicas)
+	}
+}
+
+// The round trip, which is the one that catches a field added to the model and
+// forgotten here: the fleet's own export has to import back into it unchanged.
+func TestExportKeepsAPoolAsleep(t *testing.T) {
+	doc := Export([]model.Pool{{
+		Name: "web", ScopeKind: model.ScopeRepository, Scope: "o/r",
+		Runtime: model.RuntimeVM, Sleeps: true, MinReplicas: 0, MaxReplicas: 3,
+	}})
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("this daemon's own export does not import back into it: %v", err)
+	}
+	if !back.Pools[0].Sleeps {
+		t.Fatalf("the export lost it:\n%s", raw)
+	}
+}
+
+// An organisation's queue cannot be read, so nothing would ever wake this pool.
+// A template written for a repository and imported with an organisation
+// override is the ordinary way to arrive here, and it is refused with the
+// reason rather than imported as a pool that never comes back.
+func TestImportingASleepingPoolOntoAnOrganisationIsRefused(t *testing.T) {
+	doc := Document{Version: Version, Pools: []Pool{{
+		Name: "web", Runtime: model.RuntimeVM, Sleeps: true, MaxReplicas: 3,
+	}}}
+	_, err := Apply(doc, Options{CredentialID: 1, Scope: "acme", ScopeKind: model.ScopeOrganization})
+	if err == nil {
+		t.Fatal("imported a pool nothing could wake")
+	}
+	if !strings.Contains(err.Error(), "per repository") {
+		t.Fatalf("got %v, want it to say why an organisation cannot", err)
+	}
+}

@@ -38,6 +38,8 @@ function pool(over: Partial<Pool>): Pool {
     image: 'default',
     packages: [],
     recipe: '',
+    layers: 'off',
+    sleeps: false,
     credentialId: 3,
     enabled: true,
     createdAt: '',

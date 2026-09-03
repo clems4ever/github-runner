@@ -94,7 +94,8 @@ func TestBounds(t *testing.T) {
 
 // A pool must never be allowed to reach zero while it is enabled: with no
 // runner there is nothing to accept a job, and so nothing to reveal that the
-// pool needs to grow.
+// pool needs to grow. Unless it sleeps, which is the arrangement where it
+// finds out by asking instead — see sleep_test.go.
 func TestFloorIsNeverZeroWhileEnabled(t *testing.T) {
 	p := validPool()
 	p.MinReplicas = 0
@@ -166,7 +167,7 @@ func TestEffectiveLabelsDeduplicate(t *testing.T) {
 
 func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 	base := validPool()
-	baseGen := base.Generation("fp", "image")
+	baseGen := base.Generation("fp", "image", "")
 
 	tests := []struct {
 		name   string
@@ -186,14 +187,14 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p := validPool()
 			tt.mutate(&p)
-			if p.Generation("fp", "image") == baseGen {
+			if p.Generation("fp", "image", "") == baseGen {
 				t.Fatalf("changing %s left the generation alone, so runners would keep the old configuration", tt.name)
 			}
 		})
 	}
 
 	t.Run("credential", func(t *testing.T) {
-		if base.Generation("other-fingerprint", "image") == baseGen {
+		if base.Generation("other-fingerprint", "image", "") == baseGen {
 			t.Fatal("replacing the credential left the generation alone")
 		}
 	})
@@ -203,7 +204,7 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 	t.Run("the scaling bounds do not", func(t *testing.T) {
 		p := validPool()
 		p.MinReplicas, p.MaxReplicas = 2, 10
-		if p.Generation("fp", "image") != baseGen {
+		if p.Generation("fp", "image", "") != baseGen {
 			t.Fatal("changing the scaling bounds changed the generation, which would replace every healthy runner")
 		}
 	})
@@ -214,7 +215,7 @@ func TestGenerationChangesWithTheConfiguration(t *testing.T) {
 // the pool is identical before and after — so the revision is part of it.
 func TestGenerationCoversHowRunnersAreBuilt(t *testing.T) {
 	p := validPool()
-	generation := p.Generation("fp", "image")
+	generation := p.Generation("fp", "image", "")
 
 	// What the hash would be if the revision had not moved: if these are ever
 	// equal, an upgrade that fixes the recipe leaves every runner on the old
@@ -248,11 +249,11 @@ func poolGenerationAtRevision(p Pool, fingerprint string, revision int) string {
 
 func TestGenerationIsStable(t *testing.T) {
 	p := validPool()
-	if p.Generation("fp", "image") != p.Generation("fp", "image") {
+	if p.Generation("fp", "image", "") != p.Generation("fp", "image", "") {
 		t.Fatal("the same pool hashed differently twice")
 	}
-	if len(p.Generation("fp", "image")) != 12 {
-		t.Fatalf("want a short readable hash, got %q", p.Generation("fp", "image"))
+	if len(p.Generation("fp", "image", "")) != 12 {
+		t.Fatalf("want a short readable hash, got %q", p.Generation("fp", "image", ""))
 	}
 }
 

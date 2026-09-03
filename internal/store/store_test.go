@@ -304,6 +304,46 @@ func TestUpdatePool(t *testing.T) {
 	}
 }
 
+// A pool that may go to zero has two things to keep: the setting, and the floor
+// of zero that goes with it. Either one lost in the database is a pool that
+// quietly starts a machine again on the next pass, and the operator would read
+// it as the daemon ignoring them.
+func TestAPoolThatSleepsIsStillAsleepAfterAReload(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	cred := credential(t, s)
+
+	p := samplePool(cred.ID)
+	p.Sleeps = true
+	p.MinReplicas, p.MaxReplicas = 0, 3
+
+	created, err := s.CreatePool(ctx, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := s.Pool(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.Sleeps {
+		t.Fatal("came back awake")
+	}
+	if reloaded.MinReplicas != 0 {
+		t.Fatalf("came back with a floor of %d, want nothing held up", reloaded.MinReplicas)
+	}
+
+	// And back again: turning it off has to restore the one machine every other
+	// pool is held at, not leave a pool at zero with nothing to wake it.
+	reloaded.Sleeps = false
+	off, err := s.UpdatePool(ctx, reloaded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Sleeps || off.MinReplicas != 1 {
+		t.Fatalf("after turning it off: sleeps=%v min=%d", off.Sleeps, off.MinReplicas)
+	}
+}
+
 func TestUpdateUnknownPool(t *testing.T) {
 	s := newStore(t)
 	cred := credential(t, s)

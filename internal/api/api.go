@@ -46,6 +46,9 @@ type Store interface {
 	CreateCredential(ctx context.Context, credential model.Credential, secret string) (model.Credential, error)
 	ReplaceCredentialSecret(ctx context.Context, id int64, secret string) error
 	DeleteCredential(ctx context.Context, id int64) error
+	ListRepoLayers(ctx context.Context, pool string) ([]model.RepoLayer, error)
+	RepoLayerByID(ctx context.Context, id int64) (model.RepoLayer, error)
+	DecideRepoLayer(ctx context.Context, id int64, approval model.LayerApproval, by string) (model.RepoLayer, error)
 }
 
 // Fleet is what the API needs from the reconciler.
@@ -77,12 +80,23 @@ type Images interface {
 	Rebuild(ctx context.Context, pool model.Pool) (imagebuild.Build, error)
 }
 
+// Layers is what the API needs from the layer resolver.
+//
+// One method, and it is a cache invalidation: the resolver reads a repository's
+// definition a few times an hour rather than on every pass, and a decision made
+// in the UI has to take effect now rather than whenever that interval next
+// comes round.
+type Layers interface {
+	Forget(pool string)
+}
+
 // Server is the HTTP surface.
 type Server struct {
 	store     Store
 	fleet     Fleet
 	resources Resources
 	images    Images
+	layers    Layers
 	auth      *Authenticator
 	ui        fs.FS
 	version   string
@@ -107,7 +121,11 @@ type Options struct {
 	// Images may be nil, which is a daemon that builds nothing: every pool
 	// reports that there is no image of its own to build, which is what a
 	// container-only fleet is.
-	Images      Images
+	Images Images
+	// Layers may be nil, which is a daemon that reads no repository
+	// definitions: the endpoints still serve what the database remembers, and
+	// a decision simply takes effect at the next pass.
+	Layers      Layers
 	UI          fs.FS
 	Version     string
 	Nudge       func()
@@ -121,6 +139,7 @@ func New(opts Options) *Server {
 		fleet:     opts.Fleet,
 		resources: opts.Resources,
 		images:    opts.Images,
+		layers:    opts.Layers,
 		auth:      NewAuthenticator(opts.Store),
 		ui:        opts.UI,
 		version:   opts.Version,
@@ -154,6 +173,8 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("GET /api/pools/{id}/image", s.poolImage)
 	api.HandleFunc("POST /api/pools/{id}/image/builds", s.buildPoolImage)
 	api.HandleFunc("GET /api/image-builds/{id}/log", s.imageBuildLog)
+	api.HandleFunc("GET /api/layers", s.listLayers)
+	api.HandleFunc("POST /api/layers/{id}/decision", s.decideLayer)
 	api.HandleFunc("GET /api/resources", s.resourceReport)
 	api.HandleFunc("GET /api/resources/history", s.resourceHistory)
 	api.HandleFunc("GET /api/credentials", s.listCredentials)

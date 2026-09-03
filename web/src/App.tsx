@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActionIcon,
   AppShell,
@@ -11,9 +11,9 @@ import {
   Title,
   Tooltip,
   useMantineColorScheme,
-} from '@mantine/core'
-import { useDisclosure } from '@mantine/hooks'
-import { notifications } from '@mantine/notifications'
+} from "@mantine/core";
+import { useDisclosure } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import {
   IconChartBar,
   IconGauge,
@@ -22,9 +22,10 @@ import {
   IconServer2,
   IconSettings,
   IconStack2,
+  IconStack3,
   IconSun,
   IconKey,
-} from '@tabler/icons-react'
+} from "@tabler/icons-react";
 import {
   api,
   type Credential,
@@ -34,97 +35,129 @@ import {
   type ResourceReport,
   type Runner,
   type Scale,
-} from './api'
-import { useCrampedHeader } from './responsive'
-import { Logo } from './Logo'
-import { FleetPage } from './pages/FleetPage'
-import { PoolsPage } from './pages/PoolsPage'
-import { CredentialsPage } from './pages/CredentialsPage'
-import { JobsPage } from './pages/JobsPage'
-import { ResourcesPage } from './pages/ResourcesPage'
-import { SettingsPage } from './pages/SettingsPage'
+} from "./api";
+import { useCrampedHeader } from "./responsive";
+import { Logo } from "./Logo";
+import { FleetPage } from "./pages/FleetPage";
+import { PoolsPage } from "./pages/PoolsPage";
+import { LayersPage } from "./pages/LayersPage";
+import { CredentialsPage } from "./pages/CredentialsPage";
+import { JobsPage } from "./pages/JobsPage";
+import { ResourcesPage } from "./pages/ResourcesPage";
+import { SettingsPage } from "./pages/SettingsPage";
 
-type Page = 'fleet' | 'pools' | 'jobs' | 'resources' | 'credentials' | 'settings'
+type Page =
+  | "fleet"
+  | "pools"
+  | "layers"
+  | "jobs"
+  | "resources"
+  | "credentials"
+  | "settings";
 
 const pages: { key: Page; label: string; icon: typeof IconServer2 }[] = [
-  { key: 'fleet', label: 'Fleet', icon: IconServer2 },
-  { key: 'pools', label: 'Pools', icon: IconStack2 },
+  { key: "fleet", label: "Fleet", icon: IconServer2 },
+  { key: "pools", label: "Pools", icon: IconStack2 },
+  // Under the pools, because a layer is a pool's image with a repository's own
+  // additions on it, and the decision to allow one is made on the pool.
+  { key: "layers", label: "Layers", icon: IconStack3 },
   // Next to the pools it is read against: what a pool has run is an argument
   // about how big that pool should be, not about the host.
-  { key: 'jobs', label: 'Jobs', icon: IconChartBar },
-  { key: 'resources', label: 'Resources', icon: IconGauge },
-  { key: 'credentials', label: 'Credentials', icon: IconKey },
-  { key: 'settings', label: 'Settings', icon: IconSettings },
-]
+  { key: "jobs", label: "Jobs", icon: IconChartBar },
+  { key: "resources", label: "Resources", icon: IconGauge },
+  { key: "credentials", label: "Credentials", icon: IconKey },
+  { key: "settings", label: "Settings", icon: IconSettings },
+];
 
 export function App() {
-  const crampedHeader = useCrampedHeader()
-  const [opened, { toggle }] = useDisclosure()
-  const [page, setPage] = useState<Page>('fleet')
-  const [pools, setPools] = useState<Pool[]>([])
-  const [runners, setRunners] = useState<Runner[]>([])
-  const [warnings, setWarnings] = useState<string[]>([])
-  const [scaling, setScaling] = useState<Record<string, Scale>>({})
-  const [credentials, setCredentials] = useState<Credential[]>([])
-  const [health, setHealth] = useState<Health | null>(null)
-  const [resources, setResources] = useState<ResourceReport | null>(null)
+  const crampedHeader = useCrampedHeader();
+  const [opened, { toggle }] = useDisclosure();
+  const [page, setPage] = useState<Page>("fleet");
+  const [pools, setPools] = useState<Pool[]>([]);
+  const [runners, setRunners] = useState<Runner[]>([]);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [scaling, setScaling] = useState<Record<string, Scale>>({});
+  const [credentials, setCredentials] = useState<Credential[]>([]);
+  const [health, setHealth] = useState<Health | null>(null);
+  const [resources, setResources] = useState<ResourceReport | null>(null);
   // Where each pool's image stands, by pool. A machine pool has no runners
   // until its image is built, so this belongs to the pools table rather than
   // to a banner over the fleet.
-  const [images, setImages] = useState<Record<string, PoolImage>>({})
-  const [loading, setLoading] = useState(true)
+  const [images, setImages] = useState<Record<string, PoolImage>>({});
+  const [loading, setLoading] = useState(true);
 
   const refresh = useCallback(async () => {
     try {
-      const [poolList, runnerList, credentialList, healthInfo, resourceReport, poolImages] =
-        await Promise.all([
-          api.pools(),
-          api.runners(),
-          api.credentials(),
-          api.health(),
-          api.resources(),
-          api.poolImages(),
-        ])
-      setPools(poolList)
-      setRunners(runnerList.runners ?? [])
-      setWarnings(runnerList.warnings ?? [])
-      setScaling(runnerList.scaling ?? {})
-      setCredentials(credentialList)
-      setHealth(healthInfo)
-      setResources(resourceReport)
-      setImages(Object.fromEntries(poolImages.map((image) => [image.pool, image])))
+      const [
+        poolList,
+        runnerList,
+        credentialList,
+        healthInfo,
+        resourceReport,
+        poolImages,
+      ] = await Promise.all([
+        api.pools(),
+        api.runners(),
+        api.credentials(),
+        api.health(),
+        api.resources(),
+        api.poolImages(),
+      ]);
+      setPools(poolList);
+      setRunners(runnerList.runners ?? []);
+      setWarnings(runnerList.warnings ?? []);
+      setScaling(runnerList.scaling ?? {});
+      setCredentials(credentialList);
+      setHealth(healthInfo);
+      setResources(resourceReport);
+      setImages(
+        Object.fromEntries(poolImages.map((image) => [image.pool, image])),
+      );
     } catch (error) {
       notifications.show({
-        color: 'red',
-        title: 'Cannot reach the daemon',
+        color: "red",
+        title: "Cannot reach the daemon",
         message: error instanceof Error ? error.message : String(error),
-      })
+      });
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }, [])
+  }, []);
 
   useEffect(() => {
-    void refresh()
+    void refresh();
     // The fleet changes without anyone touching this page — a job starts, a
     // runner is replaced — so it polls rather than pretending it is static.
-    const timer = setInterval(() => void refresh(), 5000)
-    return () => clearInterval(timer)
-  }, [refresh])
+    const timer = setInterval(() => void refresh(), 5000);
+    return () => clearInterval(timer);
+  }, [refresh]);
 
-  const busy = useMemo(() => runners.filter((r) => r.job === 'busy').length, [runners])
+  const busy = useMemo(
+    () => runners.filter((r) => r.job === "busy").length,
+    [runners],
+  );
 
   return (
     <AppShell
       header={{ height: 56 }}
-      navbar={{ width: 220, breakpoint: 'sm', collapsed: { mobile: !opened } }}
-      padding={{ base: 'sm', sm: 'lg' }}
+      navbar={{ width: 220, breakpoint: "sm", collapsed: { mobile: !opened } }}
+      padding={{ base: "sm", sm: "lg" }}
     >
       <AppShell.Header>
-        <Group h="100%" px={{ base: 'sm', sm: 'md' }} justify="space-between" wrap="nowrap">
+        <Group
+          h="100%"
+          px={{ base: "sm", sm: "md" }}
+          justify="space-between"
+          wrap="nowrap"
+        >
           <Group gap="sm" wrap="nowrap" style={{ minWidth: 0 }}>
-            <Burger opened={opened} onClick={toggle} hiddenFrom="sm" size="sm" />
-            <Title order={4} style={{ whiteSpace: 'nowrap' }}>
+            <Burger
+              opened={opened}
+              onClick={toggle}
+              hiddenFrom="sm"
+              size="sm"
+            />
+            <Title order={4} style={{ whiteSpace: "nowrap" }}>
               runner-fleet
             </Title>
             {runners.length > 0 && !crampedHeader && (
@@ -134,7 +167,7 @@ export function App() {
               <>
                 <Badge
                   variant="light"
-                  color={busy > 0 ? 'blue' : 'gray'}
+                  color={busy > 0 ? "blue" : "gray"}
                   visibleFrom="xs"
                   style={{ flexShrink: 0 }}
                 >
@@ -143,7 +176,7 @@ export function App() {
                 <Tooltip label={`${busy} of ${runners.length} runners busy`}>
                   <Badge
                     variant="light"
-                    color={busy > 0 ? 'blue' : 'gray'}
+                    color={busy > 0 ? "blue" : "gray"}
                     hiddenFrom="xs"
                     style={{ flexShrink: 0 }}
                   >
@@ -173,21 +206,21 @@ export function App() {
               label={label}
               leftSection={<Icon size={18} stroke={1.5} />}
               onClick={() => {
-                setPage(key)
-                if (opened) toggle()
+                setPage(key);
+                if (opened) toggle();
               }}
             />
           ))}
         </AppShell.Section>
         <AppShell.Section>
           <Text size="xs" c="dimmed" p="xs">
-            {health?.version ?? ''}
+            {health?.version ?? ""}
           </Text>
         </AppShell.Section>
       </AppShell.Navbar>
 
       <AppShell.Main>
-        {page === 'fleet' && (
+        {page === "fleet" && (
           <FleetPage
             runners={runners}
             pools={pools}
@@ -198,7 +231,7 @@ export function App() {
             onChange={refresh}
           />
         )}
-        {page === 'pools' && (
+        {page === "pools" && (
           <PoolsPage
             pools={pools}
             credentials={credentials}
@@ -208,19 +241,24 @@ export function App() {
             onChange={refresh}
           />
         )}
-        {page === 'jobs' && <JobsPage pools={pools} />}
-        {page === 'resources' && <ResourcesPage report={resources} />}
-        {page === 'credentials' && (
-          <CredentialsPage credentials={credentials} pools={pools} onChange={refresh} />
+        {page === "layers" && <LayersPage pools={pools} />}
+        {page === "jobs" && <JobsPage pools={pools} />}
+        {page === "resources" && <ResourcesPage report={resources} />}
+        {page === "credentials" && (
+          <CredentialsPage
+            credentials={credentials}
+            pools={pools}
+            onChange={refresh}
+          />
         )}
-        {page === 'settings' && <SettingsPage health={health} />}
+        {page === "settings" && <SettingsPage health={health} />}
       </AppShell.Main>
     </AppShell>
-  )
+  );
 }
 
 function ReconcileButton({ onDone }: { onDone: () => Promise<void> }) {
-  const [running, setRunning] = useState(false)
+  const [running, setRunning] = useState(false);
 
   return (
     <Tooltip label="Reconcile now">
@@ -230,40 +268,54 @@ function ReconcileButton({ onDone }: { onDone: () => Promise<void> }) {
         loading={running}
         aria-label="Reconcile now"
         onClick={async () => {
-          setRunning(true)
+          setRunning(true);
           try {
-            const result = await api.reconcile()
-            const count = result.actions?.length ?? 0
+            const result = await api.reconcile();
+            const count = result.actions?.length ?? 0;
             notifications.show({
-              color: result.errors?.length ? 'yellow' : 'green',
-              title: count === 0 ? 'Nothing to do' : `${count} action${count === 1 ? '' : 's'}`,
-              message: result.errors?.length ? result.errors.join('\n') : 'The fleet matches its configuration.',
-            })
-            await onDone()
+              color: result.errors?.length ? "yellow" : "green",
+              title:
+                count === 0
+                  ? "Nothing to do"
+                  : `${count} action${count === 1 ? "" : "s"}`,
+              message: result.errors?.length
+                ? result.errors.join("\n")
+                : "The fleet matches its configuration.",
+            });
+            await onDone();
           } catch (error) {
             notifications.show({
-              color: 'red',
-              title: 'Reconcile failed',
+              color: "red",
+              title: "Reconcile failed",
               message: error instanceof Error ? error.message : String(error),
-            })
+            });
           } finally {
-            setRunning(false)
+            setRunning(false);
           }
         }}
       >
         <IconRefresh size={18} stroke={1.5} />
       </ActionIcon>
     </Tooltip>
-  )
+  );
 }
 
 function ColorSchemeToggle() {
-  const { colorScheme, toggleColorScheme } = useMantineColorScheme()
+  const { colorScheme, toggleColorScheme } = useMantineColorScheme();
   return (
-    <Tooltip label={colorScheme === 'dark' ? 'Light theme' : 'Dark theme'}>
-      <ActionIcon variant="default" size="lg" onClick={toggleColorScheme} aria-label="Toggle theme">
-        {colorScheme === 'dark' ? <IconSun size={18} stroke={1.5} /> : <IconMoon size={18} stroke={1.5} />}
+    <Tooltip label={colorScheme === "dark" ? "Light theme" : "Dark theme"}>
+      <ActionIcon
+        variant="default"
+        size="lg"
+        onClick={toggleColorScheme}
+        aria-label="Toggle theme"
+      >
+        {colorScheme === "dark" ? (
+          <IconSun size={18} stroke={1.5} />
+        ) : (
+          <IconMoon size={18} stroke={1.5} />
+        )}
       </ActionIcon>
     </Tooltip>
-  )
+  );
 }

@@ -235,7 +235,7 @@ func TestSpecsForAPool(t *testing.T) {
 	if specs[0].Generation != specs[1].Generation {
 		t.Fatal("replicas of one pool must share a generation, or they would replace each other for ever")
 	}
-	if specs[0].Generation != p.Generation("fp", "image") {
+	if specs[0].Generation != p.Generation("fp", "image", "") {
 		t.Fatal("the spec's generation must be the pool's, or a restart would see every runner as stale")
 	}
 	if specs[0].URL != "https://github.com/o/r" || specs[0].CredentialID != 3 {

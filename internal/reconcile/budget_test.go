@@ -13,6 +13,14 @@ import (
 // budgetPool is a pool of a stated size and shape, so a test can say "four
 // machines of two processors and four gigabytes" and have the arithmetic be
 // obvious from the name.
+// budgetDiskPool is budgetPool with a disk size, for the one dimension that is
+// not enforced by a control group.
+func budgetDiskPool(name string, min, max, cpus, memoryMB, diskGB int) model.Pool {
+	p := budgetPool(name, min, max, cpus, memoryMB)
+	p.DiskGB = diskGB
+	return p
+}
+
 func budgetPool(name string, min, max, cpus, memoryMB int) model.Pool {
 	p := model.Pool{
 		ID: 1, Name: name, ScopeKind: model.ScopeRepository, Scope: "o/" + name,
@@ -698,5 +706,53 @@ func TestLoweringTheBudgetDrainsRatherThanKills(t *testing.T) {
 	// job, and removing underneath it is how a lowered budget would fail a job.
 	if removed != 0 {
 		t.Fatalf("a machine was removed mid-drain: %v", h.vm.calls)
+	}
+}
+
+// Disk is the dimension that broke a host, and the reason it broke is that a
+// fleet inside its processor and memory budgets can still be well outside what
+// the filesystem has. Rationing has to hold it back for the same reason it
+// holds the other two back.
+func TestAFleetIsHeldToItsDiskCeiling(t *testing.T) {
+	pools := []model.Pool{budgetDiskPool("web", 1, 10, 1, 1024, 40)}
+	scaling := map[string]Scale{"web": {Target: 10, ScaledUp: true}}
+
+	// Four machines' worth of disk, and nothing else in the way.
+	got := Ration(pools, scaling, model.Budget{DiskGB: 160})
+
+	if got["web"].Target != 4 {
+		t.Fatalf("target %d, want 4 — the disk ceiling divided by a machine's disk",
+			got["web"].Target)
+	}
+	if !strings.Contains(got["web"].Reason, "disk") {
+		t.Errorf("the reason does not say what ran out: %q", got["web"].Reason)
+	}
+}
+
+// The ceiling that binds is whichever runs out first, and disk is allowed to be
+// that one. A host with processors to spare and no room on the filesystem is
+// exactly the shape of the failure this dimension was added for.
+func TestTheTightestCeilingIsTheOneThatBinds(t *testing.T) {
+	pools := []model.Pool{budgetDiskPool("web", 1, 10, 1, 1024, 40)}
+	scaling := map[string]Scale{"web": {Target: 10, ScaledUp: true}}
+
+	// Room for eight by processors, two by disk.
+	got := Ration(pools, scaling, model.Budget{CPUs: 8, DiskGB: 80})
+
+	if got["web"].Target != 2 {
+		t.Fatalf("target %d, want 2 — the disk ran out first", got["web"].Target)
+	}
+}
+
+// A pool with no disk ceiling set behaves as it always did. An install that
+// never configured one must not find its fleet held at zero.
+func TestNoDiskCeilingChangesNothing(t *testing.T) {
+	pools := []model.Pool{budgetDiskPool("web", 1, 10, 1, 1024, 40)}
+	scaling := map[string]Scale{"web": {Target: 10, ScaledUp: true}}
+
+	got := Ration(pools, scaling, model.Budget{CPUs: 100})
+
+	if got["web"].Target != 10 {
+		t.Fatalf("target %d, want all ten", got["web"].Target)
 	}
 }

@@ -105,7 +105,14 @@ type harness struct {
 	images      *stubImages
 	credID      int64
 	checkAccess func(context.Context, int64, github.Scope) error
+	// forgot is the pools whose cached layer answer the server dropped, which
+	// is how a decision made in the UI takes effect now rather than at the
+	// resolver's next reading.
+	forgot []string
 }
+
+// Forget makes the harness itself the layer resolver.
+func (h *harness) Forget(pool string) { h.forgot = append(h.forgot, pool) }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
@@ -123,9 +130,10 @@ func newHarness(t *testing.T) *harness {
 	h := &harness{t: t, store: db, fleet: &stubFleet{}, resources: &stubResources{},
 		images: &stubImages{state: map[string]imagebuild.State{}}}
 	srv := New(Options{
-		Store: db, Fleet: h.fleet, Resources: h.resources, Images: h.images, Version: "test",
-		UI:    fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html>fleet</html>")}},
-		Nudge: func() { h.nudges++ },
+		Store: db, Fleet: h.fleet, Resources: h.resources, Images: h.images, Layers: h,
+		Version: "test",
+		UI:      fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<html>fleet</html>")}},
+		Nudge:   func() { h.nudges++ },
 		CheckAccess: func(ctx context.Context, id int64, scope github.Scope) error {
 			if h.checkAccess == nil {
 				return nil

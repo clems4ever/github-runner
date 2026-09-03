@@ -66,7 +66,7 @@ A pool named `web` with a maximum of three gives you `web-1`, `web-2` and
 | **Runtime** | a virtual machine per job, or a container |
 | **Nested virtualisation** | whether jobs get `/dev/kvm` and can boot machines of their own |
 | **Ephemeral** | take one job, then be replaced by a clean runner |
-| **Minimum runners** | what the pool keeps up when nothing is running, at least one |
+| **Minimum runners** | what the pool keeps up when nothing is running: at least one, or zero on a pool that sleeps |
 | **Maximum runners** | how far it may grow under load; equal to the minimum for a fixed size |
 | **Labels** | what a workflow targets with `runs-on` |
 | **Size** | vCPUs, memory, and disk for VM pools |
@@ -122,7 +122,7 @@ behave the way anyone editing them would hope:
 
 - change either, and the daemon builds a new image; the pool's runners drain as
   they finish their jobs and come back on the new one
-- change them back, and the old image is almost certainly still on the host, so
+- change them back within a day, and the old image is still on the host, so
   nothing is rebuilt
 - leave them alone, and no machine ever rebuilds anything
 
@@ -135,6 +135,85 @@ build, the pool gets no runners, and nothing tries again until somebody asks or
 the recipe changes. Both fields are for machine pools; a container pool names a
 prebuilt image in its image field instead, and is refused these rather than
 quietly ignoring them.
+
+### What a repository can add for itself
+
+The operator owns the fleet — how big a machine is, which credential it uses,
+how many there may be. What the operator cannot know is what any particular
+repository's jobs need installed. That changes with the repository, and asking
+somebody with access to the host to edit a pool every time a project picks up a
+dependency is how a fleet ends up with one enormous image that has everything in
+it, rebuilt whenever anyone needs anything.
+
+So a repository can declare its own layer, in a file next to the workflows that
+need it:
+
+```yaml
+# .github/runner-fleet.yml
+packages:
+  - ffmpeg
+  - libvips-dev
+
+recipe: |
+  #!/usr/bin/env bash
+  set -euo pipefail
+  npm install -g pnpm@10
+```
+
+The daemon reads it from the repository's **default branch**, builds a thin
+image on top of the pool's, and boots that pool's runners from it. The chain is
+three deep and each level is shared as far as it can be:
+
+```
+runner-noble-default-5cddd228c4a9.qcow2   the pool's golden image   5230 MB
+  └── runner-noble-<repo>-….qcow2         what the repository added  260 MB
+        └── disk.qcow2                    one machine, one job       grows
+```
+
+Those are real figures from a build on a test host: a repository's whole layer
+cost 260 MB on a 5.2 GB image and took under two minutes, because everything
+underneath it was already built. A machine boots through all three levels in
+about 35 seconds.
+
+**A pull request cannot change any of this.** Only the default branch is read,
+so a change to the file has to be merged first — opening a PR against a
+repository is not a way to run code on the host.
+
+Layers are off until an operator turns them on, per pool, in the pool editor:
+
+| Setting | What it does |
+|---|---|
+| **No** | The pool's own image is the whole of it. The default, and what every pool did before this existed. |
+| **Once I have approved each definition** | Each new definition waits on the **Layers** page until somebody reads it. |
+| **Whatever it asks for, unread** | Builds whatever the default branch says. |
+
+The middle one is the setting to want. What is being decided is not small: a
+recipe is a root shell on a build machine on the host, and anybody who can merge
+to the default branch can change it. Approving costs one click per change to a
+file that changes rarely, and what it buys is that no merge runs anything on the
+host that a human has not read.
+
+The **Layers** page is where that happens. It shows the packages and the recipe
+in full, because an approval button next to a package count is a click rather
+than a decision. A definition is identified by a digest of exactly what would
+execute — the effective package list and the script, not the file — so
+reformatting the file is not a new question, and changing a command always is.
+The digest travels with the decision, so a repository that edits its file while
+the page is open gets a refusal rather than an approval of something nobody saw.
+Approvals can be withdrawn.
+
+Only a **repository-scoped machine pool** can have layers, and the editor offers
+the setting nowhere else. An organisation pool's runner is built before it knows
+whose job it will take, so there is no one repository whose layer it could have;
+a container has no disk of that shape. Nothing is portable either — a template
+that carried "trust" would install an approval nobody on this host made, so the
+import refuses that field by name.
+
+**A pool whose layer is pending, building or broken keeps serving on its own
+image.** It is not held at zero. Holding it would mean a repository could take
+its own runners away by committing a file, and a job that would have run fine on
+the pool's image would sit in a queue instead. The reason is reported on the
+reconcile pass rather than swallowed.
 
 ### Waiting for an image
 
@@ -227,9 +306,10 @@ until work arrives.
 **Growing.** GitHub does not publish how many jobs are queued for a set of
 labels — only what each runner is doing. So demand is inferred: when *every*
 runner in a pool is busy, the next job would have nowhere to go, and one more
-runner is added. That is also why the minimum is never zero. A pool with no
-runners has nothing to observe, so it could never learn that it should grow;
-the idle runner is what makes the pool able to answer the question at all.
+runner is added. That is also why the minimum is one rather than zero, unless
+the pool is told to sleep. A pool with no runners has nothing to observe, so it
+could never learn that it should grow; the idle runner is what makes the pool
+able to answer the question at all.
 
 It grows one runner at a time, and the daemon comes back within seconds after a
 scale-up rather than waiting for its next tick, so a burst ramps quickly without
@@ -243,6 +323,33 @@ on.
 
 Minimum equal to maximum is a fixed-size pool that never moves — which is what
 every pool was before this existed, and what an upgraded database keeps.
+
+**Sleeping.** A pool that serves a repository busy twice a week does not need a
+machine up around the clock to find that out. Turn on **Let this pool sleep**
+in the editor and its minimum goes to zero: nothing runs while the repository
+is quiet.
+
+What wakes it is the repository's own queue. Once a pass, and *only* while a
+sleeping pool is empty or has every runner busy, the daemon asks GitHub what is
+waiting — the repository's unfinished workflow runs, then the jobs inside them —
+and counts the ones whose `runs-on` labels this pool could serve. It starts that
+many runners at once rather than one per pass, so a five-way matrix does not
+wake up over five minutes. On a quiet repository the whole question is two API
+requests, and it is not asked at all of a pool that already has a spare runner.
+
+A job's labels are matched the way GitHub matches them: every label the job asks
+for must be on the runner, and the runner may have more. `self-hosted`, `linux`
+and `x64` are on every runner here, so `runs-on: [self-hosted, vm]` is served by
+a machine pool without those having to be typed into the pool's labels.
+
+The cost is a boot — around a minute — on the first job after a quiet spell, and
+that is the whole trade. A repository that is busy all day should not sleep; one
+that is busy on Tuesdays should.
+
+Only a repository pool can sleep. GitHub lists queued jobs per repository, so
+there is no organisation-wide queue to read, and a pool at zero that nothing
+could wake is a pool that has quietly stopped. The daemon refuses to save one
+rather than accepting it and going silent.
 
 The fleet view says which pool is at what size and why: *every runner is busy*,
 *quiet for 7m*, *spare capacity available*.
@@ -315,7 +422,7 @@ per job. It is about half a minute, and it is worth knowing what it is made of:
 | | |
 | --- | --- |
 | systemd's restart delay | 2s |
-| overlay disk, registration token, seed image | 1–2s |
+| overlay disk, runner configuration, seed image | 1–2s |
 | the guest booting to *Listening for Jobs* | ~16s |
 
 The image is built for that: a machine boots for one job and is destroyed, so
@@ -408,6 +515,7 @@ pool says which of the two problems this is.
 | --- | --- |
 | **CPU** | processors across every machine together, as `CPUQuota` on the slice. Throughput, not a set of cores |
 | **Memory** | MiB across every machine together, as `MemoryHigh` |
+| **Disk** | GiB across the machines' disks and the golden images underneath them. Not enforced by the slice — see below |
 | **Share when contended** | `CPUWeight`: what the fleet gets when something else on this host wants the machine too. Not a cap — a fleet with only this set may still use the whole host |
 | **Kill at the ceiling** | off by default. See below |
 
@@ -418,6 +526,33 @@ which picks the largest machine in the group rather than the one that overspent
 — so it costs somebody their job, and not necessarily the person whose job
 caused it. That is the switch, it is off, and turning it on puts `MemoryMax`
 five per cent above the ceiling so the reclaim has somewhere to happen first.
+
+**Disk is the one the slice cannot hold.** There is no disk equivalent of
+`CPUQuota`, and it is also the dimension that behaves least like the other two:
+processors and memory come back the moment a machine stops, and disk does not. A
+machine's disk grows as its job writes and is only freed when the machine is
+destroyed; a golden image is not freed at all. So the ceiling is held from two
+sides in the daemon instead — it does not start the machine that would cross it,
+and it collects golden images to get back underneath.
+
+**Golden images are collected.** An image no pool asks for and no machine is
+booting is deleted after a day. The day is deliberate: the usual reason an image
+goes unwanted is somebody editing a recipe and putting it back, and that round
+trip is minutes where a rebuild is tens of them. Past the disk ceiling the grace
+does not apply and the oldest unwanted images go first, only as many as it takes
+to fit. Two things are never collected whatever the ceiling says: an image a
+pool asks for, and an image something is booting — including the ones further
+down a backing chain, read from the machines' own disks rather than from
+anything the daemon remembers, so a restart does not lose track of them. If that
+cannot be read at all, nothing is collected; a full disk is a bad afternoon, and
+deleting an image out from under a running job is somebody's job.
+
+Machines that were killed rather than stopped — a host crash, the out-of-memory
+killer, `kill -9` — used to leave their disks behind for ever, because the only
+thing that ever deleted one was the machine itself on the way out. The daemon now
+sweeps them at startup, which is the one moment nothing it started is running:
+a directory belonging to no runner it knows about, that no process has open, is
+gone.
 
 Changing the budget applies to the machines that are already running: the limits
 are properties of a group that already holds them. Lowering it drains the excess
@@ -449,17 +584,58 @@ job the host's `/dev/kvm`, which is a real hole in an already weaker boundary.
 Both are offered; the UI says which is which.
 
 The two also differ in what the runner is trusted with. A machine keeps the
-credential and mints its own registration tokens, which is what lets it come
-back after a reboot with the daemon still down — the job is inside the guest
-and never sees it. A container shares everything with its job, so it is given
-nothing but a registration token the daemon minted: short-lived, and able only
-to register a runner. The cost is that containers are replaced by the daemon
-rather than restarted by Docker, so a container that finishes a job while the
-daemon is down waits for it to come back.
+credential and registers itself at every boot, which is what lets it come back
+after a reboot with the daemon still down — the job is inside the guest and
+never sees it. A container shares everything with its job, so it is given only
+what the daemon minted for that one runner. The cost is that containers are
+replaced by the daemon rather than restarted by Docker, so a container that
+finishes a job while the daemon is down waits for it to come back.
+
+### How a runner registers
+
+An **ephemeral** runner is registered just in time: the whole configuration —
+name, labels, group, and the credential the runner listens with — is minted on
+the host by a single call to GitHub, handed to the runner, and spent on the
+first job. Three things follow from that, and they are the reason it is the
+default:
+
+- Nothing inside the runner can administer a repository. A registration token
+  is short-lived, but for its lifetime anyone holding it can register runners;
+  a just-in-time configuration is one runner that takes one job.
+- There is no `config.sh` step, so there is no half-registered runner to clean
+  up when it fails.
+- A runner that is minted and never boots leaves nothing behind on GitHub.
+  Under a registration token the entry appears when the guest configures
+  itself, which is what left offline runners on a repository after a host went
+  down mid-boot.
+
+A **non-ephemeral** runner cannot use one. GitHub only mints a configuration
+for a runner that takes a single job and is spent, which is the opposite of a
+pool kept up across jobs, so those still register with a token — minted by the
+daemon for a container, and by the machine itself for a VM.
+
+A configuration is spent by the job it took, so a machine mints its own at
+every boot rather than being handed one that has to survive a restart. That is
+what keeps the guarantee above: a machine that comes back with the daemon down
+registers from the credential it keeps, and a machine restarted by systemd
+after a job gets a fresh configuration instead of replaying a used one.
+
+The registration path is covered by tests that talk to real GitHub, because a
+fake server can only confirm that the client sends what this repository thinks
+GitHub wants. They are skipped unless told where to run:
+
+```
+FLEET_LIVE_TOKEN=… FLEET_LIVE_REPO=owner/name go test ./internal/github -run Live
+```
+
+The token needs `Administration: read and write` on that repository, which is
+what minting a configuration requires. Every runner they register is
+deregistered again, under a name nothing else would choose.
 
 Container images are expected to carry the GitHub Actions runner. The official
 `ghcr.io/actions/actions-runner` works as it is; a custom image is found by
-looking for `config.sh`, or told where to look with `FLEET_RUNNER_HOME`.
+looking for `config.sh`, or told where to look with `FLEET_RUNNER_HOME` — which
+is where the runner is started from either way.
 
 ## How the daemon works
 

@@ -125,6 +125,14 @@ users:
     ssh_authorized_keys:
       - %s
 
+# A build fetches several hundred packages and takes minutes to do it. Without
+# this, one connection dropped anywhere in that is the whole build: apt gives
+# up on the file, the install exits non-zero, and everything downloaded so far
+# is thrown away with the disk. Retrying costs nothing when the link is good.
+apt:
+  conf: |
+    Acquire::Retries "5";
+
 package_update: true
 package_upgrade: true
 packages:
@@ -286,10 +294,29 @@ apt-get clean
 `, RunnerVersion)
 }
 
-// runUserData is the cloud-init for one runner's machine: the registration
-// details, a script that registers and runs the runner, and a unit to keep it
-// under systemd's eye inside the guest.
-func runUserData(c Config, registrationToken, publicKey string) string {
+// Registration is what a machine is given to become a runner, and there are
+// two kinds.
+//
+// A JIT is the whole configuration, minted on the host before the machine
+// booted. The guest unpacks it and starts: there is no registration step to
+// fail, nothing that could administer a repository is ever inside the guest,
+// and a machine that never boots leaves no entry behind. It is what an
+// ephemeral pool uses, and it is the only thing GitHub will mint one of — a
+// just-in-time runner takes one job and is spent.
+//
+// A Token is the older two-step: a registration token the guest trades for
+// credentials of its own by running config.sh. It is what a pool of long-lived
+// runners has to use, because there is no such thing as a long-lived
+// just-in-time runner.
+type Registration struct {
+	JIT   string
+	Token string
+}
+
+// runUserData is the cloud-init for one runner's machine: what it registers
+// with, a script that runs the runner, and a unit to keep it under systemd's
+// eye inside the guest.
+func runUserData(c Config, reg Registration, publicKey string) string {
 	return fmt.Sprintf(`#cloud-config
 hostname: %s
 preserve_hostname: false
@@ -302,14 +329,15 @@ users:
       - %s
 
 write_files:
-  # 0600 and root-owned. The registration token is short-lived, but a job has
-  # no reason to be able to read it.
+  # 0600 and root-owned. Both kinds of registration are short-lived and worth
+  # little once spent, but neither is any of the job's business.
   - path: /etc/runner-fleet/runner.env
     permissions: '0600'
     owner: 'root:root'
     content: |
       GITHUB_URL=%s
       RUNNER_TOKEN=%s
+      RUNNER_JITCONFIG=%s
       RUNNER_NAME=%s
       RUNNER_LABELS=%s
       RUNNER_GROUP=%s
@@ -358,7 +386,7 @@ runcmd:
   - [ systemctl, start, --no-block, github-runner.service ]
 `,
 		c.Runner, publicKey,
-		quote(c.URL), quote(registrationToken), quote(c.Runner),
+		quote(c.URL), quote(reg.Token), quote(reg.JIT), quote(c.Runner),
 		quote(strings.Join(c.Labels, ",")), quote(c.Group), c.Ephemeral,
 		indent(GuestRunnerScript, "      "))
 }
@@ -373,12 +401,25 @@ set -euo pipefail
 # refuses to run as root, so the unit starts this as "runner".
 
 : "${GITHUB_URL:?GITHUB_URL is required}"
-: "${RUNNER_TOKEN:?RUNNER_TOKEN is required}"
 RUNNER_NAME=${RUNNER_NAME:-$(hostname)}
 RUNNER_GROUP=${RUNNER_GROUP:-Default}
 EPHEMERAL=${EPHEMERAL:-false}
 
 cd /home/runner/actions-runner
+
+# A just-in-time configuration is everything config.sh would have written,
+# minted on the host before this machine booted. There is nothing to register:
+# unpack it and run. exec, so the runner receives the unit's SIGTERM directly
+# and can finish the job it is on before stopping.
+if [[ -n "${RUNNER_JITCONFIG:-}" ]]; then
+  echo "starting runner '${RUNNER_NAME}' on ${GITHUB_URL} from a just-in-time configuration"
+  exec ./run.sh --jitconfig "$RUNNER_JITCONFIG"
+fi
+
+# The older path, for a pool of long-lived runners: GitHub only mints a
+# just-in-time configuration for a runner that takes one job, so a runner meant
+# to outlive its job still has to trade a registration token for credentials.
+: "${RUNNER_TOKEN:?either RUNNER_JITCONFIG or RUNNER_TOKEN is required}"
 
 args=(
   --url "$GITHUB_URL"

@@ -105,7 +105,8 @@ function FleetBudget() {
         // The page has a password form on it that works regardless, and the
         // budget is not what somebody came here for when the daemon is
         // struggling to answer at all.
-        if (!cancelled) setBudget({ cpus: 0, cpuWeight: 0, memoryMb: 0, hardMemory: false })
+        if (!cancelled)
+          setBudget({ cpus: 0, cpuWeight: 0, memoryMb: 0, diskGb: 0, hardMemory: false })
       })
     return () => {
       cancelled = true
@@ -137,7 +138,20 @@ function FleetBudget() {
             min={0} step={1024} allowDecimal={false}
             value={budget.memoryMb} onChange={(value) => set({ memoryMb: Number(value) || 0 })}
           />
+          <NumberInput
+            label="Disk (GiB)"
+            description="Machine disks and golden images together. 0 for no cap."
+            min={0} step={50} allowDecimal={false}
+            value={budget.diskGb} onChange={(value) => set({ diskGb: Number(value) || 0 })}
+          />
         </Group>
+        <Text size="sm" c="dimmed">
+          Disk is the one the other two do not cover. Processors and memory come back the moment a
+          machine stops; disk does not. A machine's disk grows as its job writes, and every edit to
+          a pool's packages or setup script builds another golden image that used to stay on this
+          host for ever. Under a cap the daemon stops starting machines and deletes golden images
+          no pool asks for and nothing is booting.
+        </Text>
         <NumberInput
           label="Share when the host is contended"
           description={
@@ -171,7 +185,7 @@ function FleetBudget() {
                   color: 'green',
                   title: 'Budget saved',
                   message:
-                    saved.cpus || saved.memoryMb
+                    saved.cpus || saved.memoryMb || saved.diskGb
                       ? 'It applies to the machines that are already running.'
                       : 'The fleet is no longer capped.',
                 })

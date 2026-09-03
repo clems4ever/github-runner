@@ -123,10 +123,16 @@ type Pool struct {
 	Runtime   Runtime   `json:"runtime"`
 	Nested    bool      `json:"nested"`
 	Ephemeral bool      `json:"ephemeral"`
-	// MinReplicas is what the pool falls back to when nothing is running, and
-	// is never below one: a pool with no runner at all cannot accept a job, and
-	// so can never discover that it needs more.
+	// MinReplicas is what the pool falls back to when nothing is running. Never
+	// below one unless the pool sleeps: a pool with no runner at all cannot
+	// accept a job, and so can never discover that it needs more — which is
+	// exactly the gap Sleeps fills another way.
 	MinReplicas int `json:"minReplicas"`
+	// Sleeps lets the pool go to zero when nothing is queued, and wakes it by
+	// reading the repository's queue instead of by keeping a runner up to
+	// watch. See sleep.go for what that costs and why only a repository pool
+	// may do it.
+	Sleeps bool `json:"sleeps"`
 	// MaxReplicas is the ceiling. Equal to the minimum, the pool is a fixed
 	// size and never scales.
 	MaxReplicas int      `json:"maxReplicas"`
@@ -146,11 +152,15 @@ type Pool struct {
 	// It is part of the image's identity — see the executor's Recipe — so
 	// editing it builds a new image and drains the runners built from the old
 	// one, and leaving it alone reuses what is already on the host.
-	Recipe       string    `json:"recipe"`
-	CredentialID int64     `json:"credentialId"`
-	Enabled      bool      `json:"enabled"`
-	CreatedAt    time.Time `json:"createdAt"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	Recipe string `json:"recipe"`
+	// Layers is how much this pool trusts the repository it serves to declare
+	// its own additions to the image. Off unless an operator turns it on; see
+	// layer.go for what turning it on means.
+	Layers       LayerPolicy `json:"layers"`
+	CredentialID int64       `json:"credentialId"`
+	Enabled      bool        `json:"enabled"`
+	CreatedAt    time.Time   `json:"createdAt"`
+	UpdatedAt    time.Time   `json:"updatedAt"`
 }
 
 // URL is where the runners register.
@@ -172,9 +182,17 @@ func (p *Pool) Elastic() bool { return p.MaxReplicas > p.MinReplicas }
 // Floor is the smallest the pool is allowed to be, and is at least one even if
 // the stored value is not: an empty pool cannot accept a job, so it can never
 // find out that it needs to grow.
+//
+// Unless it sleeps, which is the arrangement where it finds out by asking.
 func (p *Pool) Floor() int {
 	if !p.Enabled {
 		return 0
+	}
+	if p.Sleeping() {
+		if p.MinReplicas < 0 {
+			return 0
+		}
+		return p.MinReplicas
 	}
 	if p.MinReplicas < 1 {
 		return 1
@@ -286,7 +304,7 @@ const SpecRevision = 5
 // release changed that and left every existing runner looking current. The
 // spec revision below is the manual version of this, for changes a recipe
 // cannot express.
-func (p *Pool) Generation(credentialFingerprint, recipe string) string {
+func (p *Pool) Generation(credentialFingerprint, recipe, layer string) string {
 	h := sha256.New()
 	write := func(parts ...string) {
 		for _, part := range parts {
@@ -309,6 +327,12 @@ func (p *Pool) Generation(credentialFingerprint, recipe string) string {
 		p.Image,
 		recipe,
 		credentialFingerprint,
+		// The per-repository layer, when there is one. A repository that edits
+		// its file and has the result approved gets a different image, and a
+		// runner already up was built from the old one: without this it would
+		// be left alone, and the change would take effect whenever that runner
+		// happened to be replaced for some other reason.
+		layer,
 	)
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
@@ -345,9 +369,10 @@ func (p *Pool) Validate() error {
 
 	// One, not zero. A pool has to keep a runner able to accept work, or
 	// nothing would ever reveal that the pool needs to grow. Switching a pool
-	// off entirely is what "enabled" is for.
-	if p.MinReplicas < 1 || p.MinReplicas > MaxReplicas {
-		return fmt.Errorf("minimum replicas %d: want 1 to %d — use the enabled switch to stop a pool entirely", p.MinReplicas, MaxReplicas)
+	// off entirely is what "enabled" is for — and sleeping is what a pool that
+	// finds out by asking instead does.
+	if p.MinReplicas < 1 && !p.Sleeps || p.MinReplicas < 0 || p.MinReplicas > MaxReplicas {
+		return fmt.Errorf("minimum replicas %d: want 1 to %d — use the enabled switch to stop a pool entirely, or let the pool sleep", p.MinReplicas, MaxReplicas)
 	}
 	if p.MaxReplicas < p.MinReplicas || p.MaxReplicas > MaxReplicas {
 		return fmt.Errorf("maximum replicas %d: want %d to %d, and never below the minimum", p.MaxReplicas, p.MinReplicas, MaxReplicas)
@@ -391,6 +416,12 @@ func (p *Pool) Validate() error {
 	if len(p.Recipe) > MaxRecipeBytes {
 		return fmt.Errorf("recipe is %d bytes: the limit is %d, and a recipe that long wants to fetch what it needs rather than carry it", len(p.Recipe), MaxRecipeBytes)
 	}
+	if err := ValidateLayerPolicy(*p); err != nil {
+		return err
+	}
+	if err := ValidateSleep(*p); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -400,8 +431,16 @@ func (p *Pool) Defaults() {
 	if p.Runtime == "" {
 		p.Runtime = RuntimeVM
 	}
-	if p.MinReplicas < 1 {
+	if p.MinReplicas < 1 && !p.Sleeps {
 		p.MinReplicas = 1
+	}
+	if p.MinReplicas < 0 {
+		p.MinReplicas = 0
+	}
+	if p.Sleeps && p.MaxReplicas < 1 {
+		// A pool that sleeps and may never start anything is not a pool. One
+		// is the smallest thing it could wake up to.
+		p.MaxReplicas = 1
 	}
 	if p.MaxReplicas < p.MinReplicas {
 		p.MaxReplicas = p.MinReplicas
@@ -434,6 +473,9 @@ func (p *Pool) Defaults() {
 	// Normalised on the way in, so what is stored is what runs and what the
 	// image's name was computed from.
 	p.Recipe = strings.ReplaceAll(p.Recipe, "\r\n", "\n")
+	if p.Layers == "" {
+		p.Layers = LayersOff
+	}
 }
 
 // Sample is one observation of a pool: how many runners it had and how many

@@ -35,6 +35,26 @@ type Budget struct {
 	// MemoryMB is the fleet's memory ceiling. It is applied as pressure rather
 	// than as a wall — see HardMemory, which is the wall.
 	MemoryMB int `json:"memoryMb"`
+	// DiskGB is how much of the state directory the whole fleet may take, in
+	// gigabytes: the machines' disks and the golden images underneath them
+	// together, because they share one filesystem.
+	//
+	// It is the dimension that was missing, and the one that actually broke a
+	// host. Processors and memory are returned the moment a machine stops;
+	// disk is not. A machine's overlay grows as its job writes and is only
+	// freed when the machine is destroyed, and the golden images underneath
+	// them are never freed at all until they are collected — so a fleet that
+	// was comfortably inside its processor and memory budgets filled the
+	// filesystem those budgets were written on, and every pool on the host
+	// stopped at once.
+	//
+	// Unlike the other two this is not enforced by a control group. There is
+	// no disk equivalent of CPUQuota that a slice can hold machines to, so
+	// this is a ceiling the daemon holds the fleet under from two sides: the
+	// reconciler does not create the machine that would cross it, and the image
+	// collector evicts golden images nothing is booting until the fleet fits
+	// back underneath.
+	DiskGB int `json:"diskGb"`
 	// HardMemory adds a hard limit above the ceiling, past which the kernel
 	// kills something.
 	//
@@ -77,7 +97,7 @@ func (b Budget) HardMemoryBytes() int64 {
 // deliberately not a cap: it decides who yields when the host is contended,
 // which is not the same as a ceiling, and a fleet with only a weight set is
 // still allowed to use the whole machine.
-func (b Budget) Capped() bool { return b.CPUs > 0 || b.MemoryMB > 0 }
+func (b Budget) Capped() bool { return b.CPUs > 0 || b.MemoryMB > 0 || b.DiskGB > 0 }
 
 // Configured reports whether anything at all was asked for, cap or weight. It
 // is what decides whether the host needs a group to put the fleet in.
@@ -94,6 +114,11 @@ const (
 	// would give the fleet a ceiling no machine could boot inside.
 	MinBudgetMemoryMB = 512
 	MaxBudgetMemoryMB = 64 * 1024 * 1024
+	// MinBudgetDiskGB is a little over one machine's default disk. A budget
+	// below it could not admit a single runner, so it is a typo rather than a
+	// very small fleet.
+	MinBudgetDiskGB = 50
+	MaxBudgetDiskGB = MaxDiskGB
 	// The range systemd accepts for cpu.weight.
 	MinCPUWeight = 1
 	MaxCPUWeight = 10000
@@ -107,6 +132,10 @@ func (b Budget) Validate() error {
 	if b.MemoryMB != 0 && (b.MemoryMB < MinBudgetMemoryMB || b.MemoryMB > MaxBudgetMemoryMB) {
 		return fmt.Errorf("memory %d MiB: want %d to %d, or 0 for no memory cap at all",
 			b.MemoryMB, MinBudgetMemoryMB, MaxBudgetMemoryMB)
+	}
+	if b.DiskGB != 0 && (b.DiskGB < MinBudgetDiskGB || b.DiskGB > MaxBudgetDiskGB) {
+		return fmt.Errorf("disk %d GiB: want %d to %d, or 0 for no disk ceiling at all",
+			b.DiskGB, MinBudgetDiskGB, MaxBudgetDiskGB)
 	}
 	if b.CPUWeight != 0 && (b.CPUWeight < MinCPUWeight || b.CPUWeight > MaxCPUWeight) {
 		return fmt.Errorf("cpu weight %d: want %d to %d, or 0 to leave systemd's default of 100",
