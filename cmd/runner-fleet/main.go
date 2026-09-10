@@ -19,6 +19,7 @@ import (
 
 	"github.com/clems4ever/github-runner/internal/agent"
 	"github.com/clems4ever/github-runner/internal/paths"
+	"github.com/clems4ever/github-runner/internal/qmp"
 	"github.com/clems4ever/github-runner/internal/secrets"
 	"github.com/clems4ever/github-runner/internal/store"
 )
@@ -54,6 +55,8 @@ func run(args []string) error {
 		return agentCommand(args)
 	case "passwd":
 		return passwdCommand(args)
+	case "machine":
+		return machineCommand(args)
 	case "version":
 		fmt.Println(version)
 		return nil
@@ -74,6 +77,8 @@ Usage:
   runner-fleet agent --name NAME be one runner; this is what a unit or a
                                  container runs, not something to run by hand
   runner-fleet passwd [flags]    set the web UI's user and password
+  runner-fleet machine status NAME   what QEMU says one machine is doing
+  runner-fleet machine resume NAME   carry on a machine QEMU stopped
   runner-fleet version
 
 Flags for serve:
@@ -89,6 +94,9 @@ Flags for passwd:
   --user NAME        the user name (default admin)
   --password VALUE   the password; read from stdin when not given, so it does
                      not reach the process list or the shell history
+  --root DIR         as above
+
+Flags for machine:
   --root DIR         as above
 
 Environment:
@@ -178,4 +186,60 @@ func readSecretLine() (string, error) {
 		}
 	}
 	return strings.TrimSpace(line), nil
+}
+
+// machineCommand asks QEMU about one machine, or tells it to carry on.
+//
+// It exists because of one state: QEMU stops a machine when a write fails for
+// want of space on the host, rather than passing the error into the guest, and
+// nothing resumes it afterwards. The fleet reports such a machine (see the
+// systemd executor's machineTrouble) and this is the other half — the thing the
+// report tells somebody to run.
+//
+// Deliberately not automatic. Resuming a machine while the host is still full
+// stops it again on its next write, and a loop that keeps doing that turns one
+// legible fault into a machine that flaps. Somebody makes space, then says to
+// carry on.
+func machineCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("machine: say what to do: status NAME, or resume NAME")
+	}
+	action, rest := args[0], args[1:]
+
+	flags := flag.NewFlagSet("machine "+action, flag.ContinueOnError)
+	root := flags.String("root", os.Getenv("RUNNER_FLEET_ROOT"), "put everything under this directory")
+	if err := flags.Parse(rest); err != nil {
+		return err
+	}
+	name := flags.Arg(0)
+	if name == "" {
+		return fmt.Errorf("machine %s: name a machine", action)
+	}
+	socket := layoutFor(*root).QMPSocket(name)
+
+	switch action {
+	case "status":
+		status, err := qmp.Status(socket)
+		if err != nil {
+			return fmt.Errorf("machine status %s: %w", name, err)
+		}
+		fmt.Println(status)
+		return nil
+	case "resume":
+		if err := qmp.Cont(socket); err != nil {
+			return fmt.Errorf("machine resume %s: %w", name, err)
+		}
+		status, err := qmp.Status(socket)
+		if err != nil {
+			// It was told to carry on and that succeeded; not being able to
+			// read the state back afterwards is worth saying and is not a
+			// failure of the resume.
+			fmt.Printf("%s: resumed\n", name)
+			return nil
+		}
+		fmt.Printf("%s: %s\n", name, status)
+		return nil
+	default:
+		return fmt.Errorf("machine: unknown action %q; say status or resume", action)
+	}
 }

@@ -79,6 +79,12 @@ func (l Layout) ImagesDir() string { return filepath.Join(l.State, "images") }
 // VMDir is one VM's working directory.
 func (l Layout) VMDir(name string) string { return filepath.Join(l.State, "vms", name) }
 
+// QMPSocket is where a machine's QEMU monitor listens. The agent creates it
+// and the daemon reads it, so it is named here rather than joined in both.
+func (l Layout) QMPSocket(name string) string {
+	return filepath.Join(l.VMDir(name), "qmp.sock")
+}
+
 // SSHDir holds the key that reaches every VM this host runs.
 func (l Layout) SSHDir() string { return filepath.Join(l.State, "ssh") }
 
