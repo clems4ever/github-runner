@@ -48,18 +48,21 @@ type Pool struct {
 	// ScopeKind and Scope may be left out, and then the import supplies them.
 	// A template written for one repository can name it; one meant to be
 	// reused should not.
-	ScopeKind   model.ScopeKind `json:"scopeKind,omitempty"`
-	Scope       string          `json:"scope,omitempty"`
-	Runtime     model.Runtime   `json:"runtime,omitempty"`
-	Nested      *bool           `json:"nested,omitempty"`
-	Ephemeral   *bool           `json:"ephemeral,omitempty"`
-	MinReplicas int             `json:"minReplicas,omitempty"`
-	MaxReplicas int             `json:"maxReplicas,omitempty"`
-	Labels      []string        `json:"labels,omitempty"`
-	CPUs        int             `json:"cpus,omitempty"`
-	MemoryMB    int             `json:"memoryMb,omitempty"`
-	DiskGB      int             `json:"diskGb,omitempty"`
-	Image       string          `json:"image,omitempty"`
+	ScopeKind model.ScopeKind `json:"scopeKind,omitempty"`
+	Scope     string          `json:"scope,omitempty"`
+	Runtime   model.Runtime   `json:"runtime,omitempty"`
+	Nested    *bool           `json:"nested,omitempty"`
+	Ephemeral *bool           `json:"ephemeral,omitempty"`
+	// Docker is how a container pool's runners get a daemon. Left out, they
+	// get none, which is what every template written before this said.
+	Docker      model.DockerAccess `json:"docker,omitempty"`
+	MinReplicas int                `json:"minReplicas,omitempty"`
+	MaxReplicas int                `json:"maxReplicas,omitempty"`
+	Labels      []string           `json:"labels,omitempty"`
+	CPUs        int                `json:"cpus,omitempty"`
+	MemoryMB    int                `json:"memoryMb,omitempty"`
+	DiskGB      int                `json:"diskGb,omitempty"`
+	Image       string             `json:"image,omitempty"`
 	// What a machine pool bakes into its image. A template is the portable
 	// form of a pool, and a pool whose runners have the toolchain baked in is
 	// not portable without them.
@@ -171,6 +174,7 @@ func Apply(doc Document, opts Options) ([]model.Pool, error) {
 			Scope:        entry.Scope,
 			Runtime:      entry.Runtime,
 			Nested:       value(entry.Nested, false),
+			Docker:       entry.Docker,
 			Ephemeral:    value(entry.Ephemeral, true),
 			MinReplicas:  entry.MinReplicas,
 			MaxReplicas:  entry.MaxReplicas,
@@ -205,6 +209,16 @@ func Apply(doc Document, opts Options) ([]model.Pool, error) {
 	return out, nil
 }
 
+// dockerAccess is what a pool's Docker field should say in a template: nothing
+// when it is the default, so a fleet of machine pools exports the same
+// document it would have before this field existed.
+func dockerAccess(pool model.Pool) model.DockerAccess {
+	if pool.Docker == model.DockerNone {
+		return ""
+	}
+	return pool.Docker
+}
+
 // Export writes pools out as a template, dropping everything local to this
 // installation so the result imports anywhere.
 func Export(pools []model.Pool) Document {
@@ -217,6 +231,7 @@ func Export(pools []model.Pool) Document {
 			Scope:       pool.Scope,
 			Runtime:     pool.Runtime,
 			Nested:      &nested,
+			Docker:      dockerAccess(pool),
 			Ephemeral:   &ephemeral,
 			MinReplicas: pool.MinReplicas,
 			MaxReplicas: pool.MaxReplicas,

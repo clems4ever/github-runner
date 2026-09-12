@@ -32,11 +32,14 @@ type Config struct {
 	Group      string
 	Ephemeral  bool
 	Nested     bool
-	Runtime    model.Runtime
-	CPUs       int
-	MemoryMB   int
-	DiskGB     int
-	Image      string
+	// Docker is how this runner gets a daemon. A machine installs one in its
+	// image and leaves this empty; a container is given one or given nothing.
+	Docker   model.DockerAccess
+	Runtime  model.Runtime
+	CPUs     int
+	MemoryMB int
+	DiskGB   int
+	Image    string
 	// Packages and Recipe are what this runner's pool bakes into its image on
 	// top of the base one. The agent builds the image, so it is the agent that
 	// has to know them.
@@ -67,6 +70,7 @@ func ConfigFromEnv(name string) (Config, error) {
 		Group:          first(os.Getenv("FLEET_GROUP"), "Default"),
 		Ephemeral:      boolEnv("FLEET_EPHEMERAL"),
 		Nested:         boolEnv("FLEET_NESTED"),
+		Docker:         model.DockerAccess(first(os.Getenv("FLEET_DOCKER"), string(model.DockerNone))),
 		Runtime:        model.Runtime(first(os.Getenv("FLEET_RUNTIME"), string(model.RuntimeVM))),
 		CPUs:           intEnv("FLEET_CPUS", 2),
 		MemoryMB:       intEnv("FLEET_MEMORY_MB", 4096),

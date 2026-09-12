@@ -168,7 +168,14 @@ export function PoolEditor({
             { value: 'container', label: 'Container' },
           ]}
           value={values.runtime}
-          onChange={(value) => form.setFieldValue('runtime', value as Pool['runtime'])}
+          onChange={(value) => {
+            form.setFieldValue('runtime', value as Pool['runtime'])
+            // A machine boots with a daemon of its own, and the daemon refuses
+            // a machine pool that asks for one as well. Cleared here rather
+            // than left to be rejected on save, which would be a validation
+            // error about a switch that is no longer on screen.
+            if (value === 'vm') form.setFieldValue('docker', 'none')
+          }}
         />
         <Text size="xs" c="dimmed" mt={-8}>
           {isVM
@@ -190,6 +197,26 @@ export function PoolEditor({
             onChange={(event) => form.setFieldValue('nested', event.currentTarget.checked)}
           />
         </SimpleGrid>
+
+        {!isVM && (
+          <Switch
+            label="Docker in Docker"
+            description="A Docker daemon inside each runner, for jobs that build images"
+            checked={values.docker === 'dind'}
+            onChange={(event) =>
+              form.setFieldValue('docker', event.currentTarget.checked ? 'dind' : 'none')
+            }
+          />
+        )}
+
+        {!isVM && values.docker === 'dind' && (
+          <Alert color="orange" variant="light" icon={<IconAlertTriangle size={16} />}>
+            A daemon inside a container needs a privileged container: every capability, no seccomp
+            filter, and the host's kernel underneath. Read a job on this pool as having root on the
+            host. The image also has to carry dockerd and iptables — the stock runner image does
+            not.
+          </Alert>
+        )}
 
         {values.nested && !isVM && (
           <Alert color="orange" variant="light" icon={<IconAlertTriangle size={16} />}>

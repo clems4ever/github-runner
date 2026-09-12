@@ -29,6 +29,7 @@ function pool(over: Partial<Pool>): Pool {
     runtime: 'container',
     nested: false,
     ephemeral: true,
+    docker: 'none',
     minReplicas: 1,
     maxReplicas: 3,
     labels: [],

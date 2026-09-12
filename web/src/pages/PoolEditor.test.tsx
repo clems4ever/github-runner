@@ -42,6 +42,34 @@ describe('PoolEditor', () => {
     expect(screen.getByText(/hole in an already weaker boundary/)).toBeInTheDocument()
   })
 
+  it('offers a docker daemon to containers, which have none of their own', async () => {
+    renderEditor()
+    // A machine boots with one installed in its image, so there is nothing to
+    // offer and nothing the daemon would accept.
+    expect(screen.queryByRole('switch', { name: /Docker in Docker/ })).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByText('Container'))
+    await userEvent.click(screen.getByRole('switch', { name: /Docker in Docker/ }))
+
+    expect(screen.getByText('dind')).toBeInTheDocument()
+    expect(screen.getByText(/privileged container/)).toBeInTheDocument()
+  })
+
+  it('drops the docker daemon when the pool becomes a machine', async () => {
+    // Otherwise the pool is refused on save, for a switch that is no longer on
+    // screen to explain it.
+    renderEditor()
+    await userEvent.click(screen.getByText('Container'))
+    await userEvent.click(screen.getByRole('switch', { name: /Docker in Docker/ }))
+    expect(screen.getByText('dind')).toBeInTheDocument()
+
+    await userEvent.click(screen.getByText('Virtual machine'))
+    expect(screen.queryByText('dind')).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByText('Container'))
+    expect(screen.getByRole('switch', { name: /Docker in Docker/ })).not.toBeChecked()
+  })
+
   it('hides the disk size for containers, which have none', async () => {
     renderEditor()
     expect(screen.getByRole('textbox', { name: 'Disk (GiB)' })).toBeInTheDocument()

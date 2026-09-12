@@ -34,6 +34,7 @@ const pool = (name: string): Pool => ({
   runtime: 'vm',
   nested: false,
   ephemeral: true,
+  docker: 'none',
   minReplicas: 1,
   maxReplicas: 4,
   labels: [],

@@ -44,10 +44,13 @@ type Spec struct {
 	Labels     []string
 	Ephemeral  bool
 	Nested     bool
-	CPUs       int
-	MemoryMB   int
-	DiskGB     int
-	Image      string
+	// Docker is how a container runner gets a daemon: nothing, or one of its
+	// own inside the container. Machine runners install theirs in the image.
+	Docker   model.DockerAccess
+	CPUs     int
+	MemoryMB int
+	DiskGB   int
+	Image    string
 	// Packages and Recipe are what this pool bakes into its machine image on
 	// top of the base one. They travel with the spec because the agent builds
 	// the image, not the daemon — which is also what lets a machine come back
@@ -284,6 +287,7 @@ func SpecsForCredential(p model.Pool, credentialFingerprint, recipe string, name
 			Labels:         labels,
 			Ephemeral:      p.Ephemeral,
 			Nested:         p.Nested,
+			Docker:         p.Docker,
 			CPUs:           p.CPUs,
 			MemoryMB:       p.MemoryMB,
 			DiskGB:         p.DiskGB,

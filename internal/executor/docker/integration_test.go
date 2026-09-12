@@ -204,3 +204,124 @@ func inTheImage(command string) (string, error) {
 		DefaultImage, "-lc", command).CombinedOutput()
 	return string(out), err
 }
+
+// buildDindImage builds the runner image that can run a daemon of its own, out
+// of the Dockerfile this repository ships.
+//
+// Built here rather than pulled from somewhere, because the thing being
+// checked is that file: the stock image carries dockerd and no iptables, and
+// the way that fails — the daemon exits a few seconds in, complaining about a
+// network controller — is exactly the failure nobody debugging a pool of
+// restarting runners would attribute to a missing package.
+func buildDindImage(t *testing.T) string {
+	t.Helper()
+	const tag = "runner-fleet-dind-integration:latest"
+	build := exec.Command("docker", "build", "-t", tag, "../../../images/dind")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the dind runner image: %v: %s", err, out)
+	}
+	return tag
+}
+
+// Docker in Docker, from the Dockerfile to a job container.
+//
+// The unit tests beside this one assert the request the executor sends, which
+// is the half that can be checked against its author's assumptions. This is
+// the other half, and every line of it is an assumption that was wrong once:
+// that the image has what the daemon needs, that root can start it, that the
+// socket it creates can be reached by the account the runner was dropped back
+// to, and that a container started inside is a container that runs.
+func TestDindGivesTheRunnerAWorkingDaemon(t *testing.T) {
+	e := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	spec := reconcile.Spec{
+		Name: "runner-fleet-dind-integration", Pool: "integration", Generation: "test",
+		Runtime: model.RuntimeContainer, Docker: model.DockerDind,
+		URL:       "https://github.com/clems4ever/github-runner",
+		ScopeKind: model.ScopeRepository, Scope: "clems4ever/github-runner",
+		Labels: []string{"container", "dind"}, CPUs: 2, MemoryMB: 2048,
+		Image: buildDindImage(t), CredentialID: 1,
+		// Not a real token, for the same reason as the test above: GitHub
+		// refusing it is how far this needs to get.
+		RegistrationToken: "AAAA-not-a-real-registration-token",
+	}
+	t.Cleanup(func() {
+		_ = e.Remove(context.Background(), spec.Name)
+	})
+
+	if err := e.Create(ctx, spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var logs string
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		logs = logsOf(t, spec.Name)
+		if strings.Contains(logs, "registering") || strings.Contains(logs, "docker daemon") {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	if !strings.Contains(logs, "docker is ready") {
+		t.Fatalf("the daemon inside the runner never came up:\n%s", logs)
+	}
+	// And it came up before the runner registered, which is what keeps a pool
+	// from taking a job it cannot run.
+	if strings.Index(logs, "docker is ready") > strings.Index(logs, "registering") {
+		t.Fatalf("the runner registered before it had a daemon:\n%s", logs)
+	}
+
+	// The job's half of it: whoever the runner runs as has to be able to reach
+	// the socket root created, and a container started through it has to run.
+	// docker exec enters as the image's own user, which is that account.
+	out, err := exec.Command("docker", "exec", spec.Name,
+		"docker", "run", "--rm", "hello-world").CombinedOutput()
+	if err != nil {
+		t.Fatalf("a job could not run a container inside its runner: %v: %s\nrunner log:\n%s", err, out, logs)
+	}
+}
+
+// A runner whose image cannot run a daemon says so and stops, rather than
+// registering and taking a job that will fail on its first docker step.
+func TestDindRefusesAnImageWithoutTheDaemon(t *testing.T) {
+	e := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	spec := reconcile.Spec{
+		Name: "runner-fleet-dind-unfit", Pool: "integration", Generation: "test",
+		Runtime: model.RuntimeContainer, Docker: model.DockerDind,
+		URL:       "https://github.com/clems4ever/github-runner",
+		ScopeKind: model.ScopeRepository, Scope: "clems4ever/github-runner",
+		Labels: []string{"container", "dind"}, CPUs: 2, MemoryMB: 2048,
+		Image: DefaultImage, CredentialID: 1,
+		RegistrationToken: "AAAA-not-a-real-registration-token",
+	}
+	t.Cleanup(func() {
+		_ = e.Remove(context.Background(), spec.Name)
+	})
+
+	if err := e.Create(ctx, spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var logs string
+	deadline := time.Now().Add(4 * time.Minute)
+	for time.Now().Before(deadline) {
+		logs = logsOf(t, spec.Name)
+		if strings.Contains(logs, "docker in docker") || strings.Contains(logs, "registering") {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	if strings.Contains(logs, "registering") {
+		t.Fatalf("a runner with no usable daemon registered anyway:\n%s", logs)
+	}
+	if !strings.Contains(logs, "images/dind") {
+		t.Fatalf("the runner stopped without saying how to fix it:\n%s", logs)
+	}
+}

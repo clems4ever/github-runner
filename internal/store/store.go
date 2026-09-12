@@ -177,6 +177,10 @@ var migrations = []string{
 	)`,
 	`CREATE INDEX image_builds_pool ON image_builds(pool, id)`,
 	`CREATE INDEX image_builds_image ON image_builds(image, id)`,
+	// How a container pool's runners get a Docker daemon. 'none' for every
+	// pool that already exists, which is what they had: a container runner was
+	// given the runner and nothing to build images with.
+	`ALTER TABLE pools ADD COLUMN docker TEXT NOT NULL DEFAULT 'none'`,
 }
 
 // SampleRetention is how much history the daemon keeps. Two days covers "what
@@ -430,7 +434,7 @@ func (s *Store) DeleteCredential(ctx context.Context, id int64) error {
 // Pools
 // ---------------------------------------------------------------------------
 
-const poolColumns = `id, name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
+const poolColumns = `id, name, scope_kind, scope, runtime, nested, ephemeral, docker, min_replicas, max_replicas,
 	labels, cpus, memory_mb, disk_gb, image, packages, recipe, credential_id, enabled, created_at, updated_at`
 
 // execer is the part of the database both a connection and a transaction offer,
@@ -457,10 +461,10 @@ func insertPool(ctx context.Context, db execer, p model.Pool) (model.Pool, error
 	now := time.Now().UTC()
 	p.CreatedAt, p.UpdatedAt = now, now
 	res, err := db.ExecContext(ctx,
-		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, min_replicas, max_replicas,
+		`INSERT INTO pools (name, scope_kind, scope, runtime, nested, ephemeral, docker, min_replicas, max_replicas,
 			labels, cpus, memory_mb, disk_gb, image, packages, recipe, credential_id, enabled, created_at, updated_at, replicas)
-		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral,
+		 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral, string(p.Docker),
 		p.MinReplicas, p.MaxReplicas,
 		strings.Join(p.Labels, ","), p.CPUs, p.MemoryMB, p.DiskGB, p.Image,
 		strings.Join(p.Packages, ","), p.Recipe, p.CredentialID, p.Enabled,
@@ -497,12 +501,12 @@ func (s *Store) UpdatePool(ctx context.Context, p model.Pool) (model.Pool, error
 func updatePool(ctx context.Context, db execer, p model.Pool) error {
 	p.UpdatedAt = time.Now().UTC()
 	res, err := db.ExecContext(ctx,
-		`UPDATE pools SET name=?, scope_kind=?, scope=?, runtime=?, nested=?, ephemeral=?,
+		`UPDATE pools SET name=?, scope_kind=?, scope=?, runtime=?, nested=?, ephemeral=?, docker=?,
 			min_replicas=?, max_replicas=?, replicas=?,
 			labels=?, cpus=?, memory_mb=?, disk_gb=?, image=?, packages=?, recipe=?,
 			credential_id=?, enabled=?, updated_at=?
 		 WHERE id = ?`,
-		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral,
+		p.Name, string(p.ScopeKind), p.Scope, string(p.Runtime), p.Nested, p.Ephemeral, string(p.Docker),
 		p.MinReplicas, p.MaxReplicas, p.MaxReplicas,
 		strings.Join(p.Labels, ","), p.CPUs, p.MemoryMB, p.DiskGB, p.Image,
 		strings.Join(p.Packages, ","), p.Recipe, p.CredentialID, p.Enabled,
@@ -672,10 +676,11 @@ func scanPool(row scanner) (model.Pool, error) {
 	var (
 		p                  model.Pool
 		scopeKind, runtime string
+		docker             string
 		labels, packages   string
 		created, updated   string
 	)
-	err := row.Scan(&p.ID, &p.Name, &scopeKind, &p.Scope, &runtime, &p.Nested, &p.Ephemeral,
+	err := row.Scan(&p.ID, &p.Name, &scopeKind, &p.Scope, &runtime, &p.Nested, &p.Ephemeral, &docker,
 		&p.MinReplicas, &p.MaxReplicas, &labels, &p.CPUs, &p.MemoryMB, &p.DiskGB, &p.Image,
 		&packages, &p.Recipe, &p.CredentialID, &p.Enabled, &created, &updated)
 	if err != nil {
@@ -683,6 +688,7 @@ func scanPool(row scanner) (model.Pool, error) {
 	}
 	p.ScopeKind = model.ScopeKind(scopeKind)
 	p.Runtime = model.Runtime(runtime)
+	p.Docker = model.DockerAccess(docker)
 	if labels != "" {
 		p.Labels = strings.Split(labels, ",")
 	} else {

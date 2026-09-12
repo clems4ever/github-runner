@@ -5,6 +5,8 @@
 // token in local storage, and nothing here to steal from a compromised page.
 
 export type Runtime = 'vm' | 'container'
+/** How a container pool's runners get a Docker daemon. */
+export type DockerAccess = 'none' | 'dind'
 export type ScopeKind = 'repository' | 'organization'
 
 export interface Pool {
@@ -15,6 +17,11 @@ export interface Pool {
   runtime: Runtime
   nested: boolean
   ephemeral: boolean
+  /**
+   * How the runners get Docker. Machine pools have a daemon of their own and
+   * leave this at 'none'; a container has nothing until it is given something.
+   */
+  docker: DockerAccess
   /** What the pool falls back to when nothing is running. Never below one. */
   minReplicas: number
   /** The ceiling. Equal to the minimum, the pool is a fixed size. */
@@ -455,6 +462,7 @@ export function emptyPool(credentialId: number): Partial<Pool> {
     runtime: 'vm',
     nested: false,
     ephemeral: true,
+    docker: 'none',
     minReplicas: 1,
     maxReplicas: 1,
     labels: [],
@@ -516,6 +524,7 @@ export function effectiveLabels(pool: Partial<Pool>): string[] {
   add(pool.runtime === 'container' ? 'container' : 'vm')
   if (pool.nested) add('nestedvirt')
   if (pool.ephemeral) add('ephemeral')
+  if (pool.docker === 'dind') add('dind')
   ;(pool.labels ?? []).forEach(add)
   return out
 }

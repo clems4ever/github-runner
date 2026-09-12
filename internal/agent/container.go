@@ -10,6 +10,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/clems4ever/github-runner/internal/model"
 )
 
 // runnerHomes are where the actions runner is found in the images people use.
@@ -54,6 +56,28 @@ func runContainer(ctx context.Context, c Config, log *slog.Logger) error {
 		return err
 	}
 
+	// Who the runner runs as, and whether this process has to become them. A
+	// container with a daemon in it is started as root so that it can start
+	// one; everything after that is the account the image chose.
+	acct, err := runnerAccount(runnerHome)
+	if err != nil {
+		return err
+	}
+
+	if c.Docker == model.DockerDind {
+		// Before registration, not after: a runner that appears on GitHub and
+		// then finds it has no daemon takes a job it cannot run. Failing here
+		// means the pool has one runner fewer and says why, which is the
+		// failure somebody can act on.
+		stopDocker, err := startDocker(ctx, acct, log)
+		if err != nil {
+			return err
+		}
+		// After the runner has stopped, so the daemon outlives the job that is
+		// using it.
+		defer stopDocker()
+	}
+
 	token, err := registrationToken(ctx, c)
 	if err != nil {
 		return err
@@ -82,6 +106,7 @@ func runContainer(ctx context.Context, c Config, log *slog.Logger) error {
 	config := exec.CommandContext(ctx, "./config.sh", args...)
 	config.Dir = runnerHome
 	config.Stdout, config.Stderr = os.Stdout, os.Stderr
+	acct.apply(config, runnerHome)
 	if err := config.Run(); err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}
@@ -89,6 +114,7 @@ func runContainer(ctx context.Context, c Config, log *slog.Logger) error {
 	runner := exec.Command("./run.sh")
 	runner.Dir = runnerHome
 	runner.Stdout, runner.Stderr = os.Stdout, os.Stderr
+	acct.apply(runner, runnerHome)
 	if err := runner.Start(); err != nil {
 		return err
 	}
