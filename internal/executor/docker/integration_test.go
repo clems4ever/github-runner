@@ -259,7 +259,7 @@ func TestDindGivesTheRunnerAWorkingDaemon(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Minute)
 	for time.Now().Before(deadline) {
 		logs = logsOf(t, spec.Name)
-		if strings.Contains(logs, "registering") || strings.Contains(logs, "docker daemon") {
+		if settled(logs) {
 			break
 		}
 		time.Sleep(3 * time.Second)
@@ -269,8 +269,9 @@ func TestDindGivesTheRunnerAWorkingDaemon(t *testing.T) {
 		t.Fatalf("the daemon inside the runner never came up:\n%s", logs)
 	}
 	// And it came up before the runner registered, which is what keeps a pool
-	// from taking a job it cannot run.
-	if strings.Index(logs, "docker is ready") > strings.Index(logs, "registering") {
+	// from taking a job it cannot run. A runner that has not registered at all
+	// is not out of order: Index gives -1 for it, and every position beats -1.
+	if at := strings.Index(logs, "registering"); at >= 0 && strings.Index(logs, "docker is ready") > at {
 		t.Fatalf("the runner registered before it had a daemon:\n%s", logs)
 	}
 
@@ -282,6 +283,29 @@ func TestDindGivesTheRunnerAWorkingDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a job could not run a container inside its runner: %v: %s\nrunner log:\n%s", err, out, logs)
 	}
+}
+
+// settled reports whether the runner's log has got somewhere this test can
+// judge: the daemon answered, the runner carried on without one, or starting
+// it failed outright.
+//
+// Worth its own function because the obvious version of this loop is wrong.
+// "starting the docker daemon inside this runner" is printed before dockerd
+// has been asked for anything, so a loop that stops at the first mention of a
+// docker daemon reads the log while the daemon is still coming up, every time,
+// and then calls a daemon that was two seconds away one that never came.
+func settled(logs string) bool {
+	for _, reached := range []string{
+		"docker is ready",
+		"registering",
+		"the docker daemon stopped while starting up",
+		"did not answer within",
+	} {
+		if strings.Contains(logs, reached) {
+			return true
+		}
+	}
+	return false
 }
 
 // A runner whose image cannot run a daemon says so and stops, rather than
@@ -323,5 +347,22 @@ func TestDindRefusesAnImageWithoutTheDaemon(t *testing.T) {
 	}
 	if !strings.Contains(logs, "images/dind") {
 		t.Fatalf("the runner stopped without saying how to fix it:\n%s", logs)
+	}
+}
+
+// The start line is not a verdict.
+//
+// This is the failure that shipped in the first version of the test above,
+// and it costs a container build and five minutes to find out the hard way.
+func TestSettledDoesNotMistakeStartingForReady(t *testing.T) {
+	starting := `level=INFO msg="starting the docker daemon inside this runner"`
+	if settled(starting) {
+		t.Fatal("the log said the daemon was being started, and the test read that as an answer")
+	}
+	if !settled(starting + "\n" + `level=INFO msg="docker is ready"`) {
+		t.Fatal("the daemon answered and the test kept waiting")
+	}
+	if !settled(`level=ERROR msg="the docker daemon stopped while starting up: exit status 1"`) {
+		t.Fatal("the daemon died and the test kept waiting")
 	}
 }
