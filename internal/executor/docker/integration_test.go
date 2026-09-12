@@ -275,14 +275,10 @@ func TestDindGivesTheRunnerAWorkingDaemon(t *testing.T) {
 		t.Fatalf("the runner registered before it had a daemon:\n%s", logs)
 	}
 
-	// The job's half of it: whoever the runner runs as has to be able to reach
-	// the socket root created, and a container started through it has to run.
-	// docker exec enters as the image's own user, which is that account.
-	out, err := exec.Command("docker", "exec", spec.Name,
-		"docker", "run", "--rm", "hello-world").CombinedOutput()
-	if err != nil {
-		t.Fatalf("a job could not run a container inside its runner: %v: %s\nrunner log:\n%s", err, out, logs)
-	}
+	// What a job does with the daemon is the test below, on a runner that
+	// stays up. This one stops here: the token is deliberately not real, so
+	// GitHub refuses it, the runner exits and the container is gone within a
+	// second of the line just asserted.
 }
 
 // settled reports whether the runner's log has got somewhere this test can
@@ -306,6 +302,94 @@ func settled(logs string) bool {
 		}
 	}
 	return false
+}
+
+// buildStubRunnerImage builds the dind runner image with its registration and
+// its listener replaced by scripts that succeed.
+//
+// The runner above cannot be asked to do this. Its registration is refused —
+// the token is not real, which is how every integration test here avoids
+// needing a credential — and a runner whose registration is refused exits,
+// taking the daemon and the container with it. Everything a job would do with
+// the daemon happens after that point.
+//
+// Only config.sh and run.sh are replaced. The daemon, the account it is handed
+// to and the socket it creates are all still the ones images/dind produces.
+func buildStubRunnerImage(t *testing.T, base string) string {
+	t.Helper()
+	const tag = "runner-fleet-dind-stub:latest"
+	dockerfile := "FROM " + base + "\n" +
+		"USER root\n" +
+		"RUN printf '%s\\n' '#!/bin/sh' 'set -e' 'v=$(docker version --format {{.Server.Version}})' 'echo stub-config: docker says $v' > /home/runner/config.sh \\\n" +
+		" && printf '%s\\n' '#!/bin/sh' 'echo stub-runner: Listening for Jobs' 'sleep 900' > /home/runner/run.sh \\\n" +
+		" && chmod 0755 /home/runner/config.sh /home/runner/run.sh \\\n" +
+		" && chown runner /home/runner/config.sh /home/runner/run.sh\n" +
+		"USER runner\n"
+
+	build := exec.Command("docker", "build", "-t", tag, "-f", "-", t.TempDir())
+	build.Stdin = strings.NewReader(dockerfile)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the stub runner image: %v: %s", err, out)
+	}
+	return tag
+}
+
+// A job can run a container inside its own runner.
+//
+// Which is the point of the whole arrangement, and is four assumptions at
+// once: that root started the daemon, that the runner was put back on the
+// unprivileged account the image built it for, that the socket root created is
+// reachable from that account, and that a container started through it runs.
+//
+// The exec names the account, rather than letting it default. A dind container
+// is created with User=root — something has to start the daemon — so an exec
+// that says nothing enters as root, and root can reach any socket on the
+// machine. It would pass with the handover in startDocker deleted.
+func TestAJobCanRunAContainerInsideItsRunner(t *testing.T) {
+	e := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	spec := reconcile.Spec{
+		Name: "runner-fleet-dind-job", Pool: "integration", Generation: "test",
+		Runtime: model.RuntimeContainer, Docker: model.DockerDind,
+		URL:       "https://github.com/clems4ever/github-runner",
+		ScopeKind: model.ScopeRepository, Scope: "clems4ever/github-runner",
+		Labels: []string{"container", "dind"}, CPUs: 2, MemoryMB: 2048,
+		Image: buildStubRunnerImage(t, buildDindImage(t)), CredentialID: 1,
+		RegistrationToken: "AAAA-not-a-real-registration-token",
+	}
+	t.Cleanup(func() {
+		_ = e.Remove(context.Background(), spec.Name)
+	})
+
+	if err := e.Create(ctx, spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var logs string
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		logs = logsOf(t, spec.Name)
+		if strings.Contains(logs, "Listening for Jobs") || strings.Contains(logs, "registration failed") {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !strings.Contains(logs, "Listening for Jobs") {
+		t.Fatalf("the runner never got as far as waiting for a job:\n%s", logs)
+	}
+
+	// Registration ran as the unprivileged account and had a daemon already.
+	if !strings.Contains(logs, "stub-config: docker says") {
+		t.Fatalf("the runner could not reach the daemon while registering:\n%s", logs)
+	}
+
+	out, err := exec.Command("docker", "exec", "-u", "runner", spec.Name,
+		"docker", "run", "--rm", "hello-world").CombinedOutput()
+	if err != nil {
+		t.Fatalf("a job could not run a container inside its runner: %v: %s\nrunner log:\n%s", err, out, logs)
+	}
 }
 
 // A runner whose image cannot run a daemon says so and stops, rather than
