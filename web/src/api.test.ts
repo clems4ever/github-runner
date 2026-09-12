@@ -17,6 +17,13 @@ describe('effectiveLabels', () => {
     expect(effectiveLabels({ runtime: 'vm', labels: ['VM', 'custom'] })).toEqual(['vm', 'custom'])
   })
 
+  it('says when a container can build images', () => {
+    // runs-on: [self-hosted, dind] has to reach a pool that actually has a
+    // daemon in it, and only that.
+    expect(effectiveLabels({ runtime: 'container', docker: 'dind' })).toEqual(['container', 'dind'])
+    expect(effectiveLabels({ runtime: 'container', docker: 'none' })).toEqual(['container'])
+  })
+
   it('matches the daemon for a default pool', () => {
     // The editor shows this list before saving, so it has to agree with what
     // the daemon will do afterwards.

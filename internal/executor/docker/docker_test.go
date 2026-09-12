@@ -595,3 +595,95 @@ func TestUsageIsQuietWhenThereIsNoDocker(t *testing.T) {
 		t.Fatalf("got %v, %v", usage, err)
 	}
 }
+
+// A pool without docker in docker gets none of what one needs.
+//
+// The privileged flag is the whole of the boundary a container pool has left,
+// so it is worth a test that says out loud when it has been handed to a pool
+// that never asked.
+func TestCreateWithoutDindIsNotPrivileged(t *testing.T) {
+	e, fake := newExecutor(t)
+	if err := e.Create(context.Background(), testSpec("api-1")); err != nil {
+		t.Fatal(err)
+	}
+
+	body := fake.bodies["/containers/create"]
+	host, _ := body["HostConfig"].(map[string]any)
+	if _, ok := host["Privileged"]; ok {
+		t.Fatalf("a pool that did not ask for docker got a privileged container: %v", host)
+	}
+	if _, ok := body["Volumes"]; ok {
+		t.Fatalf("a pool that did not ask for docker got a daemon's storage: %v", body)
+	}
+	if body["User"] != nil {
+		t.Fatalf("a pool that did not ask for docker was started as %v rather than the image's own user", body["User"])
+	}
+	for _, entry := range body["Env"].([]any) {
+		if entry == "FLEET_DOCKER=dind" {
+			t.Fatal("the agent was told to start a daemon in a pool that asked for none")
+		}
+	}
+}
+
+// What a dind pool is made of, in one place.
+//
+// Each of these is load-bearing and none of them is obvious from the outside:
+// without the volume the daemon silently falls back to the vfs storage driver
+// and copies every layer of every image; without the private cgroup namespace
+// the job's containers land beside the runner's limits rather than inside
+// them; without root there is nothing that can start a daemon at all.
+func TestCreateWithDind(t *testing.T) {
+	e, fake := newExecutor(t)
+	spec := testSpec("api-1")
+	spec.Docker = model.DockerDind
+	if err := e.Create(context.Background(), spec); err != nil {
+		t.Fatal(err)
+	}
+
+	body := fake.bodies["/containers/create"]
+	host, _ := body["HostConfig"].(map[string]any)
+	if host["Privileged"] != true {
+		t.Fatalf("a dind runner cannot start a daemon without it: %v", host)
+	}
+	if host["CgroupnsMode"] != "private" {
+		t.Fatalf("cgroup namespace is %v, so a job's containers would escape the pool's limits", host["CgroupnsMode"])
+	}
+	if body["User"] != "root" {
+		t.Fatalf("user is %v, and nothing else can start a daemon", body["User"])
+	}
+	volumes, _ := body["Volumes"].(map[string]any)
+	if _, ok := volumes["/var/lib/docker"]; !ok {
+		t.Fatalf("the daemon has nowhere to keep its images but the container's overlay: %v", volumes)
+	}
+
+	var told bool
+	for _, entry := range body["Env"].([]any) {
+		if entry == "FLEET_DOCKER=dind" {
+			told = true
+		}
+	}
+	if !told {
+		t.Fatalf("the agent was never told to start a daemon: %v", body["Env"])
+	}
+
+	// The limits still apply. They are what contains a job's containers, since
+	// those are started inside this one.
+	if host["Memory"] != float64(4096*1024*1024) || host["NanoCpus"] != float64(2_000_000_000) {
+		t.Fatalf("a dind runner was let out of its pool's size: %v", host)
+	}
+}
+
+// The daemon's storage goes when the runner does.
+//
+// An anonymous volume per container is only cheap if it is removed with the
+// container; left behind, a fleet of ephemeral runners fills the host with the
+// image stores of runners that no longer exist.
+func TestRemoveTakesTheDaemonsStorageWithIt(t *testing.T) {
+	e, fake := newExecutor(t)
+	if err := e.Remove(context.Background(), "api-1"); err != nil {
+		t.Fatal(err)
+	}
+	if !fake.called("DELETE /containers/api-1?v=1") {
+		t.Fatalf("the volume was left on the host: %v", fake.requests)
+	}
+}

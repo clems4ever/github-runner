@@ -399,3 +399,78 @@ func TestDefaultsNormaliseARecipeAndSortThePackages(t *testing.T) {
 		t.Fatalf("the packages are %v, and what is stored should not depend on the order somebody typed", p.Packages)
 	}
 }
+
+// A pool that runs a daemon inside its runners says so in its labels, so a
+// workflow that builds images can ask for one — runs-on: [self-hosted, dind] —
+// rather than knowing which pools happen to be set up for it.
+func TestDindIsALabel(t *testing.T) {
+	p := validPool()
+	p.Runtime = RuntimeContainer
+	p.Nested = false
+	p.Ephemeral = false
+	p.Docker = DockerDind
+
+	got := strings.Join(p.EffectiveLabels(), ",")
+	if got != "container,dind" {
+		t.Fatalf("got %q, want the runner to say it can build images", got)
+	}
+}
+
+func TestNoDaemonIsNotLabelled(t *testing.T) {
+	p := validPool()
+	p.Runtime = RuntimeContainer
+	p.Docker = DockerNone
+	for _, label := range p.EffectiveLabels() {
+		if label == "dind" {
+			t.Fatal("a container with no daemon in it labelled itself dind")
+		}
+	}
+}
+
+// A machine already boots with a daemon of its own, installed in its image.
+// Accepting the field on a machine pool would mean one of two things, neither
+// of which is what it says: nothing at all, or a second daemon.
+func TestDindIsRefusedOnAMachinePool(t *testing.T) {
+	p := validPool()
+	p.Runtime = RuntimeVM
+	p.Docker = DockerDind
+	if err := p.Validate(); err == nil {
+		t.Fatal("a machine pool was allowed to ask for docker in docker")
+	}
+}
+
+func TestUnknownDockerAccessIsRefused(t *testing.T) {
+	p := validPool()
+	p.Runtime = RuntimeContainer
+	p.Docker = "socket"
+	if err := p.Validate(); err == nil {
+		t.Fatal("a pool asking for something nothing implements was accepted")
+	}
+}
+
+// Adding the field must not have changed what every pool already hashes to.
+// The generation decides which runners are replaced, so a field nobody set
+// that moved the hash would have drained every fleet on upgrade.
+func TestTheDefaultDockerAccessDoesNotChangeAGeneration(t *testing.T) {
+	p := validPool()
+	p.Docker = ""
+	before := p.Generation("fingerprint", "recipe")
+
+	p.Docker = DockerNone
+	if after := p.Generation("fingerprint", "recipe"); after != before {
+		t.Fatalf("generation moved from %q to %q for a pool nobody changed", before, after)
+	}
+}
+
+// Turning it on, on the other hand, is a different runner and has to replace
+// the ones that are running.
+func TestDindChangesAGeneration(t *testing.T) {
+	p := validPool()
+	p.Runtime = RuntimeContainer
+	before := p.Generation("fingerprint", "recipe")
+
+	p.Docker = DockerDind
+	if after := p.Generation("fingerprint", "recipe"); after == before {
+		t.Fatal("a pool that gained a docker daemon kept its old runners")
+	}
+}

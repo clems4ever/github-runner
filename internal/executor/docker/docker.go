@@ -158,6 +158,22 @@ func (e *Executor) Create(ctx context.Context, spec reconcile.Spec) error {
 		"HostConfig": e.hostConfig(spec),
 	}
 
+	if spec.Docker == model.DockerDind {
+		// A daemon has to be started before the runner is, and only root can
+		// start one. The agent drops back to the image's runner account before
+		// it registers anything, so the job still runs as whoever the image
+		// says — root here is the entrypoint's, not the job's.
+		config["User"] = "root"
+		// An anonymous volume for the daemon's own storage, and not a nicety:
+		// /var/lib/docker on the container's overlay filesystem cannot be
+		// overlay itself, so dockerd falls back to the vfs driver, which
+		// copies every layer of every image instead of sharing it. A pool that
+		// pulled a 2 GiB image would write it once per layer. The volume is a
+		// real filesystem, and goes when the container does — Remove asks for
+		// that with v=1.
+		config["Volumes"] = map[string]any{"/var/lib/docker": map[string]any{}}
+	}
+
 	var created struct {
 		ID string `json:"Id"`
 	}
@@ -187,6 +203,23 @@ func (e *Executor) hostConfig(spec reconcile.Spec) map[string]any {
 		"NanoCpus": int64(spec.CPUs) * 1_000_000_000,
 	}
 
+	if spec.Docker == model.DockerDind {
+		// Everything a daemon inside a container needs, and all of it is a
+		// hole: every capability, every device, no seccomp or apparmor filter
+		// between the job and the kernel. A job on a dind runner should be
+		// read as having root on this host. It is off unless a pool asks, the
+		// pool is refused unless it is a container pool, and the runner
+		// registers with a label that says what it is.
+		host["Privileged"] = true
+		// Its own cgroup namespace, so the daemon inside sees the container's
+		// limits as the root of the hierarchy and puts the job's containers
+		// underneath them. That is what keeps a job's containers inside the
+		// memory and processor share the pool was given, rather than beside
+		// it. It is the default on a cgroup v2 host; saying it means the same
+		// thing happens on a v1 one.
+		host["CgroupnsMode"] = "private"
+	}
+
 	if spec.Nested {
 		// Nested virtualisation in a container means handing the job the
 		// host's KVM device. It is a real hole in the boundary — far weaker
@@ -212,6 +245,9 @@ func env(spec reconcile.Spec, layout paths.Layout) []string {
 		"FLEET_LABELS=" + strings.Join(spec.Labels, ","),
 		fmt.Sprintf("FLEET_EPHEMERAL=%t", spec.Ephemeral),
 		fmt.Sprintf("FLEET_NESTED=%t", spec.Nested),
+		// What the agent should do about a daemon before it registers
+		// anything. Empty is "nothing", which is what a container was.
+		"FLEET_DOCKER=" + string(spec.Docker),
 		"FLEET_RUNTIME=container",
 		// What the runner registers with. Short-lived and single-purpose: the
 		// worst a job can do with it is register another runner, where the

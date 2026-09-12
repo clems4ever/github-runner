@@ -29,6 +29,29 @@ const (
 	RuntimeContainer Runtime = "container"
 )
 
+// DockerAccess is how a container runner gets a Docker daemon.
+//
+// A machine has one of its own — cloud-init installs it, and the guest's
+// kernel is the boundary around it. A container has nothing until it is given
+// something, which is why jobs that build images have needed a machine pool.
+type DockerAccess string
+
+const (
+	// DockerNone is a container with no Docker at all. Every job step that
+	// shells out to docker fails, which is what a container pool did before
+	// this field existed.
+	DockerNone DockerAccess = "none"
+	// DockerDind runs a daemon inside the runner's own container: its own
+	// image store, its own build cache, and job containers that are children
+	// of this one and so inside the limits the pool was given.
+	//
+	// It costs a privileged container. The kernel is the host's and the
+	// capabilities are all of them, so a job in a dind pool should be read as
+	// having root on the host — closer to the socket than to a machine. The
+	// label says so, and a pool has to ask.
+	DockerDind DockerAccess = "dind"
+)
+
 // ScopeKind is where the runner registers.
 type ScopeKind string
 
@@ -123,6 +146,9 @@ type Pool struct {
 	Runtime   Runtime   `json:"runtime"`
 	Nested    bool      `json:"nested"`
 	Ephemeral bool      `json:"ephemeral"`
+	// Docker is how a container pool's runners get a Docker daemon. Machine
+	// pools have one already and leave this at none.
+	Docker DockerAccess `json:"docker"`
 	// MinReplicas is what the pool falls back to when nothing is running, and
 	// is never below one: a pool with no runner at all cannot accept a job, and
 	// so can never discover that it needs more.
@@ -225,6 +251,13 @@ func (p *Pool) EffectiveLabels() []string {
 	if p.Ephemeral {
 		add("ephemeral")
 	}
+	if p.Docker == DockerDind {
+		// A workflow that builds an image has to be able to ask for a runner
+		// that can. Without this it would have to know which pools happen to
+		// be configured for it, which is exactly the drift the automatic
+		// labels exist to prevent.
+		add("dind")
+	}
 	for _, label := range p.Labels {
 		add(label)
 	}
@@ -310,6 +343,14 @@ func (p *Pool) Generation(credentialFingerprint, recipe string) string {
 		recipe,
 		credentialFingerprint,
 	)
+	// Only when it is something, so that adding this field did not change what
+	// every pool on every host already hashes to and drain a fleet that had
+	// not asked for anything. A pool that turns it on is a different runner
+	// and hashes differently — and would even without this line, since the
+	// dind label is in the join above.
+	if p.Docker != "" && p.Docker != DockerNone {
+		write(string(p.Docker))
+	}
 	return hex.EncodeToString(h.Sum(nil))[:12]
 }
 
@@ -341,6 +382,19 @@ func (p *Pool) Validate() error {
 	case RuntimeVM, RuntimeContainer:
 	default:
 		return fmt.Errorf("runtime %q: want %q or %q", p.Runtime, RuntimeVM, RuntimeContainer)
+	}
+
+	switch p.Docker {
+	case DockerNone, "":
+	case DockerDind:
+		// A machine already runs a daemon of its own, installed in its image.
+		// Asking for one here would either mean nothing or mean something
+		// different from what it says, and both are worse than being refused.
+		if p.Runtime != RuntimeContainer {
+			return fmt.Errorf("docker %q is for container pools: a machine boots with a daemon of its own", p.Docker)
+		}
+	default:
+		return fmt.Errorf("docker %q: want %q or %q", p.Docker, DockerNone, DockerDind)
 	}
 
 	// One, not zero. A pool has to keep a runner able to accept work, or
@@ -399,6 +453,9 @@ func (p *Pool) Validate() error {
 func (p *Pool) Defaults() {
 	if p.Runtime == "" {
 		p.Runtime = RuntimeVM
+	}
+	if p.Docker == "" {
+		p.Docker = DockerNone
 	}
 	if p.MinReplicas < 1 {
 		p.MinReplicas = 1

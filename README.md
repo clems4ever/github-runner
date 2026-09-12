@@ -8,8 +8,9 @@ host, with a web UI to configure it.
 
 Each runner is a throwaway QEMU virtual machine or a Docker container. Per pool
 you choose the repository or organisation, the runtime, whether jobs get
-`/dev/kvm`, whether runners are ephemeral, what labels they register with, how
-big they are — and how far the pool may scale itself when work arrives.
+`/dev/kvm`, whether a container runs a Docker daemon of its own, whether runners
+are ephemeral, what labels they register with, how big they are — and how far
+the pool may scale itself when work arrives.
 
 **Upgrading the daemon does not touch the runners.** It supervises nothing: the
 runners are systemd units and Docker containers of their own, and the daemon
@@ -65,6 +66,7 @@ A pool named `web` with a maximum of three gives you `web-1`, `web-2` and
 | **Scope** | one repository, or an organisation whose repositories all share the runners |
 | **Runtime** | a virtual machine per job, or a container |
 | **Nested virtualisation** | whether jobs get `/dev/kvm` and can boot machines of their own |
+| **Docker** | for container pools, whether each runner carries a daemon of its own; a machine already has one |
 | **Ephemeral** | take one job, then be replaced by a clean runner |
 | **Minimum runners** | what the pool keeps up when nothing is running, at least one |
 | **Maximum runners** | how far it may grow under load; equal to the minimum for a fixed size |
@@ -73,8 +75,8 @@ A pool named `web` with a maximum of three gives you `web-1`, `web-2` and
 | **Image** | for VM pools, what is baked into it: extra packages and a recipe |
 
 Every runner also registers with labels describing what it is — `vm` or
-`container`, plus `nestedvirt` and `ephemeral` when they apply — so a workflow
-can ask for what it needs:
+`container`, plus `nestedvirt`, `ephemeral` and `dind` when they apply — so a
+workflow can ask for what it needs:
 
 ```yaml
 jobs:
@@ -461,6 +463,53 @@ Container images are expected to carry the GitHub Actions runner. The official
 `ghcr.io/actions/actions-runner` works as it is; a custom image is found by
 looking for `config.sh`, or told where to look with `FLEET_RUNNER_HOME`.
 
+### Docker in a container pool
+
+A machine boots a Docker daemon of its own, which is why a pool whose jobs
+build images has had to be a machine pool: a container had the runner and
+nothing else, and every step that shelled out to `docker` failed.
+
+**Docker in Docker** gives a container pool one too. Each runner starts a
+daemon inside its own container, before it registers, and the job talks to
+that: its own image store, its own build cache, and job containers that are
+children of the runner's — so the memory and processor the pool was given are
+the limits the job's containers run inside, rather than limits it can step
+around by starting a container beside itself.
+
+It is a **privileged container**, and that is the whole of the trade. Every
+capability, no seccomp or apparmor filter, the host's kernel underneath: a job
+on a dind runner should be read as having root on this host. That is a weaker
+position than a machine and about the same as handing the job the host's Docker
+socket — which is why this is off unless a pool asks, refused on machine pools,
+and registered as the `dind` label so a workflow says what it is asking for:
+
+```yaml
+jobs:
+  image:
+    runs-on: [self-hosted, dind]
+```
+
+**The image has to carry the daemon.** `ghcr.io/actions/actions-runner` ships
+the whole static Docker bundle, `dockerd` included, on a base with no
+`iptables` — so the daemon starts, fails to build its network, and exits a few
+seconds in. A runner that finds either missing says so and stops rather than
+registering and taking a job it cannot run.
+[`images/dind/Dockerfile`](images/dind/Dockerfile) adds what is missing to the
+stock image; build it, push it, and name it in the pool's image field.
+
+Two things are worth knowing before moving a pool over:
+
+- **Nothing is shared between runners.** Each daemon's storage is an anonymous
+  volume that goes when the container does, so every job pulls its base images
+  and builds its layers again. That is the same bargain a machine pool makes,
+  and it can cost more than the boot it saves. A pool that builds the same
+  images repeatedly wants a warm cache somewhere: `docker buildx` against a
+  shared builder, or a registry cache, rather than the daemon's own store.
+- **Container pools are outside the fleet budget.** The budget is a systemd
+  slice, and containers are not in it — so a dind pool's growth is not rationed
+  against the ceiling on the Settings page, and the pool's own size is what
+  limits it.
+
 ## How the daemon works
 
 It is a reconciler. The database holds what you asked for; systemd and Docker
@@ -559,6 +608,10 @@ gracefully, as each finishes the job it is on.
   public one, a pull request from a fork can run arbitrary code on the runner.
   A VM is a much harder boundary than a container, and ephemeral runners give
   each job a clean machine.
+- A container pool with **Docker in Docker** is a privileged container, and a
+  job on one should be read as having root on the host. It is the fastest way
+  to give a job docker and the weakest: a machine pool is where a job that
+  builds images and cannot be trusted with the host belongs.
 
 ## Layout on the host
 

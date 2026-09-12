@@ -204,3 +204,249 @@ func inTheImage(command string) (string, error) {
 		DefaultImage, "-lc", command).CombinedOutput()
 	return string(out), err
 }
+
+// buildDindImage builds the runner image that can run a daemon of its own, out
+// of the Dockerfile this repository ships.
+//
+// Built here rather than pulled from somewhere, because the thing being
+// checked is that file: the stock image carries dockerd and no iptables, and
+// the way that fails — the daemon exits a few seconds in, complaining about a
+// network controller — is exactly the failure nobody debugging a pool of
+// restarting runners would attribute to a missing package.
+func buildDindImage(t *testing.T) string {
+	t.Helper()
+	const tag = "runner-fleet-dind-integration:latest"
+	build := exec.Command("docker", "build", "-t", tag, "../../../images/dind")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the dind runner image: %v: %s", err, out)
+	}
+	return tag
+}
+
+// Docker in Docker, from the Dockerfile to a job container.
+//
+// The unit tests beside this one assert the request the executor sends, which
+// is the half that can be checked against its author's assumptions. This is
+// the other half, and every line of it is an assumption that was wrong once:
+// that the image has what the daemon needs, that root can start it, that the
+// socket it creates can be reached by the account the runner was dropped back
+// to, and that a container started inside is a container that runs.
+func TestDindGivesTheRunnerAWorkingDaemon(t *testing.T) {
+	e := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	spec := reconcile.Spec{
+		Name: "runner-fleet-dind-integration", Pool: "integration", Generation: "test",
+		Runtime: model.RuntimeContainer, Docker: model.DockerDind,
+		URL:       "https://github.com/clems4ever/github-runner",
+		ScopeKind: model.ScopeRepository, Scope: "clems4ever/github-runner",
+		Labels: []string{"container", "dind"}, CPUs: 2, MemoryMB: 2048,
+		Image: buildDindImage(t), CredentialID: 1,
+		// Not a real token, for the same reason as the test above: GitHub
+		// refusing it is how far this needs to get.
+		RegistrationToken: "AAAA-not-a-real-registration-token",
+	}
+	t.Cleanup(func() {
+		_ = e.Remove(context.Background(), spec.Name)
+	})
+
+	if err := e.Create(ctx, spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var logs string
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		logs = logsOf(t, spec.Name)
+		if settled(logs) {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	if !strings.Contains(logs, "docker is ready") {
+		t.Fatalf("the daemon inside the runner never came up:\n%s", logs)
+	}
+	// And it came up before the runner registered, which is what keeps a pool
+	// from taking a job it cannot run. A runner that has not registered at all
+	// is not out of order: Index gives -1 for it, and every position beats -1.
+	if at := strings.Index(logs, "registering"); at >= 0 && strings.Index(logs, "docker is ready") > at {
+		t.Fatalf("the runner registered before it had a daemon:\n%s", logs)
+	}
+
+	// What a job does with the daemon is the test below, on a runner that
+	// stays up. This one stops here: the token is deliberately not real, so
+	// GitHub refuses it, the runner exits and the container is gone within a
+	// second of the line just asserted.
+}
+
+// settled reports whether the runner's log has got somewhere this test can
+// judge: the daemon answered, the runner carried on without one, or starting
+// it failed outright.
+//
+// Worth its own function because the obvious version of this loop is wrong.
+// "starting the docker daemon inside this runner" is printed before dockerd
+// has been asked for anything, so a loop that stops at the first mention of a
+// docker daemon reads the log while the daemon is still coming up, every time,
+// and then calls a daemon that was two seconds away one that never came.
+func settled(logs string) bool {
+	for _, reached := range []string{
+		"docker is ready",
+		"registering",
+		"the docker daemon stopped while starting up",
+		"did not answer within",
+	} {
+		if strings.Contains(logs, reached) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildStubRunnerImage builds the dind runner image with its registration and
+// its listener replaced by scripts that succeed.
+//
+// The runner above cannot be asked to do this. Its registration is refused —
+// the token is not real, which is how every integration test here avoids
+// needing a credential — and a runner whose registration is refused exits,
+// taking the daemon and the container with it. Everything a job would do with
+// the daemon happens after that point.
+//
+// Only config.sh and run.sh are replaced. The daemon, the account it is handed
+// to and the socket it creates are all still the ones images/dind produces.
+func buildStubRunnerImage(t *testing.T, base string) string {
+	t.Helper()
+	const tag = "runner-fleet-dind-stub:latest"
+	dockerfile := "FROM " + base + "\n" +
+		"USER root\n" +
+		"RUN printf '%s\\n' '#!/bin/sh' 'set -e' 'v=$(docker version --format {{.Server.Version}})' 'echo stub-config: docker says $v' > /home/runner/config.sh \\\n" +
+		" && printf '%s\\n' '#!/bin/sh' 'echo stub-runner: Listening for Jobs' 'sleep 900' > /home/runner/run.sh \\\n" +
+		" && chmod 0755 /home/runner/config.sh /home/runner/run.sh \\\n" +
+		" && chown runner /home/runner/config.sh /home/runner/run.sh\n" +
+		"USER runner\n"
+
+	build := exec.Command("docker", "build", "-t", tag, "-f", "-", t.TempDir())
+	build.Stdin = strings.NewReader(dockerfile)
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the stub runner image: %v: %s", err, out)
+	}
+	return tag
+}
+
+// A job can run a container inside its own runner.
+//
+// Which is the point of the whole arrangement, and is four assumptions at
+// once: that root started the daemon, that the runner was put back on the
+// unprivileged account the image built it for, that the socket root created is
+// reachable from that account, and that a container started through it runs.
+//
+// The exec names the account, rather than letting it default. A dind container
+// is created with User=root — something has to start the daemon — so an exec
+// that says nothing enters as root, and root can reach any socket on the
+// machine. It would pass with the handover in startDocker deleted.
+func TestAJobCanRunAContainerInsideItsRunner(t *testing.T) {
+	e := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	spec := reconcile.Spec{
+		Name: "runner-fleet-dind-job", Pool: "integration", Generation: "test",
+		Runtime: model.RuntimeContainer, Docker: model.DockerDind,
+		URL:       "https://github.com/clems4ever/github-runner",
+		ScopeKind: model.ScopeRepository, Scope: "clems4ever/github-runner",
+		Labels: []string{"container", "dind"}, CPUs: 2, MemoryMB: 2048,
+		Image: buildStubRunnerImage(t, buildDindImage(t)), CredentialID: 1,
+		RegistrationToken: "AAAA-not-a-real-registration-token",
+	}
+	t.Cleanup(func() {
+		_ = e.Remove(context.Background(), spec.Name)
+	})
+
+	if err := e.Create(ctx, spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var logs string
+	deadline := time.Now().Add(5 * time.Minute)
+	for time.Now().Before(deadline) {
+		logs = logsOf(t, spec.Name)
+		if strings.Contains(logs, "Listening for Jobs") || strings.Contains(logs, "registration failed") {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !strings.Contains(logs, "Listening for Jobs") {
+		t.Fatalf("the runner never got as far as waiting for a job:\n%s", logs)
+	}
+
+	// Registration ran as the unprivileged account and had a daemon already.
+	if !strings.Contains(logs, "stub-config: docker says") {
+		t.Fatalf("the runner could not reach the daemon while registering:\n%s", logs)
+	}
+
+	out, err := exec.Command("docker", "exec", "-u", "runner", spec.Name,
+		"docker", "run", "--rm", "hello-world").CombinedOutput()
+	if err != nil {
+		t.Fatalf("a job could not run a container inside its runner: %v: %s\nrunner log:\n%s", err, out, logs)
+	}
+}
+
+// A runner whose image cannot run a daemon says so and stops, rather than
+// registering and taking a job that will fail on its first docker step.
+func TestDindRefusesAnImageWithoutTheDaemon(t *testing.T) {
+	e := requireDocker(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	spec := reconcile.Spec{
+		Name: "runner-fleet-dind-unfit", Pool: "integration", Generation: "test",
+		Runtime: model.RuntimeContainer, Docker: model.DockerDind,
+		URL:       "https://github.com/clems4ever/github-runner",
+		ScopeKind: model.ScopeRepository, Scope: "clems4ever/github-runner",
+		Labels: []string{"container", "dind"}, CPUs: 2, MemoryMB: 2048,
+		Image: DefaultImage, CredentialID: 1,
+		RegistrationToken: "AAAA-not-a-real-registration-token",
+	}
+	t.Cleanup(func() {
+		_ = e.Remove(context.Background(), spec.Name)
+	})
+
+	if err := e.Create(ctx, spec); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	var logs string
+	deadline := time.Now().Add(4 * time.Minute)
+	for time.Now().Before(deadline) {
+		logs = logsOf(t, spec.Name)
+		if strings.Contains(logs, "docker in docker") || strings.Contains(logs, "registering") {
+			break
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	if strings.Contains(logs, "registering") {
+		t.Fatalf("a runner with no usable daemon registered anyway:\n%s", logs)
+	}
+	if !strings.Contains(logs, "images/dind") {
+		t.Fatalf("the runner stopped without saying how to fix it:\n%s", logs)
+	}
+}
+
+// The start line is not a verdict.
+//
+// This is the failure that shipped in the first version of the test above,
+// and it costs a container build and five minutes to find out the hard way.
+func TestSettledDoesNotMistakeStartingForReady(t *testing.T) {
+	starting := `level=INFO msg="starting the docker daemon inside this runner"`
+	if settled(starting) {
+		t.Fatal("the log said the daemon was being started, and the test read that as an answer")
+	}
+	if !settled(starting + "\n" + `level=INFO msg="docker is ready"`) {
+		t.Fatal("the daemon answered and the test kept waiting")
+	}
+	if !settled(`level=ERROR msg="the docker daemon stopped while starting up: exit status 1"`) {
+		t.Fatal("the daemon died and the test kept waiting")
+	}
+}
