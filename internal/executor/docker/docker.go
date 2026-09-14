@@ -201,6 +201,31 @@ func (e *Executor) hostConfig(spec reconcile.Spec) map[string]any {
 		},
 		"Memory":   int64(spec.MemoryMB) * 1024 * 1024,
 		"NanoCpus": int64(spec.CPUs) * 1_000_000_000,
+		// An init process, so something in here reaps.
+		//
+		// Without it PID 1 is the agent, and PID 1 is where every orphan in
+		// the container ends up. A job that kills a wrapper — `npm run dev`,
+		// a shell that backgrounds something, anything that leaves a
+		// grandchild — orphans that grandchild, and when it dies nothing
+		// collects it. The zombie keeps its pid for the rest of the job.
+		//
+		// That is not a leak worth a line of its own; it is that the pid
+		// ANSWERS. `kill(pid, 0)` succeeds on a zombie and /proc/<pid>/stat
+		// still has its start time, so every "is it still running" check a
+		// job might make reads a process that exited as one that is alive. On
+		// a machine runner systemd reaps within milliseconds and the question
+		// never arises, so what a job sees depends on which runtime it landed
+		// on — which is the one thing a pool is supposed not to do.
+		//
+		// Found from a test in runyard-ai/workspace that stops a service and
+		// waits for its children to go: green on the VM pool for months, and
+		// it waited out its full ten-second budget the first time it ran in a
+		// container.
+		//
+		// This is dockerd's own `--init`: it runs a tini that reaps orphans
+		// and forwards signals, with the agent as its child. `docker stop`
+		// still reaches the agent, which still drains the runner.
+		"Init": true,
 	}
 
 	if spec.Docker == model.DockerDind {

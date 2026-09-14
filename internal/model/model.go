@@ -291,6 +291,9 @@ func (p *Pool) EffectiveLabels() []string {
 //	5  machines are booted with a balloon that reports free pages, so guest
 //	   memory a job has finished with goes back to the host — a machine built
 //	   before this holds its high-water mark until it is replaced
+//	6  containers are created with an init process, so a job's orphans are
+//	   reaped — in one built before this, PID 1 is the agent and a zombie
+//	   keeps answering every check a job makes about whether it is running
 //
 // It should need bumping less often now. The recipe is in the generation above,
 // so a release that changes how runners are built says so by itself; this is
@@ -303,7 +306,13 @@ func (p *Pool) EffectiveLabels() []string {
 // ephemeral that resolves itself within a job or two — but "within a job or
 // two" is not the same as "on an idle host", where the machines waiting for
 // work are exactly the ones that would sit unfixed indefinitely.
-const SpecRevision = 5
+//
+// Revision 6 is the same shape for the other runtime. A container's HostConfig
+// is built by this daemon rather than configured by an operator, so it is not
+// in the generation hash: a container created without an init hashes exactly
+// like one created with it, and an idle pool would keep its old runners and
+// keep handing jobs a PID 1 that reaps nothing.
+const SpecRevision = 6
 
 // Generation is a hash of everything a runner is built from. The reconciler
 // stamps it on each runner it creates and compares it later: a runner whose
