@@ -165,6 +165,17 @@ func TestCreate(t *testing.T) {
 	if host["NanoCpus"] != float64(2_000_000_000) {
 		t.Fatalf("cpu limit is %v", host["NanoCpus"])
 	}
+	// Something has to reap. PID 1 in here would otherwise be the agent, and
+	// PID 1 is where a job's orphans land: a zombie keeps its pid, answers
+	// `kill(pid, 0)` and keeps its start time in /proc, so a job's own "is it
+	// still running" check reads a process that exited as one that is alive.
+	// A machine runner has systemd and never shows this, which is the part
+	// that makes it worth a test — the bug is a difference BETWEEN runtimes.
+	if host["Init"] != true {
+		t.Fatalf("no init process: a job's orphans would never be reaped, and a "+
+			"zombie answers every check a job makes about whether it is still "+
+			"running (HostConfig was %v)", host)
+	}
 }
 
 // The credential never enters a container.

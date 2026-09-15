@@ -463,6 +463,16 @@ Container images are expected to carry the GitHub Actions runner. The official
 `ghcr.io/actions/actions-runner` works as it is; a custom image is found by
 looking for `config.sh`, or told where to look with `FLEET_RUNNER_HOME`.
 
+Containers are created with Docker's own init (`--init`), so something in there
+reaps. Without it PID 1 is the agent, and PID 1 is where a job's orphans land —
+kill a wrapper like `npm run dev` and its grandchild is orphaned, and when that
+dies nothing collects it. The problem is not the leak; it is that a zombie
+**answers**: `kill(pid, 0)` succeeds on one and `/proc/<pid>/stat` still holds
+its start time, so a job's own "is it still running" check reads a process that
+exited as one that is alive. A machine runner has systemd and never shows this,
+which is the worst version of it — what a job sees would depend on which
+runtime it happened to land on.
+
 ### Docker in a container pool
 
 A machine boots a Docker daemon of its own, which is why a pool whose jobs
