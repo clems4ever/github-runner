@@ -504,6 +504,15 @@ the whole static Docker bundle, `dockerd` included, on a base with no
 `iptables` — so the daemon starts, fails to build its network, and exits a few
 seconds in. A runner that finds either missing says so and stops rather than
 registering and taking a job it cannot run.
+[`images/ci/Dockerfile`](images/ci/Dockerfile) is that image plus the toolchains
+a CI pool's jobs would otherwise install on every run — a compiler, `make`, the
+`docker compose` plugin, and Go and Node seeded into the runner's tool cache so
+`actions/setup-go` and `actions/setup-node` find them instead of downloading.
+`images/ci/build.sh` builds it, checks inside it that each of those is really
+there, and pushes it where a pool can name it. Measured on runyard-ai/workspace
+before it existed: 17s of `apt-get gcc` and 8s of toolchain download in every
+job that needed them.
+
 [`images/dind/Dockerfile`](images/dind/Dockerfile) adds what is missing to the
 stock image; build it, push it, and name it in the pool's image field.
 
