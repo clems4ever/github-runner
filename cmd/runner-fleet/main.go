@@ -19,8 +19,6 @@ import (
 
 	"github.com/clems4ever/github-runner/internal/agent"
 	"github.com/clems4ever/github-runner/internal/paths"
-	"github.com/clems4ever/github-runner/internal/secrets"
-	"github.com/clems4ever/github-runner/internal/store"
 )
 
 // version is stamped in at build time by goreleaser.
@@ -54,6 +52,8 @@ func run(args []string) error {
 		return agentCommand(args)
 	case "passwd":
 		return passwdCommand(args)
+	case "apikey", "apikeys":
+		return apikeyCommand(args)
 	case "version":
 		fmt.Println(version)
 		return nil
@@ -74,6 +74,9 @@ Usage:
   runner-fleet agent --name NAME be one runner; this is what a unit or a
                                  container runs, not something to run by hand
   runner-fleet passwd [flags]    set the web UI's user and password
+  runner-fleet apikey create|list|revoke
+                                 manage the keys other programs call the API
+                                 with, for a host with no browser on it
   runner-fleet version
 
 Flags for serve:
@@ -90,6 +93,16 @@ Flags for passwd:
   --password VALUE   the password; read from stdin when not given, so it does
                      not reach the process list or the shell history
   --root DIR         as above
+
+Flags for apikey create:
+  --name NAME        what the key is for
+  --scope SCOPE      read (the default) or admin. A read key may only GET
+  --expires-days N   expire after N days; omitted, it never expires
+  --root DIR         as above
+
+  The key is printed once, on stdout, and cannot be recovered afterwards: the
+  daemon keeps only a hash of it. No key can read or create another, nor change
+  the web password.
 
 Environment:
   RUNNER_FLEET_ROOT  same as --root
@@ -128,17 +141,7 @@ func passwdCommand(args []string) error {
 		return err
 	}
 
-	layout := layoutFor(*root)
-	// Setting a password creates nothing the runners read, so it hands nothing
-	// over: the daemon does that when it starts.
-	if err := layout.EnsureDirs(paths.CurrentOwner()); err != nil {
-		return err
-	}
-	ring, err := secrets.LoadOrCreateKey(layout.MasterKey())
-	if err != nil {
-		return err
-	}
-	db, err := store.Open(layout.Database(), ring)
+	db, err := openStore(*root)
 	if err != nil {
 		return err
 	}

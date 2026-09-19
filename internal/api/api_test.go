@@ -98,6 +98,7 @@ func (i *stubImages) Rebuild(ctx context.Context, pool model.Pool) (imagebuild.B
 type harness struct {
 	t           *testing.T
 	server      *httptest.Server
+	srv         *Server
 	store       *store.Store
 	fleet       *stubFleet
 	nudges      int
@@ -136,6 +137,7 @@ func newHarness(t *testing.T) *harness {
 	if err := srv.Auth().SetPassword(context.Background(), "admin", "correct-horse"); err != nil {
 		t.Fatal(err)
 	}
+	h.srv = srv
 	h.server = httptest.NewServer(srv.Handler())
 	t.Cleanup(h.server.Close)
 

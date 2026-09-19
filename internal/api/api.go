@@ -46,6 +46,12 @@ type Store interface {
 	CreateCredential(ctx context.Context, credential model.Credential, secret string) (model.Credential, error)
 	ReplaceCredentialSecret(ctx context.Context, id int64, secret string) error
 	DeleteCredential(ctx context.Context, id int64) error
+	// KeyStore is what verifying a presented api key needs, on every call; the
+	// three below are what managing them needs, which only the operator may do.
+	KeyStore
+	ListAPIKeys(ctx context.Context) ([]model.APIKey, error)
+	CreateAPIKey(ctx context.Context, key model.APIKey) (model.APIKey, string, error)
+	DeleteAPIKey(ctx context.Context, id int64) error
 }
 
 // Fleet is what the API needs from the reconciler.
@@ -84,6 +90,7 @@ type Server struct {
 	resources Resources
 	images    Images
 	auth      *Authenticator
+	keys      *keyAuth
 	ui        fs.FS
 	version   string
 	check     CheckAccess
@@ -122,6 +129,7 @@ func New(opts Options) *Server {
 		resources: opts.Resources,
 		images:    opts.Images,
 		auth:      NewAuthenticator(opts.Store),
+		keys:      newKeyAuth(opts.Store),
 		ui:        opts.UI,
 		version:   opts.Version,
 		nudge:     opts.Nudge,
@@ -160,6 +168,9 @@ func (s *Server) Handler() http.Handler {
 	api.HandleFunc("POST /api/credentials", s.createCredential)
 	api.HandleFunc("PUT /api/credentials/{id}/secret", s.rotateCredential)
 	api.HandleFunc("DELETE /api/credentials/{id}", s.deleteCredential)
+	api.HandleFunc("GET /api/api-keys", s.listAPIKeys)
+	api.HandleFunc("POST /api/api-keys", s.createAPIKey)
+	api.HandleFunc("DELETE /api/api-keys/{id}", s.deleteAPIKey)
 	api.HandleFunc("PUT /api/settings/auth", s.setPassword)
 	api.HandleFunc("PUT /api/settings/budget", s.setBudget)
 	api.HandleFunc("GET /api/settings", s.getSettings)
@@ -168,9 +179,56 @@ func (s *Server) Handler() http.Handler {
 	// Health is the one route without authentication: it says whether the
 	// daemon is up, and nothing about the fleet.
 	root.HandleFunc("GET /api/health", s.health)
-	root.Handle("/api/", s.auth.Middleware(api))
+	root.Handle("/api/", s.authenticate(api))
+	// The UI stays password-only. A key is for calling the API, and letting one
+	// fetch the app shell would only mean a leaked key could be used to sit in a
+	// browser looking at the fleet.
 	root.Handle("/", s.auth.Middleware(s.uiHandler()))
 	return securityHeaders(root)
+}
+
+// authenticate lets a request in, as a person or as a machine.
+//
+// A key first, because a request carrying one is saying what it is: it wants a
+// flat answer, not a browser's login box. Anything else falls through to the
+// password, so the UI and every existing client are untouched by this.
+func (s *Server) authenticate(next http.Handler) http.Handler {
+	// Built once rather than per request: the middleware closes over the
+	// handler, not over anything belonging to a call.
+	byPassword := s.auth.Middleware(next)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		presented, ok := bearer(r)
+		if !ok {
+			byPassword.ServeHTTP(w, r)
+			return
+		}
+
+		key, err := s.keys.verify(r.Context(), presented)
+		if err != nil {
+			// Bearer rather than Basic in the challenge, so a browser that
+			// somehow lands here shows the error instead of asking for a
+			// password that would not help.
+			w.Header().Set("WWW-Authenticate", `Bearer realm="runner-fleet"`)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+			return
+		}
+
+		if keysRefused(r.URL.Path) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": "api keys cannot manage keys or the web password; sign in as the operator for that",
+			})
+			return
+		}
+		if !scopeAllows(key.Scope, r.Method) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": "this api key is read-only",
+			})
+			return
+		}
+
+		next.ServeHTTP(w, withPrincipal(r, principal{Key: &key}))
+	})
 }
 
 // securityHeaders are the ones that matter for a single-page app served over a
@@ -877,23 +935,89 @@ func (s *Server) deleteCredential(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Settings
+// API keys
 // ---------------------------------------------------------------------------
+//
+// Every route here is refused to an api key, whatever its scope — see
+// keysRefused. Only the operator, with their password, manages keys.
 
-func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
-	user, err := s.store.Setting(r.Context(), SettingAuthUser)
+func (s *Server) listAPIKeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := s.store.ListAPIKeys(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, keys)
+}
+
+func (s *Server) createAPIKey(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name  string `json:"name"`
+		Scope string `json:"scope"`
+		// ExpiresAt is optional: absent is a key that never expires.
+		ExpiresAt *time.Time `json:"expiresAt"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	scope := model.APIKeyScope(body.Scope)
+	if scope == "" {
+		// The lesser of the two when nothing was asked for. A caller who wanted
+		// to change the fleet has to say so.
+		scope = model.APIKeyRead
+	}
+	created, secret, err := s.store.CreateAPIKey(r.Context(), model.APIKey{
+		Name: body.Name, Scope: scope, ExpiresAt: body.ExpiresAt,
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	// The only time the key is ever in a response. It is not stored in a form
+	// anything can recover, so a client that loses it has to make another.
+	writeJSON(w, http.StatusCreated, map[string]any{"apiKey": created, "secret": secret})
+}
+
+func (s *Server) deleteAPIKey(w http.ResponseWriter, r *http.Request) {
+	id, err := pathID(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.store.DeleteAPIKey(r.Context(), id); err != nil {
+		writeError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+func (s *Server) getSettings(w http.ResponseWriter, r *http.Request) {
 	budget, err := s.budget(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"authUser": user, "version": s.version, "budget": budget,
-	})
+	body := map[string]any{"version": s.version, "budget": budget}
+
+	// The operator's user name is for the operator. It is half of the one
+	// credential an api key may not touch, and a key has no business learning
+	// what to guess a password against — so the field is left out entirely
+	// rather than blanked, which a client could not tell from a daemon that has
+	// no password set.
+	if principalOf(r).Human() {
+		user, err := s.store.Setting(r.Context(), SettingAuthUser)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		body["authUser"] = user
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // budget is what the whole fleet may take from this host.
@@ -1031,6 +1155,7 @@ func isValidation(err error) bool {
 		"name ", "scope ", "runtime ", "replicas ", "cpus ", "memory ", "disk ", "label ",
 		"a credential is required", "the secret is empty", "a credential needs a name",
 		"an app needs its app id", "the app's private key", "credential kind ",
+		"an api key needs a name", "an api key cannot expire", "api key scope ",
 	} {
 		if strings.HasPrefix(message, prefix) {
 			return true

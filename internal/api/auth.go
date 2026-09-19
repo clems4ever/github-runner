@@ -80,7 +80,13 @@ func (a *Authenticator) Configured(ctx context.Context) bool {
 	return err == nil && hash != ""
 }
 
-// Middleware refuses anything without valid credentials.
+// Middleware refuses anything without a valid user and password.
+//
+// This is the Basic path, and a person is the only thing that takes it: a
+// machine calling the API presents a key instead, which Server.authenticate
+// handles before reaching here. Nothing below counts a key's failures — see the
+// note on keyAuth for why that would be a denial of service rather than a
+// defence.
 //
 // The order here matters, and it is the opposite of the obvious one. The right
 // password is checked first and always accepted, even from a client that has
@@ -99,7 +105,10 @@ func (a *Authenticator) Middleware(next http.Handler) http.Handler {
 
 		if offered && a.check(r.Context(), user, password) {
 			a.recordSuccess(client)
-			next.ServeHTTP(w, r)
+			// Tagged as a person, which is what the password means. Two things
+			// downstream turn on it: the routes no api key may reach, and the
+			// settings a key is not told.
+			next.ServeHTTP(w, withPrincipal(r, principal{}))
 			return
 		}
 
