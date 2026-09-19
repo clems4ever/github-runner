@@ -23,6 +23,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -30,6 +31,7 @@ import (
 	"time"
 
 	"github.com/clems4ever/github-runner/internal/agent"
+	"github.com/clems4ever/github-runner/internal/containerimage"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 )
@@ -62,8 +64,10 @@ const (
 	// StateFailed is a build that did not work and will not be tried again on
 	// its own.
 	StateFailed State = "failed"
-	// StateNone is a pool with no image to build here: a container pool runs
-	// an image somebody else published.
+	// StateNone is a pool with no image to build here: one that bakes nothing
+	// in and so runs an image somebody else published. Every container pool was
+	// this before one could bake something in, and a pool that names an image
+	// and nothing else still is.
 	StateNone State = "none"
 )
 
@@ -128,6 +132,9 @@ type Builder struct {
 	// build is the build itself, replaced in tests by something that does not
 	// need QEMU, a network, or forty minutes.
 	build func(ctx context.Context, o agent.BuildOptions) (string, error)
+	// containers is the Docker side of the same job: build an image from a
+	// Dockerfile, and say whether one is already here.
+	containers Containers
 
 	mu sync.Mutex
 	// latest is the most recent attempt at each image, which is what says
@@ -146,8 +153,20 @@ type Builder struct {
 // A pool edited while its build waits gets a different image, asked for by the
 // next pass; this one still builds the thing it was asked for.
 type queued struct {
-	id   int64
-	spec agent.ImageSpec
+	id      int64
+	runtime model.Runtime
+	spec    agent.ImageSpec
+	// container is what a container pool's image is built from. Only one of
+	// the two is meaningful, and `runtime` says which.
+	container containerimage.Spec
+}
+
+// Containers is how a container pool's image is built and found. Injected,
+// because the thing that can do both is the Docker executor and this package
+// must not import it — and because a test has neither a daemon nor an image.
+type Containers interface {
+	BuildImage(ctx context.Context, spec containerimage.Spec, journal io.Writer) error
+	HasImage(ctx context.Context, image string) (bool, error)
 }
 
 // Options are what a builder needs.
@@ -162,7 +181,10 @@ type Options struct {
 	// not, so an image it builds has to be handed over or no machine can boot
 	// it.
 	Owner paths.Owner
-	Log   *slog.Logger
+	// Containers builds the images container pools bake something into. Nil is
+	// a host with no Docker, where such a pool cannot have runners anyway.
+	Containers Containers
+	Log        *slog.Logger
 }
 
 // New builds a builder. It does not touch the host until Run is called.
@@ -172,15 +194,16 @@ func New(o Options) *Builder {
 		log = slog.Default()
 	}
 	return &Builder{
-		imagesDir: o.ImagesDir,
-		sshKey:    o.SSHKey,
-		store:     o.Store,
-		owner:     o.Owner,
-		log:       log,
-		now:       time.Now,
-		build:     agent.BuildImage,
-		latest:    map[string]model.ImageBuild{},
-		wake:      make(chan struct{}, 1),
+		imagesDir:  o.ImagesDir,
+		sshKey:     o.SSHKey,
+		store:      o.Store,
+		owner:      o.Owner,
+		log:        log,
+		now:        time.Now,
+		build:      agent.BuildImage,
+		containers: o.Containers,
+		latest:     map[string]model.ImageBuild{},
+		wake:       make(chan struct{}, 1),
 	}
 }
 
@@ -275,10 +298,13 @@ func (b *Builder) forgetTheOldArrangement() {
 
 // Status says where a pool's image stands, without starting anything.
 func (b *Builder) Status(pool model.Pool) Status {
-	if pool.Runtime != model.RuntimeVM {
+	// A container pool that bakes nothing in runs an image somebody else
+	// published, and there is nothing here to build or wait for. That was every
+	// container pool before this daemon could build one.
+	if pool.Runtime != model.RuntimeVM && !containerFor(pool).Wanted() {
 		return Status{
 			Pool: pool.Name, State: StateNone, Ready: true,
-			Summary: "a container pool runs an image somebody else published, so there is nothing to build here",
+			Summary: "this pool runs an image somebody else published, so there is nothing to build here",
 		}
 	}
 
@@ -293,7 +319,7 @@ func (b *Builder) Status(pool model.Pool) Status {
 		status.Build = &build
 	}
 
-	if _, built := agent.GoldenImage(specFor(pool), b.imagesDir); built {
+	if b.built(pool) {
 		status.State, status.Ready = StateReady, true
 		status.Summary = "its image is built"
 		return status
@@ -315,6 +341,34 @@ func (b *Builder) Status(pool model.Pool) Status {
 		status.Summary = "its image has not been built on this host yet"
 	}
 	return status
+}
+
+// built reports whether the image this pool asks for is already on the host.
+//
+// A file for a machine, a Docker image for a container, and the same question
+// either way: the state machine above does not care which runtime it is
+// looking at, only whether there is anything left to do.
+func (b *Builder) built(pool model.Pool) bool {
+	if pool.Runtime != model.RuntimeVM {
+		if b.containers == nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		has, err := b.containers.HasImage(ctx, Image(pool))
+		if err != nil {
+			// Docker not answering is not "the image is missing": rebuilding on
+			// a socket that blinked would throw away a good image and take the
+			// pool down with it. Unbuilt is reported, and the next pass asks
+			// again.
+			b.log.Warn("could not ask Docker whether a pool's image is built",
+				"pool", pool.Name, "error", err)
+			return false
+		}
+		return has
+	}
+	_, built := agent.GoldenImage(specFor(pool), b.imagesDir)
+	return built
 }
 
 // Ensure is Status for a pool that wants runners: the state, and a build asked
@@ -340,8 +394,8 @@ func (b *Builder) Ensure(ctx context.Context, pool model.Pool) Status {
 // Rebuild is somebody asking for another attempt, which is how a failed build
 // is retried and how an image is made again from scratch.
 func (b *Builder) Rebuild(ctx context.Context, pool model.Pool) (Build, error) {
-	if pool.Runtime != model.RuntimeVM {
-		return Build{}, errors.New("a container pool has no image to build on this host")
+	if pool.Runtime != model.RuntimeVM && !containerFor(pool).Wanted() {
+		return Build{}, errors.New("this pool bakes nothing in, so it has no image to build on this host")
 	}
 	build, err := b.enqueue(ctx, pool, model.ImageRequested)
 	if err != nil {
@@ -430,7 +484,9 @@ func (b *Builder) enqueue(ctx context.Context, pool model.Pool, trigger string) 
 
 	b.mu.Lock()
 	b.latest[image] = build
-	b.pending = append(b.pending, queued{id: build.ID, spec: specFor(pool)})
+	b.pending = append(b.pending, queued{
+		id: build.ID, runtime: pool.Runtime,
+		spec: specFor(pool), container: containerFor(pool)})
 	b.mu.Unlock()
 
 	select {
@@ -471,6 +527,13 @@ func (b *Builder) attempt(ctx context.Context, next queued) {
 	build.Phase = model.ImageFetching
 	b.record(ctx, build)
 
+	// A container image is a Dockerfile and a build on the host's own daemon:
+	// no machine to boot, and so no key to bake into one.
+	if next.runtime != model.RuntimeVM {
+		b.finish(ctx, build, b.buildContainer(ctx, build, next, journal))
+		return
+	}
+
 	publicKey, err := agent.EnsureSSHKey(b.sshKey)
 	if err != nil {
 		b.finish(ctx, build, fmt.Errorf("make the host's ssh key: %w", err))
@@ -503,6 +566,38 @@ func (b *Builder) attempt(ctx context.Context, next queued) {
 		}
 	}
 	b.finish(ctx, build, err)
+}
+
+// buildContainer is the container half of attempt: the same record, the same
+// journal and the same phases, over a Docker build rather than a booted machine.
+//
+// It is minutes rather than tens of minutes, and it is still a build a pool
+// waits for — which is the point of running it through the same machinery. An
+// image built quietly underneath a pool would be an image nobody could watch,
+// whose failure nobody could read afterwards.
+func (b *Builder) buildContainer(ctx context.Context, build model.ImageBuild, next queued, journal io.Writer) error {
+	if b.containers == nil {
+		return errors.New("this host has no Docker to build a container image with")
+	}
+	build.Phase = model.ImageRunning
+	b.record(ctx, build)
+
+	b.log.Info("building a container pool's image; this happens once per host",
+		"pool", build.Pool, "image", build.Image)
+
+	// What the image is built from, before what the builder says about it. A
+	// failed build is read by somebody asking "what did it try to do", and the
+	// recipe is the half of the answer the builder's own output does not carry:
+	// its steps are `RUN sh -e /tmp/recipe.sh`, which says nothing about what
+	// is in the file.
+	files := next.container.Files()
+	_, _ = io.WriteString(journal, "building "+build.Image+"\n\n"+
+		string(files["Dockerfile"]))
+	if recipe, ok := files[containerimage.RecipeFile]; ok {
+		_, _ = io.WriteString(journal, "\n"+containerimage.RecipeFile+":\n"+string(recipe))
+	}
+	_, _ = io.WriteString(journal, "\n")
+	return b.containers.BuildImage(ctx, next.container, journal)
 }
 
 // finish records how a build ended, in the record and in the log, and then
@@ -585,10 +680,22 @@ func (b *Builder) give(paths ...string) {
 // Image is the golden image a pool asks for: a hash of everything it is built
 // from, so two pools wanting the same thing share one and a pool that edits
 // its recipe asks for a new one.
-func Image(pool model.Pool) string { return specFor(pool).Name() }
+func Image(pool model.Pool) string {
+	if pool.Runtime != model.RuntimeVM {
+		return containerFor(pool).Name()
+	}
+	return specFor(pool).Name()
+}
 
 func specFor(pool model.Pool) agent.ImageSpec {
 	return agent.ImageSpec{Variant: pool.Image, Packages: pool.Packages, Recipe: pool.Recipe}
+}
+
+// containerFor is the same question for a container pool: what its image is
+// built from, which is the two fields an operator typed plus the image they
+// start from.
+func containerFor(pool model.Pool) containerimage.Spec {
+	return containerimage.Spec{Base: pool.Image, Packages: pool.Packages, Recipe: pool.Recipe}
 }
 
 // took is a number of seconds as somebody would say it.

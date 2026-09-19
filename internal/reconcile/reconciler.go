@@ -174,11 +174,16 @@ func (r *Reconciler) lastBusy(pool string, runners []Runner, states map[string]g
 // the pool was there — and a pool whose recipe had changed went on taking jobs
 // on the image it had before, which is the wrong image by definition.
 //
+// It covers container pools too, now that one can bake something in. A pool
+// that bakes nothing reports ready with nothing to build and is held for
+// nothing, which is what every container pool did before there was anything to
+// hold for.
+//
 // Holding a pool at nothing drains what it already has. That is the point: the
 // runners of a pool whose image is not built are running something other than
 // what the pool asks for, and they finish the job they are on before they go.
 func (r *Reconciler) holdForImage(ctx context.Context, pool model.Pool, scale Scale) Scale {
-	if r.images == nil || !pool.Enabled || pool.Runtime != model.RuntimeVM {
+	if r.images == nil || !pool.Enabled {
 		return scale
 	}
 	ready, why := r.images(ctx, pool)

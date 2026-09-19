@@ -441,14 +441,24 @@ func TestATemplateOmitsWhatAPoolDoesNotBake(t *testing.T) {
 	}
 }
 
-// A container pool cannot bake anything, and an import that says otherwise is
-// refused before anything is written rather than having the fields dropped.
-func TestImportingARecipeOntoAContainerPoolIsRefused(t *testing.T) {
+// A container pool can bake something in, so a template carrying a recipe for
+// one is imported rather than refused — and what it asks for survives the round
+// trip, because a fleet written down and imported somewhere else has to be the
+// same fleet.
+func TestImportingARecipeOntoAContainerPoolIsKept(t *testing.T) {
 	doc := Document{Version: Version, Pools: []Pool{{
 		Name: "ci-container", Scope: "o/r", Runtime: model.RuntimeContainer,
-		Recipe: "echo hello\n",
+		Packages: []string{"make"}, Recipe: "echo hello\n",
 	}}}
-	if _, err := Apply(doc, Options{CredentialID: 1}); err == nil {
-		t.Fatal("a container pool was imported with a recipe it cannot run")
+	result, err := Apply(doc, Options{CredentialID: 1})
+	if err != nil {
+		t.Fatalf("a container pool with a recipe was refused: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("got %d pools", len(result))
+	}
+	got := result[0]
+	if got.Recipe != "echo hello\n" || len(got.Packages) != 1 {
+		t.Errorf("the import dropped what the pool bakes: %+v", got)
 	}
 }

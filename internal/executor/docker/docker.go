@@ -8,9 +8,11 @@
 package docker
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/containerimage"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -122,20 +125,38 @@ func (e *Executor) Runtime() model.Runtime { return model.RuntimeContainer }
 // A pool that names no image gets the default, so changing that default here
 // replaces the containers built from the old one rather than leaving them until
 // somebody notices.
-func (e *Executor) Recipe(pool model.Pool) string { return imageFor(pool.Image) }
+func (e *Executor) Recipe(pool model.Pool) string { return imageFor(specOf(pool)) }
 
-// imageFor resolves what a pool's image field means, so the executor and the
-// recipe cannot disagree about what a runner would run.
-func imageFor(image string) string {
-	if image == "" || image == "default" {
+// specOf is what this pool's image is built from, in the shape the
+// containerimage package names and builds.
+func specOf(pool model.Pool) containerimage.Spec {
+	return containerimage.Spec{Base: pool.Image, Packages: pool.Packages, Recipe: pool.Recipe}
+}
+
+// Image is the image a pool's runners start from: the one this daemon built for
+// it, or the one it named.
+func Image(pool model.Pool) string { return imageFor(specOf(pool)) }
+
+// imageFor resolves what a pool's image means, so the executor and the recipe
+// cannot disagree about what a runner would run.
+//
+// A pool that bakes something in runs the image this daemon built for it; one
+// that does not runs the image it named, which is what every container pool did
+// before there was anything to build.
+func imageFor(spec containerimage.Spec) string {
+	if spec.Wanted() {
+		return spec.Name()
+	}
+	if spec.Base == "" || spec.Base == "default" {
 		return DefaultImage
 	}
-	return image
+	return spec.Base
 }
 
 // Create builds and starts a container runner.
 func (e *Executor) Create(ctx context.Context, spec reconcile.Spec) error {
-	image := imageFor(spec.Image)
+	image := imageFor(containerimage.Spec{
+		Base: spec.Image, Packages: spec.Packages, Recipe: spec.Recipe})
 	if err := e.ensureImage(ctx, image); err != nil {
 		return err
 	}
@@ -488,6 +509,128 @@ func mapState(state string) reconcile.RunnerState {
 	default: // exited, dead, paused
 		return reconcile.StateStopped
 	}
+}
+
+// BuildImage builds a pool's own image on this host, from the packages and the
+// recipe it declared.
+//
+// Over the Docker API rather than by shelling out to `docker build`: the
+// executor already speaks it, and the daemon is not guaranteed to have a CLI
+// beside it. The output is the builder's own stream, copied into the journal as
+// it arrives, so what somebody watches and what is kept afterwards are the same
+// bytes — the rule the machine side's console follows.
+//
+// A build that fails says so through the stream and not through the status
+// code: /build answers 200 and then reports the failure in an `errorDetail`
+// near the end, which is why this reads the whole body rather than trusting the
+// header.
+func (e *Executor) BuildImage(ctx context.Context, spec containerimage.Spec, journal io.Writer) error {
+	context, err := tarOf(spec.Files())
+	if err != nil {
+		return fmt.Errorf("make the build context: %w", err)
+	}
+	path := "/build?dockerfile=Dockerfile&rm=1&forcerm=1&t=" + url.QueryEscape(spec.Name())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.host+"/v1.44"+path, bytes.NewReader(context))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-tar")
+
+	resp, err := e.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("docker: build %s: %w (is dockerd running, and can this user reach its socket?)",
+			spec.Name(), err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return &apiError{status: resp.StatusCode, message: strings.TrimSpace(string(payload))}
+	}
+	return copyBuildOutput(resp.Body, journal)
+}
+
+// copyBuildOutput writes what the builder printed into the journal, and returns
+// the failure the builder reported inside a 200.
+func copyBuildOutput(body io.Reader, journal io.Writer) error {
+	decoder := json.NewDecoder(body)
+	var failure string
+	for {
+		var line struct {
+			Stream      string `json:"stream"`
+			Status      string `json:"status"`
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := decoder.Decode(&line); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			// A stream that ends badly is still a build somebody has to be told
+			// about, and whatever was printed before it is already in the log.
+			return fmt.Errorf("read the build's output: %w", err)
+		}
+		if journal != nil {
+			if line.Stream != "" {
+				_, _ = io.WriteString(journal, line.Stream)
+			} else if line.Status != "" {
+				_, _ = io.WriteString(journal, line.Status+"\n")
+			}
+		}
+		if line.Error != "" {
+			failure = line.Error
+		} else if line.ErrorDetail.Message != "" {
+			failure = line.ErrorDetail.Message
+		}
+	}
+	if failure != "" {
+		if journal != nil {
+			_, _ = io.WriteString(journal, "\nthe build failed: "+failure+"\n")
+		}
+		return errors.New(failure)
+	}
+	return nil
+}
+
+// HasImage reports whether an image is already on this host, which is how a
+// pool's build is skipped when there is nothing to do.
+func (e *Executor) HasImage(ctx context.Context, image string) (bool, error) {
+	err := e.do(ctx, http.MethodGet, "/images/"+url.PathEscape(image)+"/json", nil, nil)
+	if err == nil {
+		return true, nil
+	}
+	if isNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// tarOf is the build context: a few small files, in memory, because that is all
+// a generated Dockerfile and a recipe ever are.
+func tarOf(files map[string][]byte) ([]byte, error) {
+	var buf bytes.Buffer
+	w := tar.NewWriter(&buf)
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		body := files[name]
+		if err := w.WriteHeader(&tar.Header{
+			Name: name, Mode: 0o644, Size: int64(len(body)),
+		}); err != nil {
+			return nil, err
+		}
+		if _, err := w.Write(body); err != nil {
+			return nil, err
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // ensureImage pulls an image that is not on the host yet. Pulling on demand is

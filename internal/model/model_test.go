@@ -319,11 +319,14 @@ func TestAPoolThatIsSwitchedOffPromisesNothing(t *testing.T) {
 	}
 }
 
-// Both fields are how a machine's image is built, and a container has no image
-// of this kind — it names one somebody else built. Refused rather than ignored:
-// a pool that quietly bakes nothing is a pool whose jobs install the toolchain
-// every time and nobody knows why.
-func TestAContainerPoolCannotBakeAnything(t *testing.T) {
+// Both fields used to be machine-only and a container pool was refused them.
+// They mean the same thing on either runtime now — apt packages and a script as
+// root, baked in once — and what differs is only how the image is made.
+//
+// The refusal was honest about what the daemon could do and wrong about what a
+// pool needs: on an ephemeral pool, everything a job installs it installs again
+// on the next job, and on the one after that.
+func TestEitherRuntimeCanBakeSomethingIn(t *testing.T) {
 	base := Pool{
 		Name: "web", ScopeKind: ScopeRepository, Scope: "o/r", Runtime: RuntimeContainer,
 		MinReplicas: 1, MaxReplicas: 1, CPUs: 2, MemoryMB: 4096, CredentialID: 1,
@@ -331,14 +334,22 @@ func TestAContainerPoolCannotBakeAnything(t *testing.T) {
 
 	withPackages := base
 	withPackages.Packages = []string{"ffmpeg"}
-	if err := withPackages.Validate(); err == nil {
-		t.Error("a container pool was given a package list to bake, which it cannot")
+	if err := withPackages.Validate(); err != nil {
+		t.Errorf("a container pool was refused a package list: %v", err)
 	}
 
 	withRecipe := base
 	withRecipe.Recipe = "echo hello\n"
-	if err := withRecipe.Validate(); err == nil {
-		t.Error("a container pool was given a recipe, which it cannot run")
+	if err := withRecipe.Validate(); err != nil {
+		t.Errorf("a container pool was refused a recipe: %v", err)
+	}
+
+	// A package name still has to be a package name, on either runtime: it is
+	// interpolated into the thing the image is built from.
+	bad := base
+	bad.Packages = []string{"ffmpeg\nRUN echo pwned"}
+	if err := bad.Validate(); err == nil {
+		t.Error("a container pool was given a package name that is a second instruction")
 	}
 
 	// And the same pool as a machine is fine.

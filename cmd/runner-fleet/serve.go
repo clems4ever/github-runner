@@ -99,7 +99,11 @@ func serveCommand(args []string) error {
 		SSHKey:    layout.SSHKey(),
 		Store:     db,
 		Owner:     owner,
-		Log:       log,
+		// A container pool that bakes something in has its image built here
+		// too, by the same queue and into the same log. The executor is what
+		// can talk to Docker, so it is what does it.
+		Containers: containers,
+		Log:        log,
 	})
 	// Before anything can ask for a build, so that builds interrupted by this
 	// restart are settled and not confused with the ones about to be queued.
