@@ -139,6 +139,39 @@ export interface NewCredential {
   installationId?: number
 }
 
+/** What an api key may do. */
+export type ApiKeyScope = 'read' | 'admin'
+
+/**
+ * A key another program calls this daemon with, as opposed to a person typing
+ * the password into a browser.
+ *
+ * The key itself is not here and cannot be: the daemon keeps a SHA-256 of it, so
+ * it is shown once when it is created and is afterwards unrecoverable by anyone.
+ * Unlike a Credential, which has to be decryptable because the daemon needs the
+ * GitHub token in clear, a key is only ever compared.
+ */
+export interface ApiKey {
+  id: number
+  name: string
+  scope: ApiKeyScope
+  /** The front of the key: enough to match against what a script is configured with. */
+  hint: string
+  createdAt: string
+  /** Absent for a key that never expires. */
+  expiresAt?: string
+  /** Absent for a key that has never been used, which is often the answer itself. */
+  lastUsedAt?: string
+}
+
+/** What goes in when a key is created. */
+export interface NewApiKey {
+  name: string
+  scope: ApiKeyScope
+  /** RFC3339, or left out for a key that never expires. */
+  expiresAt?: string
+}
+
 /**
  * A pool template: the portable form of a fleet's pools.
  *
@@ -446,7 +479,25 @@ export const api = {
     request<void>(`/api/credentials/${id}/secret`, { method: 'PUT', body: JSON.stringify({ secret }) }),
   deleteCredential: (id: number) => request<void>(`/api/credentials/${id}`, { method: 'DELETE' }),
 
-  settings: () => request<{ authUser: string; version: string; budget: Budget }>('/api/settings'),
+  apiKeys: () => request<ApiKey[]>('/api/api-keys'),
+  /**
+   * Mint one. The key comes back exactly once, in `secret`, and the daemon
+   * cannot produce it again — so whatever calls this has to put it in front of
+   * the operator there and then.
+   */
+  createApiKey: (key: NewApiKey) =>
+    request<{ apiKey: ApiKey; secret: string }>('/api/api-keys', {
+      method: 'POST',
+      body: JSON.stringify(key),
+    }),
+  /** Revoking is final: there is no disabled state and nothing to restore. */
+  deleteApiKey: (id: number) => request<void>(`/api/api-keys/${id}`, { method: 'DELETE' }),
+
+  /**
+   * `authUser` is absent when the caller is an api key rather than the operator:
+   * no key is told the name half of the credential it may not touch.
+   */
+  settings: () => request<{ authUser?: string; version: string; budget: Budget }>('/api/settings'),
   setBudget: (budget: Budget) =>
     request<Budget>('/api/settings/budget', { method: 'PUT', body: JSON.stringify(budget) }),
   setPassword: (user: string, password: string) =>

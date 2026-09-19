@@ -609,10 +609,69 @@ tell the difference. Existing installations keep the token they have.
 Rotating either — a new key, a new token — replaces the runners using it,
 gracefully, as each finishes the job it is on.
 
+## Calling the API
+
+Everything the UI does is a REST call, and an **API key** is how something that
+is not a person makes one — a dashboard, a deployment, a script that adds a pool
+per repository. The alternative was handing your own password to a cron job,
+which cannot be scoped down, cannot be told apart from you in a log, and breaks
+every automation at once when you rotate it.
+
+Keys are made on the **Settings** page, or on a host with no browser on it:
+
+```bash
+sudo runner-fleet apikey create --name monitoring --scope read --expires-days 90
+```
+
+The key is printed once, on stdout, and never again — the daemon keeps only a
+SHA-256 of it. Send it as a bearer token:
+
+```bash
+curl -H "Authorization: Bearer rf_…" http://127.0.0.1:8080/api/runners
+```
+
+Two scopes, and deliberately not more:
+
+| scope | may |
+| --- | --- |
+| `read` | any `GET`: pools, runners, jobs, activity, resources, the budget |
+| `admin` | that, and everything that changes the fleet |
+
+The rule is the method, decided in one place, so a route added later is covered
+by it without anyone remembering to cover it.
+
+**No key can read or create another key, or change the web password**, whatever
+its scope. That is not a permission anybody can grant: it is refused at those
+routes. So a leaked key cannot mint its own replacement, cannot enumerate what
+else exists to steal, and cannot lock you out of your own dashboard — which is
+what makes revoking one final. For the same reason `GET /api/settings` does not
+tell a key your user name. Managing keys, and the password, needs the password.
+
+`runner-fleet apikey list` shows what each key is, when it expires and when it
+was last used, which is how you decide which of six is safe to revoke.
+`runner-fleet apikey revoke --name monitoring` ends it.
+
+A key also works on a daemon that has no password set at all, which is what makes
+a headless install possible: provision the host, create a key, never open a
+browser.
+
 ## Security
 
 - The web UI is HTTP Basic over a loopback bind, with bcrypt and attempt
   throttling. Until a password is set, the daemon serves nothing.
+- **API keys are hashed, not encrypted** — SHA-256, and the row holds nothing
+  else. Credentials have to be decryptable because the daemon needs a GitHub
+  token in clear; a key is only ever compared, so a stolen database yields no key
+  at all. It is SHA-256 rather than bcrypt because a key is 256 bits from
+  `crypto/rand`: there is no dictionary to grind, and a slow hash would only tax
+  the honest client polling once a second.
+- A wrong key does not count towards the password lockout. Keys arrive from
+  whatever address a reverse proxy uses — the same one your browser comes from —
+  so counting them would let one CI job with a revoked key lock you out of your
+  own fleet.
+- A bearer token is only as private as the connection carrying it. The default
+  loopback bind is the assumption throughout; if you put the daemon behind a
+  proxy that is reachable from anywhere else, that proxy needs TLS.
 - Credentials are encrypted with AES-256-GCM under a key in
   `/etc/runner-fleet/master.key` (0600, root, generated on first start). The
   daemon has to decrypt to use them, so this is not protection against root: it

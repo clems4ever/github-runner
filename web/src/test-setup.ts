@@ -83,6 +83,12 @@ window.ResizeObserver =
 
 window.scrollTo = window.scrollTo || (() => {})
 
+// Mantine's dropdowns scroll the highlighted option into view, on a timer, after
+// the click that opened them. jsdom implements no scrolling at all, so without
+// this the throw lands outside the test that caused it — as an unhandled error
+// in whichever test happened to be running when the timer fired.
+HTMLElement.prototype.scrollIntoView = HTMLElement.prototype.scrollIntoView || (() => {})
+
 // Recharts measures its container before drawing anything, and jsdom reports
 // every element as zero by zero — so without these the chart renders nothing
 // and every assertion about it fails for the wrong reason.

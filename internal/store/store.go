@@ -181,6 +181,30 @@ var migrations = []string{
 	// pool that already exists, which is what they had: a container runner was
 	// given the runner and nothing to build images with.
 	`ALTER TABLE pools ADD COLUMN docker TEXT NOT NULL DEFAULT 'none'`,
+	// How something that is not a person gets in.
+	//
+	// The web password was the only way to call this API, which meant a script
+	// had to be given the operator's own password: it could not be scoped down,
+	// it could not be told apart from the person in a log, and rotating it broke
+	// every automation at once.
+	//
+	// A hash and never the key, so this table is worth nothing to whoever copies
+	// the database — unlike credentials, which have to be decryptable because
+	// the daemon needs GitHub tokens in clear. UNIQUE on the hash because that
+	// is what a request is looked up by: one indexed query per call.
+	//
+	// Both timestamps are the empty string when they have not happened, which is
+	// how image_builds.ended_at says the same thing.
+	`CREATE TABLE api_keys (
+		id           INTEGER PRIMARY KEY AUTOINCREMENT,
+		name         TEXT NOT NULL UNIQUE,
+		hash         TEXT NOT NULL UNIQUE,
+		hint         TEXT NOT NULL,
+		scope        TEXT NOT NULL,
+		created_at   TEXT NOT NULL,
+		expires_at   TEXT NOT NULL DEFAULT '',
+		last_used_at TEXT NOT NULL DEFAULT ''
+	)`,
 }
 
 // SampleRetention is how much history the daemon keeps. Two days covers "what

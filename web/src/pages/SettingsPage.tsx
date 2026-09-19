@@ -4,6 +4,7 @@ import {
 } from '@mantine/core'
 import { notifications } from '@mantine/notifications'
 import { api, type Budget, type Health } from '../api'
+import { ApiKeysCard } from './ApiKeysCard'
 
 export function SettingsPage({ health }: { health: Health | null }) {
   const [user, setUser] = useState('')
@@ -60,6 +61,8 @@ export function SettingsPage({ health }: { health: Health | null }) {
           </Group>
         </Stack>
       </Card>
+
+      <ApiKeysCard />
 
       <FleetBudget />
 
