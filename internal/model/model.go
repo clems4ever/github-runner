@@ -434,18 +434,14 @@ func (p *Pool) Validate() error {
 		}
 	}
 
-	// Both are how a machine's image is built, and a container has no image of
-	// this kind — it names one that somebody else built. Refused rather than
-	// ignored: a pool that quietly bakes nothing is a pool whose jobs install
-	// the toolchain every time and nobody knows why.
-	if p.Runtime != RuntimeVM {
-		if len(p.Packages) > 0 {
-			return fmt.Errorf("packages are for machine pools: a container pool names a prebuilt image in its image field instead")
-		}
-		if p.Recipe != "" {
-			return fmt.Errorf("a recipe is for machine pools: a container pool names a prebuilt image in its image field instead")
-		}
-	}
+	// Both used to be machine-only, and a container pool was refused them: it
+	// named a prebuilt image and that was the whole of it. The refusal was
+	// honest about what the daemon could do and wrong about what a pool needs —
+	// on an ephemeral pool, everything a job installs it installs again on the
+	// next job, and on the one after that. They now mean the same thing on
+	// either runtime: apt packages and a script as root, baked in once, and the
+	// image is built on this host from a Dockerfile rather than in a booted
+	// machine.
 	for _, pkg := range p.Packages {
 		if !packageRe.MatchString(pkg) {
 			return fmt.Errorf("package %q: use a Debian package name — lower-case letters, digits, plus, dot and dash", pkg)

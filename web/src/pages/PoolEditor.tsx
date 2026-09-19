@@ -301,35 +301,37 @@ export function PoolEditor({
           description={
             isVM
               ? 'Names this pool\u2019s image. Two pools that bake the same thing share one; a name of its own gives this pool one of its own.'
-              : 'The container image these runners run. It has to carry the Actions runner.'
+              : 'What these runners start from. It has to carry the Actions runner. Anything baked in below is built on top of it.'
           }
           {...form.getInputProps('image')}
         />
 
         {/*
-          Machines only. A container does not build an image, it runs one
-          somebody else built, and the daemon refuses both of these on a
-          container pool rather than ignoring them.
+          Both runtimes. They used to be machines only — a container ran an
+          image somebody else built — which left an ephemeral container pool
+          installing the same toolchain on every job for ever. They mean the
+          same thing either way now; what differs is that a machine bakes them
+          into a golden image and a container into one built here with Docker.
         */}
-        {isVM && (
-          <>
-            <TagsInput
-              label="Extra packages"
-              description="apt packages baked in, so a job does not install them every time"
-              placeholder="nftables, conntrack"
-              value={values.packages ?? []}
-              onChange={(value) => form.setFieldValue('packages', value)}
-            />
-            <Textarea
-              label="Recipe"
-              description="Shell, run as root while the image is built \u2014 for what apt cannot give: a pinned toolchain, a linter, a warm build cache. Editing it builds a new image and replaces this pool's runners as they finish."
-              placeholder={'curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz'}
-              rows={10}
-              styles={{ input: { fontFamily: 'var(--mantine-font-family-monospace)' } }}
-              {...form.getInputProps('recipe')}
-            />
-          </>
-        )}
+        <TagsInput
+          label="Extra packages"
+          description="apt packages baked in, so a job does not install them every time"
+          placeholder="nftables, conntrack"
+          value={values.packages ?? []}
+          onChange={(value) => form.setFieldValue('packages', value)}
+        />
+        <Textarea
+          label="Recipe"
+          description={
+            isVM
+              ? "Shell, run as root while the image is built \u2014 for what apt cannot give: a pinned toolchain, a linter, a warm build cache. Editing it builds a new image and replaces this pool's runners as they finish."
+              : "Shell, run as root in a Dockerfile step on top of the image above \u2014 for what apt cannot give: a pinned toolchain, a linter, a warm build cache. Editing it builds a new image and replaces this pool's runners as they finish."
+          }
+          placeholder={'curl -fsSL https://go.dev/dl/go1.25.0.linux-amd64.tar.gz | tar -C /usr/local -xz'}
+          rows={10}
+          styles={{ input: { fontFamily: 'var(--mantine-font-family-monospace)' } }}
+          {...form.getInputProps('recipe')}
+        />
 
         {refusal && (
           <Alert color="red" variant="light" icon={<IconAlertTriangle size={16} />} title="GitHub refused this">

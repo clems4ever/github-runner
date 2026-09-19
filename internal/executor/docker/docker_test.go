@@ -1,16 +1,19 @@
 package docker
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/clems4ever/github-runner/internal/containerimage"
 	"github.com/clems4ever/github-runner/internal/model"
 	"github.com/clems4ever/github-runner/internal/paths"
 	"github.com/clems4ever/github-runner/internal/reconcile"
@@ -696,5 +699,101 @@ func TestRemoveTakesTheDaemonsStorageWithIt(t *testing.T) {
 	}
 	if !fake.called("DELETE /containers/api-1?v=1") {
 		t.Fatalf("the volume was left on the host: %v", fake.requests)
+	}
+}
+
+// The build context is a tar the classic builder can read: the Dockerfile the
+// spec generates, and the recipe beside it.
+func TestTheBuildContextCarriesTheDockerfileAndTheRecipe(t *testing.T) {
+	var got struct {
+		contentType string
+		query       url.Values
+		files       map[string]string
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/v1.44/build") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		got.contentType = r.Header.Get("Content-Type")
+		got.query = r.URL.Query()
+		got.files = map[string]string{}
+		tr := tar.NewReader(r.Body)
+		for {
+			h, err := tr.Next()
+			if err != nil {
+				break
+			}
+			body, _ := io.ReadAll(tr)
+			got.files[h.Name] = string(body)
+		}
+		_, _ = io.WriteString(w, `{"stream":"Step 1/3 : FROM base\n"}`+"\n")
+	}))
+	defer srv.Close()
+
+	e := New(paths.Layout{}, "/agent", WithHTTPClient(srv.Client(), srv.URL))
+	spec := containerimage.Spec{Base: "base", Packages: []string{"make"}, Recipe: "echo hello"}
+	var journal strings.Builder
+	if err := e.BuildImage(context.Background(), spec, &journal); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	if got.contentType != "application/x-tar" {
+		t.Errorf("content type %q: the daemon reads the context as a tar", got.contentType)
+	}
+	if tag := got.query.Get("t"); tag != spec.Name() {
+		t.Errorf("tagged %q, and the pool asks for %q", tag, spec.Name())
+	}
+	if !strings.Contains(got.files["Dockerfile"], "FROM base") {
+		t.Errorf("the context's Dockerfile is %q", got.files["Dockerfile"])
+	}
+	if !strings.Contains(got.files[containerimage.RecipeFile], "echo hello") {
+		t.Errorf("the recipe did not travel with the context: %q", got.files)
+	}
+	if !strings.Contains(journal.String(), "Step 1/3") {
+		t.Errorf("what the builder printed is not in the journal: %q", journal.String())
+	}
+}
+
+// /build answers 200 and then reports the failure inside the stream, which is
+// the one way a build fails that a status code does not say.
+func TestABuildThatFailsInsideATwoHundredIsAFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"stream":"Step 2/3 : RUN false\n"}`+"\n"+
+			`{"errorDetail":{"message":"The command '/bin/sh -c false' returned a non-zero code: 1"},`+
+			`"error":"The command '/bin/sh -c false' returned a non-zero code: 1"}`+"\n")
+	}))
+	defer srv.Close()
+
+	e := New(paths.Layout{}, "/agent", WithHTTPClient(srv.Client(), srv.URL))
+	var journal strings.Builder
+	err := e.BuildImage(context.Background(), containerimage.Spec{Recipe: "false"}, &journal)
+	if err == nil {
+		t.Fatal("a build that failed was reported as having worked")
+	}
+	if !strings.Contains(err.Error(), "non-zero code") {
+		t.Errorf("the error does not say what the builder said: %v", err)
+	}
+	if !strings.Contains(journal.String(), "the build failed") {
+		t.Errorf("the log does not end with the failure:\n%s", journal.String())
+	}
+}
+
+// Which image a runner starts from: the one this daemon built when the pool
+// bakes something in, and the one the pool named when it does not.
+func TestAPoolRunsTheImageItBakesWhenItBakesOne(t *testing.T) {
+	plain := model.Pool{Runtime: model.RuntimeContainer, Image: "ghcr.io/me/runner:v3"}
+	if got := Image(plain); got != "ghcr.io/me/runner:v3" {
+		t.Errorf("a pool that bakes nothing runs %q", got)
+	}
+	if got := Image(model.Pool{Runtime: model.RuntimeContainer}); got != DefaultImage {
+		t.Errorf("a pool that names no image runs %q", got)
+	}
+
+	baking := plain
+	baking.Packages = []string{"make"}
+	want := containerimage.Spec{Base: plain.Image, Packages: baking.Packages}.Name()
+	if got := Image(baking); got != want {
+		t.Errorf("a pool that bakes something runs %q, and its image is %q", got, want)
 	}
 }

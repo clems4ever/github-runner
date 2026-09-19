@@ -70,6 +70,19 @@ describe('PoolEditor', () => {
     expect(screen.getByRole('switch', { name: /Docker in Docker/ })).not.toBeChecked()
   })
 
+  it('offers what to bake in on either runtime', async () => {
+    // Both were machines only, which left an ephemeral container pool
+    // installing the same toolchain on every job for ever. The fields mean the
+    // same thing on either runtime now; only how the image is built differs.
+    renderEditor()
+    expect(screen.getByText(/apt packages baked in/)).toBeInTheDocument()
+    expect(screen.getByText(/while the image is built/)).toBeInTheDocument()
+
+    await userEvent.click(screen.getByText('Container'))
+    expect(screen.getByText(/apt packages baked in/)).toBeInTheDocument()
+    expect(screen.getByText(/in a Dockerfile step on top of the image above/)).toBeInTheDocument()
+  })
+
   it('hides the disk size for containers, which have none', async () => {
     renderEditor()
     expect(screen.getByRole('textbox', { name: 'Disk (GiB)' })).toBeInTheDocument()

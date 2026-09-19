@@ -72,7 +72,7 @@ A pool named `web` with a maximum of three gives you `web-1`, `web-2` and
 | **Maximum runners** | how far it may grow under load; equal to the minimum for a fixed size |
 | **Labels** | what a workflow targets with `runs-on` |
 | **Size** | vCPUs, memory, and disk for VM pools |
-| **Image** | for VM pools, what is baked into it: extra packages and a recipe |
+| **Image** | what the runners start from, and what is baked on top of it: extra packages and a recipe |
 
 Every runner also registers with labels describing what it is — `vm` or
 `container`, plus `nestedvirt`, `ephemeral` and `dind` when they apply — so a
@@ -134,9 +134,45 @@ secrets: it is stored in the clear, and it ends up in an image any job can read.
 
 A build that fails says so and stops. A recipe that exits non-zero fails the
 build, the pool gets no runners, and nothing tries again until somebody asks or
-the recipe changes. Both fields are for machine pools; a container pool names a
-prebuilt image in its image field instead, and is refused these rather than
-quietly ignoring them.
+the recipe changes.
+
+### The same two fields on a container pool
+
+They were machines only until recently, and a container pool was refused them:
+it named a prebuilt image and that was the whole of it. The refusal was honest
+about what the daemon could do and wrong about what a pool needs — on an
+ephemeral pool, everything a job installs it installs again on the next job, and
+on the one after that. A pool running sixteen jobs a push, four of them
+`apt-get install`ing a compiler, pays for it four times a push, for ever.
+
+So they mean the same thing on either runtime now: **extra packages** are apt
+packages, a **recipe** is shell run as root, and both are baked in once. What
+differs is how. A machine boots a build machine and snapshots the disk; a
+container is built here with Docker, from a generated Dockerfile:
+
+```dockerfile
+FROM ghcr.io/actions/actions-runner:latest   # the pool's image field
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends make gcc …
+COPY recipe.sh /tmp/recipe.sh                # the recipe, byte for byte
+RUN sh -e /tmp/recipe.sh && rm -f /tmp/recipe.sh
+USER runner
+```
+
+The **image** field is what it is built on top of rather than what it runs, and a
+pool that bakes nothing in is unchanged: it runs the image it names, there is
+nothing to build, and nothing to wait for.
+
+Everything else is the machine side's, deliberately: the image is named by a
+hash of everything it is built from, it is built once per host before the pool
+gets a single runner, a pool whose recipe changed drains onto the new one, a
+failed build says so once and waits, and every attempt is kept with its log —
+the Dockerfile and the recipe at the top of it, so a failure shows what it tried
+to do.
+
+The recipe is written into the build context as a file and removed in the same
+layer that runs it. It is still not a place for secrets: it is stored in the
+clear and anything it leaves behind is in an image every job can read.
 
 ### Waiting for an image
 

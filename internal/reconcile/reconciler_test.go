@@ -772,24 +772,45 @@ func TestAPoolDrainsWhenItsImageIsNoLongerBuilt(t *testing.T) {
 	}
 }
 
-// A container pool has no image of this kind — it runs one somebody else
-// published — and must not be held back by a builder that has nothing to say
-// about it.
-func TestAContainerPoolIsNeverHeldBackByAnImageBuild(t *testing.T) {
+// A container pool waits for its image the way a machine pool does, now that it
+// can have one — and a pool that bakes nothing has nothing to wait for, which
+// is what the builder answers for it.
+//
+// The gate is the builder's answer rather than the runtime: the reconciler does
+// not know which pools have something to build, and a second opinion about that
+// here would be one that could disagree with the thing doing the building.
+func TestAContainerPoolWaitsForTheImageItBakes(t *testing.T) {
 	pool := testPool("ci", 1)
 	pool.Runtime = model.RuntimeContainer
+	pool.Packages = []string{"make"}
 	pool.Defaults()
 	h := newHarness(pool)
 	asked := 0
 	h.rec.WithImages(func(ctx context.Context, p model.Pool) (bool, string) {
 		asked++
-		return false, "nothing has been built"
+		return false, "its image has not been built on this host yet"
 	})
 
 	h.rec.Once(context.Background())
-	if asked != 0 {
-		t.Fatalf("a container pool was asked about a golden image %d times", asked)
+	if asked != 1 {
+		t.Fatalf("a container pool with a package list was asked about its image %d times", asked)
 	}
+	if got := strings.Join(h.docker.calls, "; "); got != "" {
+		t.Fatalf("a runner was created on an image that is not built: %q", got)
+	}
+}
+
+// And one that bakes nothing is not held for anything.
+func TestAContainerPoolThatBakesNothingIsNotHeld(t *testing.T) {
+	pool := testPool("ci", 1)
+	pool.Runtime = model.RuntimeContainer
+	pool.Defaults()
+	h := newHarness(pool)
+	h.rec.WithImages(func(ctx context.Context, p model.Pool) (bool, string) {
+		return true, ""
+	})
+
+	h.rec.Once(context.Background())
 	if got := strings.Join(h.docker.calls, "; "); got != "create ci-1" {
 		t.Fatalf("got %q", got)
 	}
