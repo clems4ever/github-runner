@@ -522,6 +522,17 @@ children of the runner's — so the memory and processor the pool was given are
 the limits the job's containers run inside, rather than limits it can step
 around by starting a container beside itself.
 
+That last part is why the daemon is not simply started. Cgroup v2 has a rule
+with no exceptions: a cgroup may hold processes, or it may have controllers
+enabled for its children, but not both — and a container's cgroup root holds
+every process in the container. So before the daemon starts, the runner moves
+what is in the root into a leaf of its own and delegates the controllers to
+children. Without it the daemon runs perfectly and everything it starts fails,
+with a message naming a cgroup rather than the rule it broke:
+
+    unable to apply cgroup configuration: cannot enter cgroupv2
+    "/sys/fs/cgroup/docker" with domain controllers -- it is in threaded mode
+
 It is a **privileged container**, and that is the whole of the trade. Every
 capability, no seccomp or apparmor filter, the host's kernel underneath: a job
 on a dind runner should be read as having root on this host. That is a weaker
