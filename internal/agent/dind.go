@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -104,6 +105,12 @@ func startDocker(ctx context.Context, acct account, log *slog.Logger) (stop func
 		return nil, err
 	}
 
+	// Before the daemon, and it is not optional on a cgroup v2 host: see
+	// nestCgroups.
+	if err := nestCgroups(log); err != nil {
+		return nil, err
+	}
+
 	log.Info("starting the docker daemon inside this runner")
 	daemon := exec.Command("dockerd",
 		"--host=unix://"+dockerSocket,
@@ -156,6 +163,105 @@ func startDocker(ctx context.Context, acct account, log *slog.Logger) (stop func
 
 	log.Info("docker is ready")
 	return stop, nil
+}
+
+// cgroupRoot is where this container's cgroup namespace is mounted. A variable
+// so a test can point it at a directory it made.
+var cgroupRoot = "/sys/fs/cgroup"
+
+// nestCgroups makes this container's cgroup namespace one that a daemon inside
+// it can create containers in.
+//
+// Cgroup v2 has a rule with no exceptions: a cgroup may hold processes, or it
+// may have controllers enabled for its children, but not both. A container's
+// namespace root starts out holding every process in the container — the
+// agent, the runner, the job — so the moment the daemon inside asks for a child
+// cgroup with `cpu` or `memory` on it, the kernel refuses. What it says is:
+//
+//	unable to apply cgroup configuration: cannot enter cgroupv2
+//	"/sys/fs/cgroup/docker" with domain controllers -- it is in threaded mode
+//
+// which names a cgroup somebody would have to already understand to act on,
+// and arrives as a container that will not start rather than as a daemon that
+// will not run. The daemon is fine. Everything it starts fails.
+//
+// The fix is the one the official dind image has had for years: move what is in
+// the root into a leaf of its own, then delegate the controllers to children.
+// The root then holds no processes and may enable anything; the daemon's
+// containers get their own cgroups underneath it, which is where a pool's
+// memory and processor share is enforced.
+//
+// It is a no-op on cgroup v1, and on a root that has already been nested — a
+// runner restarted in place, or a host whose runtime did it first.
+func nestCgroups(log *slog.Logger) error {
+	controllers, err := os.ReadFile(filepath.Join(cgroupRoot, "cgroup.controllers"))
+	if err != nil {
+		// No cgroup.controllers is cgroup v1, where none of this applies and
+		// the daemon has always worked.
+		return nil
+	}
+
+	procs, err := os.ReadFile(filepath.Join(cgroupRoot, "cgroup.procs"))
+	if err != nil {
+		return fmt.Errorf("read this container's cgroup: %w", err)
+	}
+	pids := strings.Fields(string(procs))
+	if len(pids) > 0 {
+		leaf := filepath.Join(cgroupRoot, "init")
+		if err := os.MkdirAll(leaf, 0o755); err != nil {
+			return fmt.Errorf("make the cgroup the container's own processes move into: %w", err)
+		}
+		// One at a time, because cgroup.procs takes one pid per write and
+		// reports the first refusal by failing the write.
+		//
+		// A pid that has gone between the read and the write is not an error
+		// here: it is a process that exited, and the only thing that matters is
+		// that the root ends up empty.
+		moved := 0
+		for _, pid := range pids {
+			if err := appendTo(filepath.Join(leaf, "cgroup.procs"), pid); err == nil {
+				moved++
+			}
+		}
+		log.Info("moved this container's processes out of its cgroup root",
+			"processes", moved, "of", len(pids))
+	}
+
+	// Delegate every controller this namespace has to its children. Written as
+	// one line because the kernel applies it as one: a partial write leaves the
+	// ones before it enabled, which is a state nothing here would know to
+	// unpick.
+	var enable strings.Builder
+	for _, controller := range strings.Fields(string(controllers)) {
+		if enable.Len() > 0 {
+			enable.WriteByte(' ')
+		}
+		enable.WriteString("+" + controller)
+	}
+	if enable.Len() == 0 {
+		return nil
+	}
+	if err := os.WriteFile(filepath.Join(cgroupRoot, "cgroup.subtree_control"),
+		[]byte(enable.String()), 0o644); err != nil {
+		return fmt.Errorf("delegate %s to this container's children, which is what "+
+			"lets the daemon inside it start containers: %w", enable.String(), err)
+	}
+	return nil
+}
+
+// appendTo writes one line to a kernel file that takes one write at a time.
+func appendTo(path, line string) error {
+	// O_CREATE because the kernel makes `cgroup.procs` when the directory is
+	// made and a test's fake directory starts empty. Not O_TRUNC: cgroupfs
+	// ignores truncation, a fake does not, and a helper that only works
+	// against the kernel is one nothing can check.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(line + "\n")
+	return err
 }
 
 // dockerPresent reports whether this image can run a daemon at all, in terms
