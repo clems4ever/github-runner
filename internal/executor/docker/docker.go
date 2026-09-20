@@ -61,6 +61,28 @@ const DefaultImage = "ghcr.io/actions/actions-runner:latest"
 // an hour is longer than any job worth waiting for.
 const stopTimeout = 3600
 
+// buildDeadline bounds one image build.
+//
+// Every other call this executor makes is a control-plane request that answers
+// in milliseconds, and the client's 60-second timeout is right for those. A
+// build is not one of them: it holds a single HTTP response open and streams
+// the builder's output down it for as long as the build takes, so the client's
+// whole-request timeout is the build's timeout — and at 60 seconds that is a
+// build of apt packages and nothing else.
+//
+// It went unnoticed because it is exactly the shape of failure that looks like
+// something else. The builder is mid-step when the deadline fires, so the
+// error is `context deadline exceeded` attached to whatever was on screen —
+// a download, an unpack — and reads as a network problem with the thing being
+// downloaded rather than as a limit on the build.
+//
+// An hour is chosen to be longer than any recipe worth waiting for. A recipe
+// that fetches a browser or a cross-compiler runs for minutes; one that runs
+// for an hour is hung, and a pool whose image never finishes building is a pool
+// with no runners, which somebody has to be told about rather than left to
+// discover.
+const buildDeadline = time.Hour
+
 // Executor creates, drains and removes container runners.
 type Executor struct {
 	layout paths.Layout
@@ -119,6 +141,20 @@ func New(layout paths.Layout, binary string, opts ...Option) *Executor {
 
 // Runtime is what this executor runs.
 func (e *Executor) Runtime() model.Runtime { return model.RuntimeContainer }
+
+// streaming is this executor's client with its whole-request deadline removed,
+// for the one endpoint that holds a response open while it works.
+//
+// The transport is shared — the same socket, the same connection pool — so
+// this is not a second way to reach Docker, it is the same one without a
+// stopwatch that was only ever meant for requests that answer immediately.
+// What bounds a build instead is the context BuildImage puts on the request,
+// which is the deadline a caller can see and cancel.
+func (e *Executor) streaming() *http.Client {
+	client := *e.http
+	client.Timeout = 0
+	return &client
+}
 
 // Recipe is the container image a runner in this pool would run.
 //
@@ -525,18 +561,22 @@ func mapState(state string) reconcile.RunnerState {
 // near the end, which is why this reads the whole body rather than trusting the
 // header.
 func (e *Executor) BuildImage(ctx context.Context, spec containerimage.Spec, journal io.Writer) error {
-	context, err := tarOf(spec.Files())
+	// Named for what it is rather than `context`, which would shadow the
+	// package the deadline below comes from.
+	buildContext, err := tarOf(spec.Files())
 	if err != nil {
 		return fmt.Errorf("make the build context: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(ctx, buildDeadline)
+	defer cancel()
 	path := "/build?dockerfile=Dockerfile&rm=1&forcerm=1&t=" + url.QueryEscape(spec.Name())
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.host+"/v1.44"+path, bytes.NewReader(context))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.host+"/v1.44"+path, bytes.NewReader(buildContext))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/x-tar")
 
-	resp, err := e.http.Do(req)
+	resp, err := e.streaming().Do(req)
 	if err != nil {
 		return fmt.Errorf("docker: build %s: %w (is dockerd running, and can this user reach its socket?)",
 			spec.Name(), err)
