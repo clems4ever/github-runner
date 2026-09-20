@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -795,5 +796,78 @@ func TestAPoolRunsTheImageItBakesWhenItBakesOne(t *testing.T) {
 	want := containerimage.Spec{Base: plain.Image, Packages: baking.Packages}.Name()
 	if got := Image(baking); got != want {
 		t.Errorf("a pool that bakes something runs %q, and its image is %q", got, want)
+	}
+}
+
+// A build holds one HTTP response open for as long as the build takes, so the
+// client's whole-request timeout is the build's ceiling — and the client this
+// executor uses for everything else has a 60-second one, which is right for a
+// request that answers immediately and wrong for the only request here that
+// does not.
+//
+// The shape is worth keeping in a test because of how it fails. The build is
+// mid-step when the deadline fires, so what surfaces is `context deadline
+// exceeded` next to whatever was on screen at the time — a download, an unpack
+// — and reads as a problem with the thing being downloaded rather than as a
+// limit on the build. A pool whose recipe fetches a browser hits it every time;
+// one that installs three apt packages never does.
+func TestABuildOutlastsTheClientTimeoutTheOtherCallsUse(t *testing.T) {
+	const short = 100 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("the test server cannot stream, so this proves nothing")
+			return
+		}
+		// Longer than `short`, in pieces, the way a builder reports steps.
+		for i := 0; i < 5; i++ {
+			_, _ = io.WriteString(w, `{"stream":"working\n"}`+"\n")
+			flusher.Flush()
+			time.Sleep(short / 2)
+		}
+	}))
+	defer srv.Close()
+
+	client := srv.Client()
+	client.Timeout = short
+	e := New(paths.Layout{}, "/agent", WithHTTPClient(client, srv.URL))
+
+	var journal strings.Builder
+	if err := e.BuildImage(context.Background(), containerimage.Spec{Base: "base"}, &journal); err != nil {
+		t.Fatalf("a build that streamed for longer than the client's %s timeout failed: %v", short, err)
+	}
+	if n := strings.Count(journal.String(), "working"); n != 5 {
+		t.Errorf("the journal kept %d of the 5 lines the builder streamed", n)
+	}
+}
+
+// Removing the client's stopwatch does not mean a build runs forever: what
+// bounds it is the context on the request, which a caller can also cancel.
+func TestACancelledBuildStopsWaiting(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain the context tar first: the server only learns that the client
+		// has gone once it is reading, so a handler that blocks without
+		// finishing the request never notices the cancellation and the test
+		// hangs instead of failing.
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+			t.Error("the client never went away, so the cancellation did not reach the request")
+		}
+	}))
+	defer srv.Close()
+
+	e := New(paths.Layout{}, "/agent", WithHTTPClient(srv.Client(), srv.URL))
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	var journal strings.Builder
+	err := e.BuildImage(ctx, containerimage.Spec{Base: "base"}, &journal)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled build ended with %v, and the caller asked for %v", err, context.Canceled)
 	}
 }
