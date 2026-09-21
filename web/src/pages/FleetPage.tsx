@@ -15,8 +15,8 @@ import {
   Title,
   Tooltip,
 } from '@mantine/core'
-import { IconAlertTriangle, IconServerOff } from '@tabler/icons-react'
-import type { Credential, JobState, Pool, Runner, RunnerState, Scale } from '../api'
+import { IconAlertTriangle, IconHammer, IconServerOff } from '@tabler/icons-react'
+import type { Credential, JobState, Pool, PoolImage, Runner, RunnerState, Scale } from '../api'
 import { Field, useNarrow } from '../responsive'
 import { ActivityChart } from './ActivityChart'
 import { PoolEditor } from './PoolEditor'
@@ -35,16 +35,20 @@ export function FleetPage({
   credentials,
   scaling,
   warnings,
+  images,
   loading,
   onChange,
+  onOpenPools,
 }: {
   runners: Runner[]
   pools: Pool[]
   credentials: Credential[]
   scaling: Record<string, Scale>
   warnings: string[]
+  images: Record<string, PoolImage>
   loading: boolean
   onChange: () => Promise<void>
+  onOpenPools: () => void
 }) {
   const narrow = useNarrow()
   // The question a runner raises is usually about its pool — it is too small,
@@ -113,6 +117,8 @@ export function FleetPage({
           </Stack>
         </Card>
       )}
+
+      <ImageNotices images={images} onOpenPools={onOpenPools} />
 
       {warnings.map((warning) => (
         <Alert key={warning} color="yellow" icon={<IconAlertTriangle size={18} />} variant="light">
@@ -389,4 +395,67 @@ function JobBadge({ job }: { job: JobState }) {
       </Badge>
     </Tooltip>
   )
+}
+
+/**
+ * What the host is building, on the page somebody is already looking at.
+ *
+ * A pool's image has its own panel on the pools page, with the log and every
+ * attempt — and that is the right place to READ one. It is the wrong place to
+ * FIND OUT, because nothing sends you there: a pool whose image is building
+ * has no runners, and a pool whose image failed has no runners either, and
+ * from here both of those look like a fleet that is simply empty. The
+ * explanation was a page away and nothing said so.
+ *
+ * Only the two states that hold a pool back appear here. A built image is not
+ * news, and a fleet page that lists every image is a page nobody reads.
+ */
+function ImageNotices({
+  images,
+  onOpenPools,
+}: {
+  images: Record<string, PoolImage>
+  onOpenPools: () => void
+}) {
+  const held = Object.values(images).filter(
+    (image) => image.state === 'building' || image.state === 'queued' || image.state === 'failed',
+  )
+  return (
+    <>
+      {held.map((image) => {
+        const failed = image.state === 'failed'
+        const since = image.build ? ` — ${duration(image.build.seconds)} so far` : ''
+        return (
+          <Alert
+            key={image.pool}
+            color={failed ? 'red' : 'blue'}
+            variant="light"
+            icon={failed ? <IconAlertTriangle size={18} /> : <IconHammer size={18} />}
+            title={
+              failed
+                ? `${image.pool} has no runners: its image did not build`
+                : `${image.pool} is building its image${since}`
+            }
+          >
+            <Group gap="xs" wrap="wrap">
+              <Text size="sm">
+                {failed
+                  ? 'Until it builds, this pool takes no jobs. The log says how far it got.'
+                  : 'The pool gets no runners until it is done. The log is live while it runs.'}
+              </Text>
+              <Anchor component="button" type="button" size="sm" onClick={onOpenPools}>
+                Open the pool
+              </Anchor>
+            </Group>
+          </Alert>
+        )
+      })}
+    </>
+  )
+}
+
+/** Seconds as something to read at a glance, the way the image panel says it. */
+function duration(seconds: number) {
+  if (seconds < 60) return `${seconds}s`
+  return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`
 }

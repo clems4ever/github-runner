@@ -194,8 +194,10 @@ export function App() {
             credentials={credentials}
             scaling={scaling}
             warnings={warnings}
+            images={images}
             loading={loading}
             onChange={refresh}
+            onOpenPools={() => setPage('pools')}
           />
         )}
         {page === 'pools' && (

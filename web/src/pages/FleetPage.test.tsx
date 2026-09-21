@@ -4,7 +4,7 @@ import { MantineProvider } from '@mantine/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { FleetPage } from './FleetPage'
 import { pretendNarrow } from '../test-setup'
-import { api, type Credential, type Pool, type Runner, type Scale } from '../api'
+import { api, type Credential, type Pool, type PoolImage, type Runner, type Scale } from '../api'
 
 const credentials: Credential[] = [{ id: 1, name: 'pat', kind: 'pat', hint: '…1234', createdAt: '' }]
 
@@ -35,6 +35,8 @@ async function renderPage(
   pools: Pool[] = [],
   scaling: Record<string, Scale> = {},
   onChange = vi.fn().mockResolvedValue(undefined),
+  images: Record<string, PoolImage> = {},
+  onOpenPools = vi.fn(),
 ) {
   const result = render(
     <MantineProvider>
@@ -44,8 +46,10 @@ async function renderPage(
         credentials={credentials}
         scaling={scaling}
         warnings={warnings}
+        images={images}
         loading={false}
         onChange={onChange}
+        onOpenPools={onOpenPools}
       />
     </MantineProvider>,
   )
@@ -273,5 +277,59 @@ describe('FleetPage', () => {
   it('keeps the table on a wide screen', async () => {
     await renderPage([runner()])
     expect(screen.getByRole('table')).toBeInTheDocument()
+  })
+})
+
+// A pool with no runners looks the same from the fleet page whatever the
+// reason, so the two reasons that are about an image say so where somebody is
+// already looking. The panel that holds the log is on another page, and
+// nothing used to point at it.
+describe('an image that is holding a pool back', () => {
+  const image = (state: PoolImage['state'], seconds = 0): Record<string, PoolImage> => ({
+    'runyard-ci': {
+      pool: 'runyard-ci',
+      image: 'runner-fleet/pool:abc123',
+      state,
+      ready: state === 'ready',
+      summary: '',
+      build: {
+        id: 1,
+        pool: 'runyard-ci',
+        image: 'runner-fleet/pool:abc123',
+        phase: 'running',
+        trigger: 'automatic',
+        startedAt: '',
+        seconds,
+        hasLog: true,
+      },
+    },
+  })
+
+  it('says which pool is building, and for how long', async () => {
+    await renderPage([], [], [], {}, vi.fn(), image('building', 107))
+    expect(
+      await screen.findByText(/runyard-ci is building its image — 1m47s so far/),
+    ).toBeInTheDocument()
+  })
+
+  it('says a failed image is why the pool is empty', async () => {
+    await renderPage([], [], [], {}, vi.fn(), image('failed'))
+    expect(
+      await screen.findByText(/runyard-ci has no runners: its image did not build/),
+    ).toBeInTheDocument()
+  })
+
+  it('offers the way to the log rather than describing where it is', async () => {
+    const onOpenPools = vi.fn()
+    await renderPage([], [], [], {}, vi.fn(), image('failed'), onOpenPools)
+    await userEvent.click(await screen.findByRole('button', { name: 'Open the pool' }))
+    expect(onOpenPools).toHaveBeenCalled()
+  })
+
+  // A built image is not news. A page that lists every pool's image is one
+  // nobody reads, and then the failure is lost in it.
+  it('says nothing at all about an image that is built', async () => {
+    await renderPage([], [], [], {}, vi.fn(), image('ready'))
+    expect(screen.queryByText(/its image/)).not.toBeInTheDocument()
   })
 })
