@@ -51,8 +51,28 @@ jobs:
           set -euo pipefail
           branch="runner-${LATEST}"
 
-          # Already proposed and not yet merged: nothing to do, and opening a
-          # second pull request every Monday would be noise.
+          # WHAT THIS GUARD USED TO ASK, AND WHY IT WAS THE WRONG QUESTION.
+          #
+          # It asked whether a pull request was open, and left if one was. But
+          # what this job creates first is a BRANCH, and the two come apart the
+          # moment the second step fails — which is exactly what happened on
+          # 2026-08-31: the push landed, `gh pr create` was refused, and the
+          # repository was left with `runner-2.337.0` and no pull request.
+          #
+          # Every Monday after that, the guard saw no open pull request, rebuilt
+          # the branch from a fresh main, and pushed it into the one already
+          # there:
+          #
+          #     ! [rejected]  runner-2.337.0 -> runner-2.337.0 (fetch first)
+          #
+          # Three weeks of red, each reporting a git error that says nothing
+          # about the refusal that caused it, while the version this workflow
+          # exists to move sat still.
+          #
+          # So it asks about the branch too, and treats one that is already
+          # there as this job's own work rather than as a collision: the commit
+          # is reproducible from LATEST, so pushing it again over a stale one is
+          # a rebase onto current main, not a loss.
           if gh pr list --head "$branch" --state open --json number --jq 'length' | grep -qv '^0$'; then
             echo "::notice::${LATEST} is already proposed"
             exit 0
@@ -74,12 +94,38 @@ jobs:
 
           Merging this changes the image hash, so each host builds a fresh golden
           image the next time it starts a machine."
-          git push -u origin "$branch"
 
-          gh pr create \
+          # --force-with-lease rather than --force: it replaces the branch this
+          # job left behind, and refuses if somebody else has been working on
+          # one by that name.
+          git push --force-with-lease -u origin "$branch"
+
+          # THE REFUSAL THAT STARTED ALL OF THIS, REPORTED AS ITSELF.
+          #
+          # `GITHUB_TOKEN` cannot open a pull request when the organisation has
+          # "Allow GitHub Actions to create and approve pull requests" turned
+          # off, and an organisation that turns it off locks its repositories
+          # out of overriding it. Nothing here can change that, so the useful
+          # thing is to say which setting it is and leave the branch — which is
+          # pushed, tested, and one click from a pull request — rather than to
+          # fail with a git error four weeks later.
+          if ! gh pr create \
             --title "Carry actions runner ${LATEST} in the golden image" \
             --body "GitHub's latest runner is \`${LATEST}\`; the golden image carries \`${OURS}\`.
 
           Old versions are deprecated server-side and cannot receive jobs — the runner connects, is refused, and exits, which on an ephemeral machine looks like a boot loop rather than an error. Merging this changes the image hash, so every host builds a fresh golden image the next time it starts a machine.
 
-          Opened by the weekly \`runner version\` workflow."
+          Opened by the weekly \`runner version\` workflow."; then
+            {
+              echo "### The branch is pushed; the pull request is not"
+              echo
+              echo "\`${branch}\` carries the bump and its tests pass. Opening the pull"
+              echo "request failed — if the reason above is *not permitted to create or"
+              echo "approve pull requests*, that is an organisation setting"
+              echo "(**Settings → Actions → General → Workflow permissions**) and no token"
+              echo "this job has can get round it."
+              echo
+              echo "[Open it by hand](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${branch}?expand=1)"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
